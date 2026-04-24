@@ -298,6 +298,12 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 				return fmt.Errorf("failed to parse system data: %w", err)
 			}
 			tmpl.Fill(systemData)
+		case register.MsgObservedNetworkConfig:
+			observed := &elementalv1.ObservedNetwork{}
+			if err := json.Unmarshal(data, observed); err != nil {
+				return fmt.Errorf("failed to parse observed network config: %w", err)
+			}
+			inventory.Spec.ObservedNetwork = observed
 		default:
 			return fmt.Errorf("got unexpected message: %s", msgType)
 		}

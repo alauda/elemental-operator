@@ -7,23 +7,18 @@ toolchain go1.24.1
 replace k8s.io/client-go => k8s.io/client-go v0.34.3
 
 require (
-	github.com/drone/envsubst/v2 v2.0.0-20210730161058-179042472c46
 	github.com/gobuffalo/flect v1.0.3
 	github.com/google/go-attestation v0.5.1
 	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
-	github.com/hashicorp/go-version v1.6.0
 	github.com/jaypipes/ghw v0.12.0
 	github.com/onsi/ginkgo/v2 v2.27.2
 	github.com/onsi/gomega v1.38.2
-	github.com/rancher-sandbox/ele-testhelpers v0.0.0-20240926104948-8ac88aebed21
 	github.com/rancher-sandbox/go-tpm v0.0.0-20251217133601-d3eb5ceca3d6
-	github.com/rancher/fleet/pkg/apis v0.14.0
 	github.com/rancher/lasso v0.2.5
 	github.com/rancher/rancher/pkg/apis v0.0.0-20251125015639-f94ac947f75e
 	github.com/rancher/steve v0.8.0
-	github.com/rancher/system-upgrade-controller/pkg/apis v0.0.0-20240308073002-4a643535e6ea
 	github.com/rancher/wrangler/v3 v3.3.1
 	github.com/rancher/yip v1.9.6
 	github.com/sanity-io/litter v1.5.5
@@ -40,7 +35,6 @@ require (
 	k8s.io/client-go v12.0.0+incompatible
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/utils v0.0.0-20250604170112-4c0f3b243397
-	sigs.k8s.io/cluster-api v1.12.2
 	sigs.k8s.io/controller-runtime v0.22.5
 	sigs.k8s.io/yaml v1.6.0
 )
@@ -102,11 +96,11 @@ require (
 	github.com/rancher/aks-operator v1.13.0 // indirect
 	github.com/rancher/ali-operator v1.13.0 // indirect
 	github.com/rancher/eks-operator v1.13.0 // indirect
+	github.com/rancher/fleet/pkg/apis v0.14.0 // indirect
 	github.com/rancher/gke-operator v1.13.0 // indirect
 	github.com/rancher/norman v0.8.0 // indirect
 	github.com/rancher/remotedialer v0.6.0-rc.1 // indirect
 	github.com/rancher/rke v1.8.0 // indirect
-	github.com/rancher/wrangler v1.1.1 // indirect
 	github.com/sagikazarmark/locafero v0.11.0 // indirect
 	github.com/sirupsen/logrus v1.9.4-0.20230606125235-dd1b4c2e81af // indirect
 	github.com/sourcegraph/conc v0.3.1-0.20240121214520-5f936abd7ae8 // indirect

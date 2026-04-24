@@ -118,6 +118,14 @@ func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *St
 		}
 	}
 
+	if protoVersion >= MsgObservedNetworkConfig {
+		log.Info("Send observed network snapshot")
+		if err := sendObservedNetwork(conn); err != nil {
+			// Informational data: warn but continue registration.
+			log.Warningf("failed to send observed network snapshot: %v", err)
+		}
+	}
+
 	log.Info("Get elemental configuration")
 	if err := WriteMessage(conn, MsgGet, []byte{}); err != nil {
 		return nil, fmt.Errorf("request elemental configuration: %w", err)

@@ -25,10 +25,8 @@ import (
 	goruntime "runtime"
 	"time"
 
-	fleetv1 "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/steve/pkg/aggregation"
-	upgradev1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	corev1 "k8s.io/api/core/v1"
@@ -36,8 +34,6 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
-	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
-	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -59,7 +55,6 @@ import (
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;create;delete;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;create;delete;list;watch
-// +kubebuilder:rbac:groups="ipam.cluster.x-k8s.io",resources=ipaddressclaims,verbs=get;create;delete;list;watch
 
 var (
 	scheme   = runtime.NewScheme()
@@ -91,10 +86,6 @@ func init() {
 	utilruntime.Must(elementalv1.AddToScheme(scheme))
 	utilruntime.Must(managementv3.AddToScheme(scheme))
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(clusterv1.AddToScheme(scheme))
-	utilruntime.Must(upgradev1.AddToScheme(scheme))
-	utilruntime.Must(fleetv1.AddToScheme(scheme))
-	utilruntime.Must(ipamv1.AddToScheme(scheme))
 }
 
 func NewOperatorCommand() *cobra.Command {
@@ -212,7 +203,6 @@ func operatorRun(config *rootConfig) {
 				DisableFor: []client.Object{
 					&corev1.ConfigMap{},
 					&corev1.Secret{},
-					&elementalv1.ManagedOSVersion{},
 				},
 			},
 		},
@@ -289,39 +279,12 @@ func setupReconcilers(mgr ctrl.Manager, config *rootConfig) {
 		setupLog.Error(err, "unable to create reconciler", "controller", "MachineInventory")
 		os.Exit(1)
 	}
-	if err := (&controllers.MachineInventorySelectorReconciler{
-		Client: mgr.GetClient(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create reconciler", "controller", "MachineInventorySelector")
-		os.Exit(1)
-	}
-	if err := (&controllers.ManagedOSImageReconciler{
-		Client:          mgr.GetClient(),
-		DefaultRegistry: config.defaultRegistry,
-		Scheme:          scheme,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create reconciler", "controller", "ManagedOSImage")
-		os.Exit(1)
-	}
-	if err := (&controllers.ManagedOSVersionChannelReconciler{
-		Client:        mgr.GetClient(),
-		OperatorImage: config.operatorImage,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create reconciler", "controller", "ManagedOSVersionChannel")
-		os.Exit(1)
-	}
 	if err := (&controllers.SeedImageReconciler{
 		Client:                   mgr.GetClient(),
 		SeedImageImage:           config.seedimageImage,
 		SeedImageImagePullPolicy: corev1.PullPolicy(config.seedimageImagePullPolicy),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create reconciler", "controller", "SeedImage")
-		os.Exit(1)
-	}
-	if err := (&controllers.ManagedOSVersionReconciler{
-		Client: mgr.GetClient(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create reconciler", "controller", "ManagedOSVersion")
 		os.Exit(1)
 	}
 }

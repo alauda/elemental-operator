@@ -40,9 +40,10 @@ const (
 	MsgError                            // v1.1.1
 	MsgAnnotations                      // v1.1.4
 	MsgUpdate                           // v1.2.6
-	MsgSystemDataV2                     // v1.6.0
-	MsgNetworkConfig                    // v1.7.0
-	MsgLast          = MsgNetworkConfig // MsgLast must point to the last message
+	MsgSystemDataV2                                 // v1.6.0
+	MsgNetworkConfig                                // v1.7.0
+	MsgObservedNetworkConfig                        // Alauda fork: live-ISO observed network snapshot
+	MsgLast                  = MsgObservedNetworkConfig // MsgLast must point to the last message
 )
 
 func (mt MessageType) String() string {
@@ -73,6 +74,8 @@ func (mt MessageType) String() string {
 		return "SystemDataV2"
 	case MsgNetworkConfig:
 		return "NetworkConfig"
+	case MsgObservedNetworkConfig:
+		return "ObservedNetworkConfig"
 	default:
 		return "Unknown"
 	}

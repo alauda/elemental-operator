@@ -53,6 +53,65 @@ type MachineInventorySpec struct {
 	// NetworkConfig is the final NetworkConfig.
 	// +optional
 	Network NetworkConfig `json:"network,omitempty"`
+	// ObservedNetwork is a live-ISO-side snapshot of the host's actual network
+	// configuration uploaded by elemental-register during initial registration
+	// (Alauda fork). It is informational only and is intentionally kept
+	// separate from Network (the target/template network). Consumers such as
+	// baremetal providers can read this to know what the host looked like
+	// before install-time network reconfiguration.
+	// +optional
+	ObservedNetwork *ObservedNetwork `json:"observedNetwork,omitempty"`
+}
+
+// ObservedNetwork captures a snapshot of the host's actual network state as
+// observed from the live ISO at registration time. Unlike NetworkConfig, this
+// structure carries no template/configurator semantics — it is purely
+// descriptive data.
+type ObservedNetwork struct {
+	// Interfaces observed on the host.
+	// +optional
+	Interfaces []ObservedInterface `json:"interfaces,omitempty"`
+	// Routes observed in the host's routing table.
+	// +optional
+	Routes []ObservedRoute `json:"routes,omitempty"`
+	// DNSServers observed (typically from /etc/resolv.conf).
+	// +optional
+	DNSServers []string `json:"dnsServers,omitempty"`
+	// SearchDomains observed.
+	// +optional
+	SearchDomains []string `json:"searchDomains,omitempty"`
+}
+
+// ObservedInterface describes a single network interface on the host.
+type ObservedInterface struct {
+	// Name is the OS-level interface name (e.g. eth0, ens3).
+	Name string `json:"name"`
+	// MAC is the hardware address.
+	// +optional
+	MAC string `json:"mac,omitempty"`
+	// MTU in bytes.
+	// +optional
+	MTU int `json:"mtu,omitempty"`
+	// Addresses assigned to the interface, in CIDR form (e.g. 10.0.0.5/24,
+	// fe80::1/64). Both IPv4 and IPv6 may appear.
+	// +optional
+	Addresses []string `json:"addresses,omitempty"`
+}
+
+// ObservedRoute describes a single routing table entry.
+type ObservedRoute struct {
+	// Destination CIDR, or the literal string "default" for the default
+	// route.
+	Destination string `json:"destination"`
+	// Gateway is the next-hop IP, if any.
+	// +optional
+	Gateway string `json:"gateway,omitempty"`
+	// Interface is the outgoing device name, if any.
+	// +optional
+	Interface string `json:"interface,omitempty"`
+	// Metric of the route.
+	// +optional
+	Metric int `json:"metric,omitempty"`
 }
 
 type MachineInventoryStatus struct {

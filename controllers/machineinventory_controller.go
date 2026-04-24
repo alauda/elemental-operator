@@ -34,7 +34,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	errorutils "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/utils/ptr"
-	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -51,9 +50,6 @@ import (
 	"github.com/rancher/elemental-operator/pkg/util"
 )
 
-// Timeout to validate machine inventory adoption
-const adoptionTimeout = 5
-
 const LocalResetPlanPath = "/oem/reset-cloud-config.yaml"
 const LocalResetUnmanagedMarker = "/var/lib/elemental/.unmanaged_reset"
 
@@ -65,8 +61,6 @@ type MachineInventoryReconciler struct {
 // +kubebuilder:rbac:groups=elemental.cattle.io,resources=machineinventories,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=elemental.cattle.io,resources=machineinventories/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;watch;create;list
-// +kubebuilder:rbac:groups="ipam.cluster.x-k8s.io",resources=ipaddresses,verbs=get;list;watch
-// +kubebuilder:rbac:groups="ipam.cluster.x-k8s.io",resources=ipaddresseclaims,verbs=get;list;watch;delete
 
 func (r *MachineInventoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -161,32 +155,6 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 		return ctrl.Result{}, fmt.Errorf("failed to create plan secret: %w", err)
 	}
 
-	if r.networkNeedsReconcile(*mInventory) {
-		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
-			Type:    elementalv1.ReadyCondition,
-			Reason:  elementalv1.ReconcilingNetworkConfig,
-			Status:  metav1.ConditionFalse,
-			Message: "NetworkConfig needs reconcile",
-		})
-		result, err := r.reconcileNetworkConfig(ctx, mInventory)
-		if err != nil {
-			meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
-				Type:    elementalv1.ReadyCondition,
-				Reason:  elementalv1.NetworkConfigFailure,
-				Status:  metav1.ConditionFalse,
-				Message: err.Error(),
-			})
-			return ctrl.Result{}, fmt.Errorf("reconciling network config: %w", err)
-		}
-		return result, nil
-	}
-	meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
-		Type:    elementalv1.NetworkConfigReady,
-		Reason:  elementalv1.ReconcilingNetworkConfig,
-		Status:  metav1.ConditionTrue,
-		Message: "NetworkConfig is ready",
-	})
-
 	if err := r.updateInventoryWithPlanStatus(ctx, mInventory); err != nil {
 		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.ReadyCondition,
@@ -195,18 +163,6 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 			Message: err.Error(),
 		})
 		return ctrl.Result{}, fmt.Errorf("failed to update inventory status with plan %w", err)
-	}
-
-	if requeue, err := r.updateInventoryWithAdoptionStatus(ctx, mInventory); err != nil {
-		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
-			Type:    elementalv1.AdoptionReadyCondition,
-			Reason:  elementalv1.AdoptionFailureReason,
-			Status:  metav1.ConditionFalse,
-			Message: err.Error(),
-		})
-		return ctrl.Result{}, fmt.Errorf("failed to update inventory status with plan %w", err)
-	} else if requeue {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -302,112 +258,6 @@ func (r *MachineInventoryReconciler) updatePlanSecretWithReset(ctx context.Conte
 	}
 
 	return nil
-}
-
-// networkNeedsReconcile checks if there is an IPAddress for each IPPool referenced by the MachineInventory.
-func (r *MachineInventoryReconciler) networkNeedsReconcile(mInventory elementalv1.MachineInventory) bool {
-	for ipName := range mInventory.Spec.IPAddressPools {
-		_, ipExists := mInventory.Spec.Network.IPAddresses[ipName]
-		if !ipExists {
-			return true
-		}
-	}
-	return false
-}
-
-func ConvertToIPPoolReference(ref *corev1.TypedLocalObjectReference) ipamv1.IPPoolReference {
-	if ref == nil {
-		return ipamv1.IPPoolReference{}
-	}
-	return ipamv1.IPPoolReference{
-		Name:     ref.Name,
-		Kind:     ref.Kind,
-		APIGroup: *ref.APIGroup,
-	}
-}
-
-func (r *MachineInventoryReconciler) reconcileNetworkConfig(ctx context.Context, mInventory *elementalv1.MachineInventory) (ctrl.Result, error) {
-	logger := ctrl.LoggerFrom(ctx)
-	logger.Info("Reconciling Network Config")
-
-	// Loops over the IPAddressPools and create an IPAddressClaim for each
-	for name, ipPoolRef := range mInventory.Spec.IPAddressPools {
-		ipClaimName := fmt.Sprintf("%s-%s", mInventory.Name, name)
-		ipClaim := &ipamv1.IPAddressClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      ipClaimName,
-				Namespace: mInventory.Namespace,
-				// Ownership takes care of IPAddressClaim deletion when the MachineInventory is also deleted.
-				OwnerReferences: []metav1.OwnerReference{
-					{
-						APIVersion: mInventory.APIVersion,
-						Kind:       mInventory.Kind,
-						Name:       mInventory.Name,
-						UID:        mInventory.UID,
-						Controller: ptr.To(true),
-					},
-				},
-			},
-			Spec: ipamv1.IPAddressClaimSpec{
-				PoolRef: ConvertToIPPoolReference(ipPoolRef),
-			},
-		}
-		if err := r.Create(ctx, ipClaim); apierrors.IsAlreadyExists(err) {
-			logger.Info("Reusing already existing IPAddressClaim", "IPAddressClaim", ipClaimName)
-		} else if err != nil {
-			return ctrl.Result{}, fmt.Errorf("creating IPAddressClaim '%s': %w", ipClaimName, err)
-		}
-
-		if err := r.Get(ctx, client.ObjectKeyFromObject(ipClaim), ipClaim); err != nil {
-			return ctrl.Result{}, fmt.Errorf("getting IPAddressClaim '%s': %w", ipClaimName, err)
-		}
-		// Just for safety, prevent usage of any IPClaim that is undergoing deletion (we don't have an IPAddressClaim watch for a further reconcile)
-		if !ipClaim.DeletionTimestamp.IsZero() {
-			return ctrl.Result{}, fmt.Errorf("Waiting for IPAddressClaim deletion '%s'", ipClaimName)
-		}
-
-		if mInventory.Spec.IPAddressClaims == nil {
-			mInventory.Spec.IPAddressClaims = map[string]*corev1.ObjectReference{}
-		}
-
-		mInventory.Spec.IPAddressClaims[name] = &corev1.ObjectReference{
-			APIVersion: ipClaim.APIVersion,
-			Kind:       ipClaim.Kind,
-			Name:       ipClaim.Name,
-			Namespace:  ipClaim.Namespace,
-			UID:        ipClaim.UID,
-		}
-	}
-
-	// Loops over the IPAddressClaims and get the IPAddresses
-	for name, ipClaimRef := range mInventory.Spec.IPAddressClaims {
-		ipAddress := &ipamv1.IPAddress{}
-		err := r.Get(ctx, types.NamespacedName{
-			Name:      ipClaimRef.Name,
-			Namespace: ipClaimRef.Namespace,
-		}, ipAddress)
-		if apierrors.IsNotFound(err) {
-			logger.Info("IPAddress not found. Requeuing.", "IPAddress", ipClaimRef.Name)
-			meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
-				Type:    elementalv1.NetworkConfigReady,
-				Reason:  elementalv1.WaitingForIPAddressReason,
-				Status:  metav1.ConditionFalse,
-				Message: fmt.Sprintf("Waiting to claim IPAddress %s", ipClaimRef.Name),
-			})
-			return ctrl.Result{RequeueAfter: time.Second}, nil
-		}
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("getting IPAddress '%s': %w", ipClaimRef.Name, err)
-		}
-
-		if mInventory.Spec.Network.IPAddresses == nil {
-			mInventory.Spec.Network.IPAddresses = map[string]string{}
-		}
-
-		mInventory.Spec.Network.IPAddresses[name] = ipAddress.Spec.Address
-	}
-
-	return ctrl.Result{}, nil
 }
 
 func (r *MachineInventoryReconciler) newResetPlan(ctx context.Context, resetNetwork bool) (string, []byte, error) {
@@ -627,77 +477,6 @@ func (r *MachineInventoryReconciler) updateInventoryWithPlanStatus(ctx context.C
 	}
 }
 
-// updateInventoryWithAdoptionStatus computes sanity checks on owner references to verify inventory owner is properly set.
-// Returns true if a requeue to wait for owner setup is required, false if no requeue is needed.
-func (r *MachineInventoryReconciler) updateInventoryWithAdoptionStatus(ctx context.Context, mInventory *elementalv1.MachineInventory) (bool, error) {
-	logger := ctrl.LoggerFrom(ctx)
-
-	owner := getSelectorOwner(mInventory)
-	if owner == nil {
-		logger.V(log.DebugDepth).Info("Waiting to be adopted")
-		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
-			Type:    elementalv1.AdoptionReadyCondition,
-			Reason:  elementalv1.WaitingToBeAdoptedReason,
-			Status:  metav1.ConditionFalse,
-			Message: "Waiting to be adopted",
-		})
-		return false, nil
-	}
-
-	adoptedCondition := meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.AdoptionReadyCondition)
-	if adoptedCondition != nil && adoptedCondition.Status == metav1.ConditionTrue {
-		logger.V(log.DebugDepth).Info("Inventory already adopted")
-		return false, nil
-	}
-
-	miSelector := &elementalv1.MachineInventorySelector{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Namespace: mInventory.Namespace,
-		Name:      owner.Name,
-	},
-		miSelector,
-	); err != nil {
-		return false, fmt.Errorf("failed to get machine inventory selector: %w", err)
-	}
-
-	meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
-		Type:    elementalv1.AdoptionReadyCondition,
-		Reason:  elementalv1.ValidatingAdoptionReason,
-		Status:  metav1.ConditionUnknown,
-		Message: "Adoption being validated",
-	})
-	adoptedCondition = meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.AdoptionReadyCondition)
-
-	deadLine := adoptedCondition.LastTransitionTime.Add(adoptionTimeout * time.Second)
-
-	switch {
-	case miSelector.Status.MachineInventoryRef == nil && time.Now().Before(deadLine):
-		logger.V(log.DebugDepth).Info("Adoption being validated")
-		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
-			Type:    elementalv1.AdoptionReadyCondition,
-			Reason:  elementalv1.ValidatingAdoptionReason,
-			Status:  metav1.ConditionUnknown,
-			Message: "Adoption being validated",
-		})
-		return true, nil
-	case miSelector.Status.MachineInventoryRef == nil:
-		removeSelectorOwnerShip(mInventory)
-		return false, fmt.Errorf("Adoption timeout, dropping selector ownership. Deadline was: %v ", deadLine)
-	case miSelector.Status.MachineInventoryRef.Name != mInventory.Name:
-		removeSelectorOwnerShip(mInventory)
-		return false, fmt.Errorf("Ownership mismatch, dropping selector ownership")
-	default:
-		logger.Info("Successfully adopted")
-		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
-			Type:    elementalv1.AdoptionReadyCondition,
-			Reason:  elementalv1.SuccessfullyAdoptedReason,
-			Status:  metav1.ConditionTrue,
-			Message: "Successfully adopted",
-		})
-		return false, nil
-	}
-}
-
 func (r *MachineInventoryReconciler) ignoreIncrementalStatusUpdate() predicate.Funcs {
 	return predicate.Funcs{
 		// Avoid reconciling if the event triggering the reconciliation is related to incremental status updates
@@ -727,32 +506,5 @@ func (r *MachineInventoryReconciler) ignoreIncrementalStatusUpdate() predicate.F
 			// Return true in case it watches other types
 			return true
 		},
-	}
-}
-
-func findSelectorOwner(machineInventory *elementalv1.MachineInventory) (int, *metav1.OwnerReference) {
-	for idx, owner := range machineInventory.GetOwnerReferences() {
-		if owner.APIVersion == elementalv1.GroupVersion.String() && owner.Kind == "MachineInventorySelector" {
-			return idx, &owner
-		}
-	}
-	return -1, nil
-}
-
-func getSelectorOwner(machineInventory *elementalv1.MachineInventory) *metav1.OwnerReference {
-	_, owner := findSelectorOwner(machineInventory)
-	return owner
-}
-
-func isAlreadyOwned(machineInventory *elementalv1.MachineInventory) bool {
-	return getSelectorOwner(machineInventory) != nil
-}
-
-func removeSelectorOwnerShip(machineInventory *elementalv1.MachineInventory) {
-	idx, _ := findSelectorOwner(machineInventory)
-	if idx >= 0 {
-		owners := machineInventory.GetOwnerReferences()
-		owners[idx] = owners[len(owners)-1]
-		machineInventory.OwnerReferences = owners[:len(owners)-1]
 	}
 }

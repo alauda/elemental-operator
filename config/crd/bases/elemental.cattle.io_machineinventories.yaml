@@ -141,6 +141,77 @@ spec:
                     description: IPAddresses contains a map of claimed IPAddresses
                     type: object
                 type: object
+              observedNetwork:
+                description: |-
+                  ObservedNetwork is a live-ISO-side snapshot of the host's actual network
+                  configuration uploaded by elemental-register during initial registration
+                  (Alauda fork). It is informational only and is intentionally kept
+                  separate from Network (the target/template network). Consumers such as
+                  baremetal providers can read this to know what the host looked like
+                  before install-time network reconfiguration.
+                properties:
+                  dnsServers:
+                    description: DNSServers observed (typically from /etc/resolv.conf).
+                    items:
+                      type: string
+                    type: array
+                  interfaces:
+                    description: Interfaces observed on the host.
+                    items:
+                      description: ObservedInterface describes a single network interface
+                        on the host.
+                      properties:
+                        addresses:
+                          description: |-
+                            Addresses assigned to the interface, in CIDR form (e.g. 10.0.0.5/24,
+                            fe80::1/64). Both IPv4 and IPv6 may appear.
+                          items:
+                            type: string
+                          type: array
+                        mac:
+                          description: MAC is the hardware address.
+                          type: string
+                        mtu:
+                          description: MTU in bytes.
+                          type: integer
+                        name:
+                          description: Name is the OS-level interface name (e.g. eth0,
+                            ens3).
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  routes:
+                    description: Routes observed in the host's routing table.
+                    items:
+                      description: ObservedRoute describes a single routing table
+                        entry.
+                      properties:
+                        destination:
+                          description: |-
+                            Destination CIDR, or the literal string "default" for the default
+                            route.
+                          type: string
+                        gateway:
+                          description: Gateway is the next-hop IP, if any.
+                          type: string
+                        interface:
+                          description: Interface is the outgoing device name, if any.
+                          type: string
+                        metric:
+                          description: Metric of the route.
+                          type: integer
+                      required:
+                      - destination
+                      type: object
+                    type: array
+                  searchDomains:
+                    description: SearchDomains observed.
+                    items:
+                      type: string
+                    type: array
+                type: object
               tpmHash:
                 description: |-
                   TPMHash the hash of the TPM EK public key. This is used if you are
