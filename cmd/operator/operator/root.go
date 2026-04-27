@@ -18,11 +18,15 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	goruntime "runtime"
+	"strings"
 	"time"
 
 	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
@@ -78,6 +82,8 @@ type rootConfig struct {
 	watchNamespace              string
 	seedimageImage              string
 	seedimageImagePullPolicy    string
+	serverURL                   string
+	httpBindAddr                string
 }
 
 func init() {
@@ -102,6 +108,18 @@ func NewOperatorCommand() *cobra.Command {
 					config.seedimageImagePullPolicy,
 					corev1.PullAlways, corev1.PullIfNotPresent, corev1.PullNever)
 			}
+			serverURL := strings.TrimRight(config.serverURL, "/")
+			if serverURL == "" {
+				return fmt.Errorf("server-url is required")
+			}
+			parsedServerURL, err := url.Parse(serverURL)
+			if err != nil || parsedServerURL.Scheme == "" || parsedServerURL.Host == "" {
+				return fmt.Errorf("invalid server-url %q", config.serverURL)
+			}
+			if parsedServerURL.Scheme != "http" && parsedServerURL.Scheme != "https" {
+				return fmt.Errorf("invalid server-url scheme %q, expected http or https", parsedServerURL.Scheme)
+			}
+			config.serverURL = serverURL
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
@@ -172,6 +190,13 @@ func NewOperatorCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&config.seedimageImagePullPolicy, "seedimage-image-pullpolicy", "IfNotPresent", "PullPolicy for the SeedImage builder image.")
 	_ = viper.BindPFlag("seedimage-image-pullpolicy", cmd.PersistentFlags().Lookup("seedimage-image-pullpolicy"))
 
+	cmd.PersistentFlags().StringVar(&config.serverURL, "server-url", "", "External URL used by machines to reach the Elemental operator HTTP server.")
+	_ = viper.BindPFlag("server-url", cmd.PersistentFlags().Lookup("server-url"))
+	_ = cobra.MarkFlagRequired(cmd.PersistentFlags(), "server-url")
+
+	cmd.PersistentFlags().StringVar(&config.httpBindAddr, "http-bind-addr", ":8082", "The address the Elemental HTTP server binds to.")
+	_ = viper.BindPFlag("http-bind-addr", cmd.PersistentFlags().Lookup("http-bind-addr"))
+
 	cmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
 	return cmd
@@ -224,7 +249,7 @@ func operatorRun(config *rootConfig) {
 	setupReconcilers(mgr, config)
 
 	// +kubebuilder:scaffold:builder
-	runRegistration(ctx, mgr, config.watchNamespace)
+	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL)
 	runManager(ctx, mgr)
 }
 
@@ -236,8 +261,37 @@ func runManager(ctx context.Context, mgr ctrl.Manager) {
 	}
 }
 
-func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace string) {
+func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL string) {
 	setupLog.Info("starting registration")
+	handler := server.New(ctx, mgr.GetClient(), serverURL)
+
+	if httpBindAddr != "" {
+		httpServer := &http.Server{
+			Addr:    httpBindAddr,
+			Handler: handler,
+			BaseContext: func(_ net.Listener) context.Context {
+				return ctx
+			},
+		}
+
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := httpServer.Shutdown(shutdownCtx); err != nil {
+				setupLog.Error(err, "problem shutting down elemental HTTP server")
+			}
+		}()
+
+		go func() {
+			setupLog.Info("starting elemental HTTP server", "addr", httpBindAddr)
+			if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				setupLog.Error(err, "problem running elemental HTTP server")
+				os.Exit(1)
+			}
+		}()
+	}
+
 	restConfig, err := runtimeconfig.GetConfig()
 	if err != nil {
 		setupLog.Error(err, "Failed to find kubeconfig")
@@ -250,7 +304,7 @@ func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace string) {
 		os.Exit(1)
 	}
 
-	aggregation.Watch(ctx, cl.Core().Secret(), namespace, "elemental-operator", server.New(ctx, mgr.GetClient()))
+	aggregation.Watch(ctx, cl.Core().Secret(), namespace, "elemental-operator", handler)
 
 	if err := cl.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running registration")
@@ -272,7 +326,8 @@ func setupChecks(mgr ctrl.Manager) {
 
 func setupReconcilers(mgr ctrl.Manager, config *rootConfig) {
 	if err := (&controllers.MachineRegistrationReconciler{
-		Client: mgr.GetClient(),
+		Client:    mgr.GetClient(),
+		ServerURL: config.serverURL,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create reconciler", "controller", "MachineRegistration")
 		os.Exit(1)
@@ -287,6 +342,7 @@ func setupReconcilers(mgr ctrl.Manager, config *rootConfig) {
 		Client:                   mgr.GetClient(),
 		SeedImageImage:           config.seedimageImage,
 		SeedImageImagePullPolicy: corev1.PullPolicy(config.seedimageImagePullPolicy),
+		ServerURL:                config.serverURL,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create reconciler", "controller", "SeedImage")
 		os.Exit(1)

@@ -46,12 +46,19 @@ type InventoryServer struct {
 	client.Client
 	context.Context
 	authenticators []authenticator
+	ServerURL      string
 }
 
-func New(ctx context.Context, cl client.Client) *InventoryServer {
+func New(ctx context.Context, cl client.Client, serverURL ...string) *InventoryServer {
+	configuredServerURL := ""
+	if len(serverURL) > 0 {
+		configuredServerURL = strings.TrimRight(serverURL[0], "/")
+	}
+
 	server := &InventoryServer{
-		Client:  cl,
-		Context: ctx,
+		Client:    cl,
+		Context:   ctx,
+		ServerURL: configuredServerURL,
 		authenticators: []authenticator{
 			tpm.New(ctx, cl),
 			plainauth.New(ctx, cl),
@@ -127,6 +134,15 @@ func (i *InventoryServer) getValue(name string) (string, error) {
 		return "", err
 	}
 	return setting.Value, nil
+}
+
+func (i *InventoryServer) getServerURL() (string, error) {
+	serverURL := strings.TrimRight(i.ServerURL, "/")
+	if serverURL == "" {
+		return "", fmt.Errorf("server-url is not set")
+	}
+
+	return serverURL, nil
 }
 
 func (i *InventoryServer) authMachine(conn *websocket.Conn, req *http.Request, registerNamespace string) (*elementalv1.MachineInventory, error) {

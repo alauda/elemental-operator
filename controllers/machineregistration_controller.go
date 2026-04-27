@@ -20,9 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/go-cmp/cmp"
-	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/wrangler/v3/pkg/randomtoken"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -47,12 +47,12 @@ import (
 // MachineRegistrationReconciler reconciles a MachineRegistration object.
 type MachineRegistrationReconciler struct {
 	client.Client
+	ServerURL string
 }
 
 // +kubebuilder:rbac:groups=elemental.cattle.io,resources=machineregistrations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=elemental.cattle.io,resources=machineregistrations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=rolebindings;roles,verbs=create;delete;list;watch
-// +kubebuilder:rbac:groups="management.cattle.io",resources=settings,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create;delete;list;watch;update
 
@@ -185,7 +185,7 @@ func (r *MachineRegistrationReconciler) setRegistrationTokenAndURL(ctx context.C
 	}
 
 	if mRegistration.Status.RegistrationURL == "" {
-		serverURL, err = r.getRancherServerURL(ctx)
+		serverURL, err = r.getServerURL()
 		if err != nil {
 			return fmt.Errorf("failed to get the server url: %w", err)
 		}
@@ -195,21 +195,14 @@ func (r *MachineRegistrationReconciler) setRegistrationTokenAndURL(ctx context.C
 	return nil
 }
 
-func (r *MachineRegistrationReconciler) getRancherServerURL(ctx context.Context) (string, error) {
-	logger := ctrl.LoggerFrom(ctx)
-
-	setting := &managementv3.Setting{}
-	if err := r.Get(ctx, types.NamespacedName{Name: "server-url"}, setting); err != nil {
-		return "", fmt.Errorf("failed to get server url setting: %w", err)
-	}
-
-	if setting.Value == "" {
+func (r *MachineRegistrationReconciler) getServerURL() (string, error) {
+	serverURL := strings.TrimRight(r.ServerURL, "/")
+	if serverURL == "" {
 		err := errors.New("server-url is not set")
-		logger.Error(err, "can't get server-url")
 		return "", err
 	}
 
-	return setting.Value, nil
+	return serverURL, nil
 }
 
 func (r *MachineRegistrationReconciler) createRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration) error {

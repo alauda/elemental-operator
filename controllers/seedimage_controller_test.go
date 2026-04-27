@@ -25,7 +25,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -41,7 +40,6 @@ var _ = Describe("reconcile seed image", func() {
 	var r *SeedImageReconciler
 	var mRegistration *elementalv1.MachineRegistration
 	var seedImg *elementalv1.SeedImage
-	var setting *managementv3.Setting
 	var pod *corev1.Pod
 	var service *corev1.Service
 
@@ -50,6 +48,7 @@ var _ = Describe("reconcile seed image", func() {
 			Client:                   cl,
 			SeedImageImage:           "registry.suse.com/rancher/seedimage-builder:latest",
 			SeedImageImagePullPolicy: corev1.PullIfNotPresent,
+			ServerURL:                "https://example.com",
 		}
 
 		mRegistration = &elementalv1.MachineRegistration{
@@ -93,13 +92,6 @@ var _ = Describe("reconcile seed image", func() {
 			},
 		}
 
-		setting = &managementv3.Setting{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "server-url",
-			},
-			Value: "https://example.com",
-		}
-
 		pod = &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: seedImg.Namespace,
@@ -118,7 +110,6 @@ var _ = Describe("reconcile seed image", func() {
 
 		Expect(cl.Create(ctx, mRegistration)).To(Succeed())
 		Expect(cl.Create(ctx, seedImg)).To(Succeed())
-		Expect(cl.Create(ctx, setting)).To(Succeed())
 
 		patchBase := client.MergeFrom(mRegistration.DeepCopy())
 		mRegistration.Status = *statusCopy
@@ -126,7 +117,7 @@ var _ = Describe("reconcile seed image", func() {
 	})
 
 	AfterEach(func() {
-		Expect(test.CleanupAndWait(ctx, cl, mRegistration, seedImg, setting, pod, service)).To(Succeed())
+		Expect(test.CleanupAndWait(ctx, cl, mRegistration, seedImg, pod, service)).To(Succeed())
 	})
 
 	It("should reconcile seed image object", func() {
@@ -273,7 +264,6 @@ var _ = Describe("reconcile seed image build container", func() {
 	var r *SeedImageReconciler
 	var mRegistration *elementalv1.MachineRegistration
 	var seedImg *elementalv1.SeedImage
-	var setting *managementv3.Setting
 	var pod *corev1.Pod
 	var service *corev1.Service
 
@@ -282,6 +272,7 @@ var _ = Describe("reconcile seed image build container", func() {
 			Client:                   cl,
 			SeedImageImage:           "registry.suse.com/rancher/seedimage-builder:latest",
 			SeedImageImagePullPolicy: corev1.PullIfNotPresent,
+			ServerURL:                "https://example.com",
 		}
 
 		mRegistration = &elementalv1.MachineRegistration{
@@ -330,13 +321,6 @@ var _ = Describe("reconcile seed image build container", func() {
 			},
 		}
 
-		setting = &managementv3.Setting{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "server-url",
-			},
-			Value: "https://example.com",
-		}
-
 		pod = &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: seedImg.Namespace,
@@ -355,7 +339,6 @@ var _ = Describe("reconcile seed image build container", func() {
 
 		Expect(cl.Create(ctx, mRegistration)).To(Succeed())
 		Expect(cl.Create(ctx, seedImg)).To(Succeed())
-		Expect(cl.Create(ctx, setting)).To(Succeed())
 
 		patchBase := client.MergeFrom(mRegistration.DeepCopy())
 		mRegistration.Status = *statusCopy
@@ -363,7 +346,7 @@ var _ = Describe("reconcile seed image build container", func() {
 	})
 
 	AfterEach(func() {
-		Expect(test.CleanupAndWait(ctx, cl, mRegistration, seedImg, setting, pod, service)).To(Succeed())
+		Expect(test.CleanupAndWait(ctx, cl, mRegistration, seedImg, pod, service)).To(Succeed())
 	})
 
 	It("should create the initContainer from a user-specified BuildContainer", func() {
@@ -395,7 +378,6 @@ var _ = Describe("reconcile seed image build container", func() {
 
 var _ = Describe("reconcileBuildImagePod", func() {
 	var r *SeedImageReconciler
-	var setting *managementv3.Setting
 	var mRegistration *elementalv1.MachineRegistration
 	var seedImg *elementalv1.SeedImage
 	var pod *corev1.Pod
@@ -406,6 +388,7 @@ var _ = Describe("reconcileBuildImagePod", func() {
 			Client:                   cl,
 			SeedImageImage:           "registry.suse.com/rancher/seedimage-builder:latest",
 			SeedImageImagePullPolicy: corev1.PullIfNotPresent,
+			ServerURL:                "https://example.com",
 		}
 
 		mRegistration = &elementalv1.MachineRegistration{
@@ -463,18 +446,10 @@ var _ = Describe("reconcileBuildImagePod", func() {
 			},
 		}
 
-		setting = &managementv3.Setting{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "server-url",
-			},
-			Value: "https://example.com",
-		}
-
 		statusCopy := mRegistration.Status.DeepCopy()
 
 		Expect(cl.Create(ctx, mRegistration)).To(Succeed())
 		Expect(cl.Create(ctx, seedImg)).To(Succeed())
-		Expect(cl.Create(ctx, setting)).To(Succeed())
 
 		patchBase := client.MergeFrom(mRegistration.DeepCopy())
 		mRegistration.Status = *statusCopy
@@ -482,7 +457,7 @@ var _ = Describe("reconcileBuildImagePod", func() {
 	})
 
 	AfterEach(func() {
-		Expect(test.CleanupAndWait(ctx, cl, mRegistration, setting, seedImg, pod, svc)).To(Succeed())
+		Expect(test.CleanupAndWait(ctx, cl, mRegistration, seedImg, pod, svc)).To(Succeed())
 	})
 
 	It("should return error when a pod with the same name but different owner is there", func() {
@@ -591,7 +566,6 @@ var _ = Describe("reconcileBuildImagePod", func() {
 
 var _ = Describe("createConfigMapObject", func() {
 	var r *SeedImageReconciler
-	var setting *managementv3.Setting
 	var mRegistration *elementalv1.MachineRegistration
 	var seedImg *elementalv1.SeedImage
 	var configMap *corev1.ConfigMap
@@ -603,6 +577,7 @@ var _ = Describe("createConfigMapObject", func() {
 			Client:                   cl,
 			SeedImageImage:           "registry.suse.com/rancher/seedimage-builder:latest",
 			SeedImageImagePullPolicy: corev1.PullIfNotPresent,
+			ServerURL:                "https://example.com",
 		}
 
 		mRegistration = &elementalv1.MachineRegistration{
@@ -665,18 +640,10 @@ var _ = Describe("createConfigMapObject", func() {
 			},
 		}
 
-		setting = &managementv3.Setting{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "server-url",
-			},
-			Value: "https://example.com",
-		}
-
 		statusCopy := mRegistration.Status.DeepCopy()
 
 		Expect(cl.Create(ctx, mRegistration)).To(Succeed())
 		Expect(cl.Create(ctx, seedImg)).To(Succeed())
-		Expect(cl.Create(ctx, setting)).To(Succeed())
 
 		patchBase := client.MergeFrom(mRegistration.DeepCopy())
 		mRegistration.Status = *statusCopy
@@ -684,7 +651,7 @@ var _ = Describe("createConfigMapObject", func() {
 	})
 
 	AfterEach(func() {
-		Expect(test.CleanupAndWait(ctx, cl, mRegistration, seedImg, setting, configMap, pod, svc)).To(Succeed())
+		Expect(test.CleanupAndWait(ctx, cl, mRegistration, seedImg, configMap, pod, svc)).To(Succeed())
 	})
 
 	It("should create a configmap with empty cloud-config data", func() {
@@ -730,6 +697,7 @@ var _ = Describe("updateStatusFromPod", func() {
 		r = &SeedImageReconciler{
 			Client:         cl,
 			SeedImageImage: "registry.suse.com/rancher/seedimage-builder:latest",
+			ServerURL:      "https://example.com",
 		}
 		seedImg = &elementalv1.SeedImage{
 			Status: elementalv1.SeedImageStatus{

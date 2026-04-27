@@ -741,8 +741,9 @@ func NewInventoryServer(auth authenticator) *InventoryServer {
 	managementv3.AddToScheme(scheme)
 
 	return &InventoryServer{
-		Context: context.Background(),
-		Client:  fake.NewClientBuilder().WithScheme(scheme).Build(),
+		Context:   context.Background(),
+		Client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
+		ServerURL: "https://test-server.example.com",
 		authenticators: []authenticator{
 			auth,
 		},
@@ -788,14 +789,6 @@ func createDefaultResources(t *testing.T, server *InventoryServer) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-account",
 		},
-	})
-
-	server.Client.Create(context.Background(), &managementv3.Setting{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "server-url",
-		},
-
-		Value: "https://test-server.example.com",
 	})
 
 	server.Client.Create(context.Background(), &managementv3.Setting{

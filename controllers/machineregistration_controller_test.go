@@ -22,7 +22,6 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,7 +37,6 @@ import (
 var _ = Describe("reconcile machine registration", func() {
 	var r *MachineRegistrationReconciler
 	var mRegistration *elementalv1.MachineRegistration
-	var setting *managementv3.Setting
 	var role *rbacv1.Role
 	var roleBinding *rbacv1.RoleBinding
 	var sa *corev1.ServiceAccount
@@ -46,7 +44,8 @@ var _ = Describe("reconcile machine registration", func() {
 
 	BeforeEach(func() {
 		r = &MachineRegistrationReconciler{
-			Client: cl,
+			Client:    cl,
+			ServerURL: "https://example.com",
 		}
 
 		objKey := metav1.ObjectMeta{
@@ -64,20 +63,11 @@ var _ = Describe("reconcile machine registration", func() {
 				Name:      mRegistration.Name + elementalv1.SASecretSuffix,
 			},
 		}
-		setting = &managementv3.Setting{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "server-url",
-			},
-			Value: "https://example.com",
-		}
-
 		Expect(cl.Create(ctx, mRegistration)).To(Succeed())
-
-		Expect(cl.Create(ctx, setting)).To(Succeed())
 	})
 
 	AfterEach(func() {
-		Expect(test.CleanupAndWait(ctx, cl, mRegistration, setting, role, roleBinding, sa, secret)).To(Succeed())
+		Expect(test.CleanupAndWait(ctx, cl, mRegistration, role, roleBinding, sa, secret)).To(Succeed())
 	})
 
 	reconcileTest := func() {
@@ -140,7 +130,8 @@ var _ = Describe("setRegistrationTokenAndURL", func() {
 
 	BeforeEach(func() {
 		r = &MachineRegistrationReconciler{
-			Client: cl,
+			Client:    cl,
+			ServerURL: "https://example.com",
 		}
 
 		mRegistration = &elementalv1.MachineRegistration{
@@ -156,36 +147,16 @@ var _ = Describe("setRegistrationTokenAndURL", func() {
 	})
 
 	It("should successfully set registration token and url", func() {
-		setting := &managementv3.Setting{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "server-url",
-			},
-			Value: "https://example.com",
-		}
-		Expect(cl.Create(ctx, setting)).To(Succeed())
 		Expect(r.setRegistrationTokenAndURL(ctx, mRegistration)).To(Succeed())
 		Expect(mRegistration.Status.RegistrationToken).ToNot(BeEmpty())
 		Expect(mRegistration.Status.RegistrationURL).To(ContainSubstring("https://example.com/elemental/registration/"))
-		Expect(test.CleanupAndWait(ctx, cl, setting)).To(Succeed())
 	})
 
-	It("should return error when setting doesn't exist", func() {
-		err := r.setRegistrationTokenAndURL(ctx, mRegistration)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("failed to get server url setting"))
-	})
-
-	It("should return error when setting doesn't have a value", func() {
-		setting := &managementv3.Setting{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "server-url",
-			},
-		}
-		Expect(cl.Create(ctx, setting)).To(Succeed())
+	It("should return error when server-url is not configured", func() {
+		r.ServerURL = ""
 		err := r.setRegistrationTokenAndURL(ctx, mRegistration)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("server-url is not set"))
-		Expect(test.CleanupAndWait(ctx, cl, setting)).To(Succeed())
 	})
 })
 

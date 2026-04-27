@@ -37,7 +37,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/wrangler/v3/pkg/randomtoken"
 	"github.com/rancher/yip/pkg/schema"
 
@@ -49,6 +48,7 @@ type SeedImageReconciler struct {
 	client.Client
 	SeedImageImage           string
 	SeedImageImagePullPolicy corev1.PullPolicy
+	ServerURL                string
 }
 
 const (
@@ -414,9 +414,9 @@ func (r *SeedImageReconciler) updateStatusFromPod(ctx context.Context, seedImg *
 		})
 		return nil
 	case corev1.PodRunning:
-		rancherURL, err := r.getRancherServerAddress(ctx)
+		serverURL, err := r.getServerURL()
 		if err != nil {
-			errMsg := fmt.Errorf("failed to get Rancher Server Address: %w", err)
+			errMsg := fmt.Errorf("failed to get server URL: %w", err)
 			meta.SetStatusCondition(&seedImg.Status.Conditions, metav1.Condition{
 				Type:    elementalv1.SeedImageConditionReady,
 				Status:  metav1.ConditionFalse,
@@ -461,7 +461,7 @@ func (r *SeedImageReconciler) updateStatusFromPod(ctx context.Context, seedImg *
 		}
 
 		seedImg.Status.DownloadToken = token
-		seedImg.Status.DownloadURL = fmt.Sprintf("https://%s/elemental/seedimage/%s/%s", rancherURL, token, outputName)
+		seedImg.Status.DownloadURL = fmt.Sprintf("%s/elemental/seedimage/%s/%s", serverURL, token, outputName)
 		seedImg.Status.ChecksumURL = fmt.Sprintf("%s.sha256", seedImg.Status.DownloadURL)
 		meta.SetStatusCondition(&seedImg.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.SeedImageConditionReady,
@@ -550,21 +550,13 @@ func (r *SeedImageReconciler) deleteChildResources(ctx context.Context, seedImg 
 	return nil
 }
 
-func (r *SeedImageReconciler) getRancherServerAddress(ctx context.Context) (string, error) {
-	logger := ctrl.LoggerFrom(ctx)
-
-	setting := &managementv3.Setting{}
-	if err := r.Get(ctx, types.NamespacedName{Name: "server-url"}, setting); err != nil {
-		return "", fmt.Errorf("failed to get server url setting: %w", err)
+func (r *SeedImageReconciler) getServerURL() (string, error) {
+	serverURL := strings.TrimRight(r.ServerURL, "/")
+	if serverURL == "" {
+		return "", fmt.Errorf("server-url is not set")
 	}
 
-	if setting.Value == "" {
-		err := fmt.Errorf("server-url is not set")
-		logger.Error(err, "can't get server-url")
-		return "", err
-	}
-
-	return strings.TrimPrefix(setting.Value, "https://"), nil
+	return serverURL, nil
 }
 
 func fillBuildImagePod(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy) *corev1.Pod {
