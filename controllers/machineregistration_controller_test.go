@@ -218,13 +218,10 @@ var _ = Describe("createRBACObjects", func() {
 		Expect(role.OwnerReferences[0].Controller).To(Equal(ptr.To(true)))
 		Expect(role.Labels).To(HaveKey(elementalv1.ElementalManagedLabel))
 
-		Expect(role.Rules).To(HaveLen(2))
+		Expect(role.Rules).To(HaveLen(1))
 		Expect(role.Rules[0].APIGroups).To(Equal([]string{""}))
 		Expect(role.Rules[0].Verbs).To(Equal([]string{"get", "watch", "list", "update", "patch"}))
 		Expect(role.Rules[0].Resources).To(Equal([]string{"secrets"}))
-		Expect(role.Rules[1].APIGroups).To(Equal([]string{"management.cattle.io"}))
-		Expect(role.Rules[1].Verbs).To(Equal([]string{"get", "watch", "list"}))
-		Expect(role.Rules[1].Resources).To(Equal([]string{"settings"}))
 
 		sa := &corev1.ServiceAccount{}
 		Expect(r.Get(ctx, objKey, sa)).To(Succeed())

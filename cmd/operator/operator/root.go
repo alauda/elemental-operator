@@ -29,7 +29,6 @@ import (
 	"strings"
 	"time"
 
-	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/steve/pkg/aggregation"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -84,13 +83,15 @@ type rootConfig struct {
 	seedimageImagePullPolicy    string
 	serverURL                   string
 	httpBindAddr                string
+	caCertFile                  string
+	caCert                      string
+	agentTLSMode                string
 }
 
 func init() {
 	klog.InitFlags(nil)
 
 	utilruntime.Must(elementalv1.AddToScheme(scheme))
-	utilruntime.Must(managementv3.AddToScheme(scheme))
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 }
 
@@ -120,6 +121,24 @@ func NewOperatorCommand() *cobra.Command {
 				return fmt.Errorf("invalid server-url scheme %q, expected http or https", parsedServerURL.Scheme)
 			}
 			config.serverURL = serverURL
+
+			agentTLSMode := strings.TrimSpace(config.agentTLSMode)
+			switch agentTLSMode {
+			case "", server.AgentTLSModeStrict:
+				config.agentTLSMode = server.AgentTLSModeStrict
+			case server.AgentTLSModeSystemStore:
+				config.agentTLSMode = agentTLSMode
+			default:
+				return fmt.Errorf("invalid agent-tls-mode %q, valid values: %q, %q", config.agentTLSMode, server.AgentTLSModeStrict, server.AgentTLSModeSystemStore)
+			}
+
+			if config.caCertFile != "" {
+				caCert, err := os.ReadFile(config.caCertFile)
+				if err != nil {
+					return fmt.Errorf("failed to read ca-cert-file %q: %w", config.caCertFile, err)
+				}
+				config.caCert = string(caCert)
+			}
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
@@ -197,6 +216,12 @@ func NewOperatorCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&config.httpBindAddr, "http-bind-addr", ":8082", "The address the Elemental HTTP server binds to.")
 	_ = viper.BindPFlag("http-bind-addr", cmd.PersistentFlags().Lookup("http-bind-addr"))
 
+	cmd.PersistentFlags().StringVar(&config.caCertFile, "ca-cert-file", "", "Path to a PEM CA bundle used in Elemental registration configs.")
+	_ = viper.BindPFlag("ca-cert-file", cmd.PersistentFlags().Lookup("ca-cert-file"))
+
+	cmd.PersistentFlags().StringVar(&config.agentTLSMode, "agent-tls-mode", server.AgentTLSModeStrict, "System agent TLS mode. Valid values: strict, system-store.")
+	_ = viper.BindPFlag("agent-tls-mode", cmd.PersistentFlags().Lookup("agent-tls-mode"))
+
 	cmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
 	return cmd
@@ -249,7 +274,7 @@ func operatorRun(config *rootConfig) {
 	setupReconcilers(mgr, config)
 
 	// +kubebuilder:scaffold:builder
-	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL)
+	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL, config.caCert, config.agentTLSMode)
 	runManager(ctx, mgr)
 }
 
@@ -261,9 +286,13 @@ func runManager(ctx context.Context, mgr ctrl.Manager) {
 	}
 }
 
-func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL string) {
+func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL, caCert, agentTLSMode string) {
 	setupLog.Info("starting registration")
-	handler := server.New(ctx, mgr.GetClient(), serverURL)
+	handler := server.NewWithOptions(ctx, mgr.GetClient(), server.Options{
+		ServerURL:    serverURL,
+		CACert:       caCert,
+		AgentTLSMode: agentTLSMode,
+	})
 
 	if httpBindAddr != "" {
 		httpServer := &http.Server{
@@ -343,6 +372,7 @@ func setupReconcilers(mgr ctrl.Manager, config *rootConfig) {
 		SeedImageImage:           config.seedimageImage,
 		SeedImageImagePullPolicy: corev1.PullPolicy(config.seedimageImagePullPolicy),
 		ServerURL:                config.serverURL,
+		CACert:                   config.caCert,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create reconciler", "controller", "SeedImage")
 		os.Exit(1)

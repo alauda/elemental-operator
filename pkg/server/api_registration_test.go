@@ -32,14 +32,12 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/jaypipes/ghw/pkg/memory"
 
-	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"gopkg.in/yaml.v3"
 	"gotest.tools/v3/assert"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
@@ -72,13 +70,10 @@ func TestUnauthenticatedResponse(t *testing.T) {
 	}
 
 	for _, test := range testCase {
-		scheme := runtime.NewScheme()
-		elementalv1.AddToScheme(scheme)
-		managementv3.AddToScheme(scheme)
-
 		i := &InventoryServer{
 			Context: context.Background(),
 			Client:  fake.NewClientBuilder().Build(),
+			CACert:  "test-ca",
 		}
 		registration := elementalv1.MachineRegistration{}
 		registration.Spec.Config = test.config
@@ -110,6 +105,7 @@ func TestUnauthenticatedResponse(t *testing.T) {
 		assert.Equal(t, confReg.EmulateTPM, testReg.EmulateTPM)
 		assert.Equal(t, confReg.EmulatedTPMSeed, testReg.EmulatedTPMSeed)
 		assert.Equal(t, confReg.NoSMBIOS, testReg.NoSMBIOS)
+		assert.Equal(t, confReg.CACert, "test-ca")
 	}
 }
 
@@ -692,24 +688,24 @@ func TestRegistrationDynamicLabels(t *testing.T) {
 func TestAgentTLSMode(t *testing.T) {
 	type test struct {
 		name              string
-		agentTLSModeValue *string
+		agentTLSMode      string
 		wantStrictTLSMode bool
 	}
 
 	tests := []test{
 		{
 			name:              "missing agent-tls-mode",
-			agentTLSModeValue: nil,
+			agentTLSMode:      "",
 			wantStrictTLSMode: true,
 		},
 		{
 			name:              "strict agent-tls-mode",
-			agentTLSModeValue: ptr.To("strict"),
+			agentTLSMode:      AgentTLSModeStrict,
 			wantStrictTLSMode: true,
 		},
 		{
 			name:              "system-store agent-tls-mode",
-			agentTLSModeValue: ptr.To("system-store"),
+			agentTLSMode:      AgentTLSModeSystemStore,
 			wantStrictTLSMode: false,
 		},
 	}
@@ -718,16 +714,7 @@ func TestAgentTLSMode(t *testing.T) {
 		server := NewInventoryServer(&FakeAuthServer{})
 
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.agentTLSModeValue != nil {
-				server.Client.Create(context.Background(), &managementv3.Setting{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "agent-tls-mode",
-					},
-
-					Value: *tt.agentTLSModeValue,
-				})
-			}
-
+			server.AgentTLSMode = tt.agentTLSMode
 			assert.Equal(t, server.isAgentTLSModeStrict(), tt.wantStrictTLSMode)
 		})
 	}
@@ -738,12 +725,12 @@ func NewInventoryServer(auth authenticator) *InventoryServer {
 	scheme := runtime.NewScheme()
 	elementalv1.AddToScheme(scheme)
 	clientgoscheme.AddToScheme(scheme)
-	managementv3.AddToScheme(scheme)
 
 	return &InventoryServer{
-		Context:   context.Background(),
-		Client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
-		ServerURL: "https://test-server.example.com",
+		Context:      context.Background(),
+		Client:       fake.NewClientBuilder().WithScheme(scheme).Build(),
+		ServerURL:    "https://test-server.example.com",
+		AgentTLSMode: AgentTLSModeStrict,
 		authenticators: []authenticator{
 			auth,
 		},
@@ -789,13 +776,5 @@ func createDefaultResources(t *testing.T, server *InventoryServer) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-account",
 		},
-	})
-
-	server.Client.Create(context.Background(), &managementv3.Setting{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "cacerts",
-		},
-
-		Value: "cacerts",
 	})
 }

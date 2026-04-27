@@ -118,7 +118,7 @@ func (i *InventoryServer) apiRegistration(resp http.ResponseWriter, req *http.Re
 }
 
 func (i *InventoryServer) unauthenticatedResponse(registration *elementalv1.MachineRegistration, writer io.Writer) error {
-	config, err := registration.GetClientRegistrationConfig(i.getRancherCACert())
+	config, err := registration.GetClientRegistrationConfig(i.CACert)
 	if err != nil {
 		return err
 	}
@@ -151,7 +151,7 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 		return fmt.Errorf("failed to get server-url: %w", err)
 	}
 
-	config, err := registration.GetClientRegistrationConfig(i.getRancherCACert())
+	config, err := registration.GetClientRegistrationConfig(i.CACert)
 	if err != nil {
 		return err
 	}
@@ -201,31 +201,9 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 	return register.WriteMessage(conn, register.MsgConfig, data)
 }
 
-func (i *InventoryServer) getRancherCACert() string {
-	cacert, err := i.getValue("cacerts")
-	if err != nil {
-		log.Errorf("Error getting cacerts: %s", err.Error())
-	}
-
-	if cacert == "" {
-		if cacert, err = i.getValue("internal-cacerts"); err != nil {
-			log.Errorf("Error getting internal-cacerts: %s", err.Error())
-			return ""
-		}
-	}
-	return cacert
-}
-
-// Support for agent-tls-mode
 func (i *InventoryServer) isAgentTLSModeStrict() bool {
-	agentTLSMode, err := i.getValue("agent-tls-mode")
-	if err != nil {
-		log.Errorf("Error getting agent-tls-mode: %s", err.Error())
-	}
-	switch agentTLSMode {
-	case "strict":
-		return true
-	case "system-store":
+	switch i.AgentTLSMode {
+	case AgentTLSModeSystemStore:
 		return false
 	default:
 		// Historically the default has been strict TLS verification

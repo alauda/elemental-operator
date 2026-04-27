@@ -234,10 +234,6 @@ func (r *MachineRegistrationReconciler) createRBACObjects(ctx context.Context, m
 			APIGroups: []string{""},
 			Verbs:     []string{"get", "watch", "list", "update", "patch"}, // TODO: Review permissions, does it need update, patch?
 			Resources: []string{"secrets"},
-		}, {
-			APIGroups: []string{"management.cattle.io"},
-			Verbs:     []string{"get", "watch", "list"},
-			Resources: []string{"settings"},
 		},
 		},
 	}); err != nil && !apierrors.IsAlreadyExists(err) {

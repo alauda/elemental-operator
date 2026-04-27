@@ -79,14 +79,6 @@ rules:
   - patch
   - update
 - apiGroups:
-  - management.cattle.io
-  resources:
-  - settings
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
   - rbac.authorization.k8s.io
   resources:
   - rolebindings

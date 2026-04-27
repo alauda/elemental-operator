@@ -26,8 +26,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
@@ -42,23 +40,47 @@ type authenticator interface {
 	Authenticate(conn *websocket.Conn, req *http.Request, registerNamespace string) (*elementalv1.MachineInventory, bool, error)
 }
 
+const (
+	AgentTLSModeStrict      = "strict"
+	AgentTLSModeSystemStore = "system-store"
+)
+
+type Options struct {
+	ServerURL    string
+	CACert       string
+	AgentTLSMode string
+}
+
 type InventoryServer struct {
 	client.Client
 	context.Context
 	authenticators []authenticator
 	ServerURL      string
+	CACert         string
+	AgentTLSMode   string
 }
 
 func New(ctx context.Context, cl client.Client, serverURL ...string) *InventoryServer {
-	configuredServerURL := ""
+	options := Options{AgentTLSMode: AgentTLSModeStrict}
 	if len(serverURL) > 0 {
-		configuredServerURL = strings.TrimRight(serverURL[0], "/")
+		options.ServerURL = serverURL[0]
+	}
+
+	return NewWithOptions(ctx, cl, options)
+}
+
+func NewWithOptions(ctx context.Context, cl client.Client, options Options) *InventoryServer {
+	agentTLSMode := strings.TrimSpace(options.AgentTLSMode)
+	if agentTLSMode == "" {
+		agentTLSMode = AgentTLSModeStrict
 	}
 
 	server := &InventoryServer{
-		Client:    cl,
-		Context:   ctx,
-		ServerURL: configuredServerURL,
+		Client:       cl,
+		Context:      ctx,
+		ServerURL:    strings.TrimRight(options.ServerURL, "/"),
+		CACert:       options.CACert,
+		AgentTLSMode: agentTLSMode,
 		authenticators: []authenticator{
 			tpm.New(ctx, cl),
 			plainauth.New(ctx, cl),
@@ -125,15 +147,6 @@ func upgrade(resp http.ResponseWriter, req *http.Request) (*websocket.Conn, erro
 	}
 
 	return conn, err
-}
-
-func (i *InventoryServer) getValue(name string) (string, error) {
-	setting := &managementv3.Setting{}
-	if err := i.Get(i, types.NamespacedName{Name: name}, setting); err != nil {
-		log.Errorf("Error getting %s setting: %s", name, err.Error())
-		return "", err
-	}
-	return setting.Value, nil
 }
 
 func (i *InventoryServer) getServerURL() (string, error) {

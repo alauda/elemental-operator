@@ -49,6 +49,7 @@ var _ = Describe("reconcile seed image", func() {
 			SeedImageImage:           "registry.suse.com/rancher/seedimage-builder:latest",
 			SeedImageImagePullPolicy: corev1.PullIfNotPresent,
 			ServerURL:                "https://example.com",
+			CACert:                   "test-ca",
 		}
 
 		mRegistration = &elementalv1.MachineRegistration{
@@ -661,6 +662,7 @@ var _ = Describe("createConfigMapObject", func() {
 			Namespace: seedImg.Namespace,
 		}, configMap)).To(Succeed())
 		Expect(len(configMap.BinaryData["cloud-config"])).To(Equal(0))
+		Expect(string(configMap.BinaryData["registration"])).To(ContainSubstring("ca-cert: test-ca"))
 	})
 
 	It("should create a configmap with non-empty cloud-config data", func() {

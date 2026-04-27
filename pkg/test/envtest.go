@@ -22,8 +22,6 @@ import (
 	goruntime "runtime"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
-	managementv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -38,7 +36,6 @@ var (
 
 func init() {
 	utilruntime.Must(elementalv1.AddToScheme(scheme))
-	utilruntime.Must(managementv3.AddToScheme(scheme))
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 }
 
@@ -47,9 +44,6 @@ func StartEnvTest(testEnv *envtest.Environment) (*rest.Config, client.Client, er
 	_, filename, _, _ := goruntime.Caller(0) //nolint:dogsled
 	root := path.Join(path.Dir(filename), "..", "..", "..", "elemental-operator")
 
-	testEnv.CRDs = []*apiextensionsv1.CustomResourceDefinition{
-		fakeSettingCRD,
-	}
 	testEnv.CRDDirectoryPaths = []string{
 		path.Join(root, "config", "crd", "bases"),
 	}

@@ -49,6 +49,7 @@ type SeedImageReconciler struct {
 	SeedImageImage           string
 	SeedImageImagePullPolicy corev1.PullPolicy
 	ServerURL                string
+	CACert                   string
 }
 
 const (
@@ -297,7 +298,7 @@ func (r *SeedImageReconciler) reconcileConfigMapObject(ctx context.Context, seed
 
 	podConfigMap := &corev1.ConfigMap{}
 
-	regClientConf, err := mRegistration.GetClientRegistrationConfig(util.GetRancherCACert(ctx, r))
+	regClientConf, err := mRegistration.GetClientRegistrationConfig(r.CACert)
 	if err != nil {
 		return fmt.Errorf("failed processing registration config: %w", err)
 	}
