@@ -137,6 +137,27 @@ var _ = Describe("reconcile machine inventory", func() {
 		Expect(networkCond.Message).To(Equal("NetworkConfig is ready"))
 	})
 
+	It("should not mark network config ready when reconciliation is required", func() {
+		mInventory.Spec.Network.Configurator = network.ConfiguratorNmc
+		Expect(cl.Update(ctx, mInventory)).To(Succeed())
+
+		_, err := r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: mInventory.Namespace,
+				Name:      mInventory.Name,
+			},
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(cl.Get(ctx, client.ObjectKey{
+			Name:      mInventory.Name,
+			Namespace: mInventory.Namespace,
+		}, mInventory)).To(Succeed())
+
+		networkCond := meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.NetworkConfigReady)
+		Expect(networkCond).To(BeNil())
+	})
+
 	It("should add finalizer if not exist", func() {
 		noFinalizerMI := &elementalv1.MachineInventory{
 			ObjectMeta: metav1.ObjectMeta{

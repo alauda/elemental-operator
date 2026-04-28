@@ -155,12 +155,14 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 		return ctrl.Result{}, fmt.Errorf("failed to create plan secret: %w", err)
 	}
 
-	meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
-		Type:    elementalv1.NetworkConfigReady,
-		Reason:  elementalv1.ReconcilingNetworkConfig,
-		Status:  metav1.ConditionTrue,
-		Message: "NetworkConfig is ready",
-	})
+	if isNetworkConfigReadyWithoutReconciliation(mInventory) {
+		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
+			Type:    elementalv1.NetworkConfigReady,
+			Reason:  elementalv1.ReconcilingNetworkConfig,
+			Status:  metav1.ConditionTrue,
+			Message: "NetworkConfig is ready",
+		})
+	}
 
 	if err := r.updateInventoryWithPlanStatus(ctx, mInventory); err != nil {
 		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
@@ -173,6 +175,11 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func isNetworkConfigReadyWithoutReconciliation(mInventory *elementalv1.MachineInventory) bool {
+	configurator := mInventory.Spec.Network.Configurator
+	return configurator == "" || configurator == network.ConfiguratorNone
 }
 
 func (r *MachineInventoryReconciler) reconcileResetPlanSecret(ctx context.Context, mInventory *elementalv1.MachineInventory) error {
