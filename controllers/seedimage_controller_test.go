@@ -772,7 +772,7 @@ var _ = Describe("fillBuildImagePod", func() {
 			},
 		}
 
-		pod := fillBuildImagePod(seedImg, defaultBuildImg, corev1.PullNever)
+		pod := fillBuildImagePod(seedImg, defaultBuildImg, corev1.PullNever, nil)
 
 		Expect(len(pod.Spec.InitContainers)).To(Equal(1))
 		Expect(pod.Spec.InitContainers[0].Image).To(Equal(defaultBuildImg))
@@ -794,7 +794,7 @@ var _ = Describe("fillBuildImagePod", func() {
 			},
 		}
 
-		pod := fillBuildImagePod(seedImg, "", corev1.PullNever)
+		pod := fillBuildImagePod(seedImg, "", corev1.PullNever, nil)
 
 		Expect(len(pod.Spec.InitContainers)).To(Equal(1))
 		Expect(pod.Spec.InitContainers[0].Image).To(Equal(buildImg))
@@ -810,11 +810,22 @@ var _ = Describe("fillBuildImagePod", func() {
 			},
 		}
 
-		pod := fillBuildImagePod(seedImg, defaultBuildImg, corev1.PullNever)
+		pod := fillBuildImagePod(seedImg, defaultBuildImg, corev1.PullNever, nil)
 
 		Expect(len(pod.Spec.InitContainers)).To(Equal(2))
 		Expect(pod.Spec.InitContainers[0].Image).To(Equal(defaultBuildImg))
 		Expect(pod.Spec.InitContainers[0].Args[0]).To(ContainSubstring("elemental pull-image --platform=linux/riscv64"))
 
+	})
+
+	It("should configure image pull secrets", func() {
+		seedImg := &elementalv1.SeedImage{}
+
+		pod := fillBuildImagePod(seedImg, "default-builder:latest", corev1.PullNever, []string{"registry-secret", "", "registry-secret", " mirror-secret "})
+
+		Expect(pod.Spec.ImagePullSecrets).To(Equal([]corev1.LocalObjectReference{
+			{Name: "registry-secret"},
+			{Name: "mirror-secret"},
+		}))
 	})
 })

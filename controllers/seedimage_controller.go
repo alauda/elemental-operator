@@ -46,10 +46,11 @@ import (
 
 type SeedImageReconciler struct {
 	client.Client
-	SeedImageImage           string
-	SeedImageImagePullPolicy corev1.PullPolicy
-	ServerURL                string
-	CACert                   string
+	SeedImageImage            string
+	SeedImageImagePullPolicy  corev1.PullPolicy
+	SeedImageImagePullSecrets []string
+	ServerURL                 string
+	CACert                    string
 }
 
 const (
@@ -261,7 +262,7 @@ func (r *SeedImageReconciler) reconcileBuildImagePod(ctx context.Context, seedIm
 
 	logger.V(5).Info("Creating pod")
 
-	pod := fillBuildImagePod(seedImg, r.SeedImageImage, r.SeedImageImagePullPolicy)
+	pod := fillBuildImagePod(seedImg, r.SeedImageImage, r.SeedImageImagePullPolicy, r.SeedImageImagePullSecrets)
 	if err := controllerutil.SetControllerReference(seedImg, pod, r.Scheme()); err != nil {
 		meta.SetStatusCondition(&seedImg.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.SeedImageConditionReady,
@@ -560,7 +561,7 @@ func (r *SeedImageReconciler) getServerURL() (string, error) {
 	return serverURL, nil
 }
 
-func fillBuildImagePod(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy) *corev1.Pod {
+func fillBuildImagePod(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy, pullSecrets []string) *corev1.Pod {
 	name := seedImg.Name
 	namespace := seedImg.Namespace
 	baseImg := seedImg.Spec.BaseImage
@@ -584,7 +585,8 @@ func fillBuildImagePod(seedImg *elementalv1.SeedImage, buildImg string, pullPoli
 			},
 		},
 		Spec: corev1.PodSpec{
-			InitContainers: initContainers,
+			ImagePullSecrets: imagePullSecrets(pullSecrets),
+			InitContainers:   initContainers,
 			Containers: []corev1.Container{
 				{
 					Name:            "serve",
@@ -644,6 +646,26 @@ func fillBuildImagePod(seedImg *elementalv1.SeedImage, buildImg string, pullPoli
 		},
 	}
 	return pod
+}
+
+func imagePullSecrets(names []string) []corev1.LocalObjectReference {
+	if len(names) == 0 {
+		return nil
+	}
+	secrets := make([]corev1.LocalObjectReference, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		secrets = append(secrets, corev1.LocalObjectReference{Name: name})
+	}
+	return secrets
 }
 
 func defaultInitContainers(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy) []corev1.Container {
