@@ -96,6 +96,12 @@ var _ = Describe("reconcile machine inventory", func() {
 		Expect(cond.Reason).To(Equal(elementalv1.WaitingForPlanReason))
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Message).To(Equal("waiting for plan to be applied"))
+
+		networkCond := meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.NetworkConfigReady)
+		Expect(networkCond).NotTo(BeNil())
+		Expect(networkCond.Reason).To(Equal(elementalv1.ReconcilingNetworkConfig))
+		Expect(networkCond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(networkCond.Message).To(Equal("NetworkConfig is ready"))
 	})
 
 	It("should reconcile machine inventory object when plan secret already exists", func() {
@@ -123,6 +129,12 @@ var _ = Describe("reconcile machine inventory", func() {
 		Expect(cond.Reason).To(Equal(elementalv1.PlanSuccessfullyAppliedReason))
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Message).To(Equal("plan successfully applied"))
+
+		networkCond := meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.NetworkConfigReady)
+		Expect(networkCond).NotTo(BeNil())
+		Expect(networkCond.Reason).To(Equal(elementalv1.ReconcilingNetworkConfig))
+		Expect(networkCond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(networkCond.Message).To(Equal("NetworkConfig is ready"))
 	})
 
 	It("should add finalizer if not exist", func() {

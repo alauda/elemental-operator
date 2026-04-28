@@ -155,6 +155,13 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 		return ctrl.Result{}, fmt.Errorf("failed to create plan secret: %w", err)
 	}
 
+	meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
+		Type:    elementalv1.NetworkConfigReady,
+		Reason:  elementalv1.ReconcilingNetworkConfig,
+		Status:  metav1.ConditionTrue,
+		Message: "NetworkConfig is ready",
+	})
+
 	if err := r.updateInventoryWithPlanStatus(ctx, mInventory); err != nil {
 		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.ReadyCondition,
