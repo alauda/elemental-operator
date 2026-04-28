@@ -382,6 +382,7 @@ func TestRegistrationMsgGet(t *testing.T) {
 	}
 
 	server := NewInventoryServer(&FakeAuthServer{})
+	server.SystemAgentClusterName = "global"
 
 	server.Client.Create(context.Background(), &elementalv1.MachineRegistration{
 		ObjectMeta: metav1.ObjectMeta{
@@ -506,6 +507,9 @@ func TestRegistrationMsgGet(t *testing.T) {
 			config := &elementalv1.Config{}
 			err = yaml.Unmarshal(data, &config)
 			assert.NilError(t, err)
+			if tc.wantMessageType == register.MsgConfig {
+				assert.Equal(t, "https://test-server.example.com/kubernetes/global", config.Elemental.SystemAgent.URL)
+			}
 		})
 	}
 }
@@ -727,10 +731,11 @@ func NewInventoryServer(auth authenticator) *InventoryServer {
 	clientgoscheme.AddToScheme(scheme)
 
 	return &InventoryServer{
-		Context:      context.Background(),
-		Client:       fake.NewClientBuilder().WithScheme(scheme).Build(),
-		ServerURL:    "https://test-server.example.com",
-		AgentTLSMode: AgentTLSModeStrict,
+		Context:                context.Background(),
+		Client:                 fake.NewClientBuilder().WithScheme(scheme).Build(),
+		ServerURL:              "https://test-server.example.com",
+		AgentTLSMode:           AgentTLSModeStrict,
+		SystemAgentClusterName: DefaultSystemAgentClusterName,
 		authenticators: []authenticator{
 			auth,
 		},

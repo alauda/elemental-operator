@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -43,21 +44,25 @@ type authenticator interface {
 const (
 	AgentTLSModeStrict      = "strict"
 	AgentTLSModeSystemStore = "system-store"
+
+	DefaultSystemAgentClusterName = "local"
 )
 
 type Options struct {
-	ServerURL    string
-	CACert       string
-	AgentTLSMode string
+	ServerURL              string
+	CACert                 string
+	AgentTLSMode           string
+	SystemAgentClusterName string
 }
 
 type InventoryServer struct {
 	client.Client
 	context.Context
-	authenticators []authenticator
-	ServerURL      string
-	CACert         string
-	AgentTLSMode   string
+	authenticators         []authenticator
+	ServerURL              string
+	CACert                 string
+	AgentTLSMode           string
+	SystemAgentClusterName string
 }
 
 func New(ctx context.Context, cl client.Client, serverURL ...string) *InventoryServer {
@@ -76,11 +81,12 @@ func NewWithOptions(ctx context.Context, cl client.Client, options Options) *Inv
 	}
 
 	server := &InventoryServer{
-		Client:       cl,
-		Context:      ctx,
-		ServerURL:    strings.TrimRight(options.ServerURL, "/"),
-		CACert:       options.CACert,
-		AgentTLSMode: agentTLSMode,
+		Client:                 cl,
+		Context:                ctx,
+		ServerURL:              strings.TrimRight(options.ServerURL, "/"),
+		CACert:                 options.CACert,
+		AgentTLSMode:           agentTLSMode,
+		SystemAgentClusterName: NormalizeSystemAgentClusterName(options.SystemAgentClusterName),
 		authenticators: []authenticator{
 			tpm.New(ctx, cl),
 			plainauth.New(ctx, cl),
@@ -156,6 +162,24 @@ func (i *InventoryServer) getServerURL() (string, error) {
 	}
 
 	return serverURL, nil
+}
+
+func NormalizeSystemAgentClusterName(clusterName string) string {
+	clusterName = strings.Trim(strings.TrimSpace(clusterName), "/")
+	if clusterName == "" {
+		return DefaultSystemAgentClusterName
+	}
+	return clusterName
+}
+
+func (i *InventoryServer) getSystemAgentURL() (string, error) {
+	serverURL, err := i.getServerURL()
+	if err != nil {
+		return "", err
+	}
+
+	clusterName := NormalizeSystemAgentClusterName(i.SystemAgentClusterName)
+	return fmt.Sprintf("%s/kubernetes/%s", serverURL, url.PathEscape(clusterName)), nil
 }
 
 func (i *InventoryServer) authMachine(conn *websocket.Conn, req *http.Request, registerNamespace string) (*elementalv1.MachineInventory, error) {

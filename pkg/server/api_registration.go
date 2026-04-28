@@ -146,9 +146,9 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 		return fmt.Errorf("failed to get secret: %w", err)
 	}
 
-	serverURL, err := i.getServerURL()
+	systemAgentURL, err := i.getSystemAgentURL()
 	if err != nil {
-		return fmt.Errorf("failed to get server-url: %w", err)
+		return fmt.Errorf("failed to get system-agent url: %w", err)
 	}
 
 	config, err := registration.GetClientRegistrationConfig(i.CACert)
@@ -157,7 +157,7 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 	}
 	config.Elemental.SystemAgent = elementalv1.SystemAgent{
 		StrictTLSMode:   i.isAgentTLSModeStrict(),
-		URL:             fmt.Sprintf("%s/k8s/clusters/local", serverURL),
+		URL:             systemAgentURL,
 		Token:           string(secret.Data["token"]),
 		SecretName:      inventory.Name,
 		SecretNamespace: inventory.Namespace,

@@ -87,6 +87,7 @@ type rootConfig struct {
 	caCertFile                  string
 	caCert                      string
 	agentTLSMode                string
+	systemAgentClusterName      string
 }
 
 func init() {
@@ -122,6 +123,7 @@ func NewOperatorCommand() *cobra.Command {
 				return fmt.Errorf("invalid server-url scheme %q, expected http or https", parsedServerURL.Scheme)
 			}
 			config.serverURL = serverURL
+			config.systemAgentClusterName = server.NormalizeSystemAgentClusterName(config.systemAgentClusterName)
 
 			agentTLSMode := strings.TrimSpace(config.agentTLSMode)
 			switch agentTLSMode {
@@ -226,6 +228,9 @@ func NewOperatorCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&config.agentTLSMode, "agent-tls-mode", server.AgentTLSModeStrict, "System agent TLS mode. Valid values: strict, system-store.")
 	_ = viper.BindPFlag("agent-tls-mode", cmd.PersistentFlags().Lookup("agent-tls-mode"))
 
+	cmd.PersistentFlags().StringVar(&config.systemAgentClusterName, "system-agent-cluster-name", server.DefaultSystemAgentClusterName, "Cluster name used to build the Elemental system agent Kubernetes API URL.")
+	_ = viper.BindPFlag("system-agent-cluster-name", cmd.PersistentFlags().Lookup("system-agent-cluster-name"))
+
 	cmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
 	return cmd
@@ -278,7 +283,7 @@ func operatorRun(config *rootConfig) {
 	setupReconcilers(mgr, config)
 
 	// +kubebuilder:scaffold:builder
-	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL, config.caCert, config.agentTLSMode)
+	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL, config.caCert, config.agentTLSMode, config.systemAgentClusterName)
 	runManager(ctx, mgr)
 }
 
@@ -290,12 +295,13 @@ func runManager(ctx context.Context, mgr ctrl.Manager) {
 	}
 }
 
-func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL, caCert, agentTLSMode string) {
+func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL, caCert, agentTLSMode, systemAgentClusterName string) {
 	setupLog.Info("starting registration")
 	handler := server.NewWithOptions(ctx, mgr.GetClient(), server.Options{
-		ServerURL:    serverURL,
-		CACert:       caCert,
-		AgentTLSMode: agentTLSMode,
+		ServerURL:              serverURL,
+		CACert:                 caCert,
+		AgentTLSMode:           agentTLSMode,
+		SystemAgentClusterName: systemAgentClusterName,
 	})
 
 	if httpBindAddr != "" {
