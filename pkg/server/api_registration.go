@@ -330,7 +330,7 @@ func (i *InventoryServer) handleGetNetworkConfig(inventory *elementalv1.MachineI
 		break
 	}
 
-	return inventory.Spec.Network, nil
+	return observedNetworkConfig(inventory), nil
 }
 
 func (i *InventoryServer) handleGet(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration) error {
