@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"time"
@@ -641,9 +642,6 @@ var _ = Describe("handle unmanaged finalizer", func() {
 		mInventory.Annotations[elementalv1.MachineInventoryOSUnmanagedAnnotation] = "true"
 		Expect(cl.Update(ctx, mInventory)).To(Succeed())
 
-		_, wantPlan, err := r.newUnmanagedResetPlan(ctx)
-		Expect(err).ToNot(HaveOccurred())
-
 		// Check Plan status
 		Expect(mInventory.Status.Plan.PlanSecretRef.Name).To(Equal(planSecret.Name))
 		Expect(mInventory.Status.Plan.PlanSecretRef.Namespace).To(Equal(planSecret.Namespace))
@@ -657,7 +655,15 @@ var _ = Describe("handle unmanaged finalizer", func() {
 
 		// Check plan secret was updated
 		Expect(planSecret.Annotations[elementalv1.PlanTypeAnnotation]).To(Equal(elementalv1.PlanTypeReset))
-		Expect(string(planSecret.Data["plan"])).To(Equal(string(wantPlan)))
+		var gotPlan systemagent.Plan
+		Expect(json.Unmarshal(planSecret.Data["plan"], &gotPlan)).To(Succeed())
+		Expect(gotPlan.Files).To(HaveLen(1))
+		Expect(gotPlan.Files[0].Path).To(Equal(LocalResetUnmanagedMarker))
+		Expect(gotPlan.Files[0].Permissions).To(Equal("0600"))
+		timestamp, err := base64.StdEncoding.DecodeString(gotPlan.Files[0].Content)
+		Expect(err).ToNot(HaveOccurred())
+		_, err = time.Parse("2006-01-02 15:04:05", string(timestamp))
+		Expect(err).ToNot(HaveOccurred())
 		Expect(string(planSecret.Data["applied-checksum"])).To(Equal(""))
 		Expect(string(planSecret.Data["failed-checksum"])).To(Equal(""))
 

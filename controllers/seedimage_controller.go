@@ -46,11 +46,12 @@ import (
 
 type SeedImageReconciler struct {
 	client.Client
-	SeedImageImage            string
-	SeedImageImagePullPolicy  corev1.PullPolicy
-	SeedImageImagePullSecrets []string
-	ServerURL                 string
-	CACert                    string
+	SeedImageImage                     string
+	SeedImageImagePullPolicy           corev1.PullPolicy
+	SeedImageImagePullSecrets          []string
+	DisableSeedImagePullImageTLSVerify bool
+	ServerURL                          string
+	CACert                             string
 }
 
 const (
@@ -262,7 +263,7 @@ func (r *SeedImageReconciler) reconcileBuildImagePod(ctx context.Context, seedIm
 
 	logger.V(5).Info("Creating pod")
 
-	pod := fillBuildImagePod(seedImg, r.SeedImageImage, r.SeedImageImagePullPolicy, r.SeedImageImagePullSecrets)
+	pod := fillBuildImagePod(seedImg, r.SeedImageImage, r.SeedImageImagePullPolicy, r.SeedImageImagePullSecrets, r.DisableSeedImagePullImageTLSVerify)
 	if err := controllerutil.SetControllerReference(seedImg, pod, r.Scheme()); err != nil {
 		meta.SetStatusCondition(&seedImg.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.SeedImageConditionReady,
@@ -561,7 +562,7 @@ func (r *SeedImageReconciler) getServerURL() (string, error) {
 	return serverURL, nil
 }
 
-func fillBuildImagePod(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy, pullSecrets []string) *corev1.Pod {
+func fillBuildImagePod(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy, pullSecrets []string, disablePullImageTLSVerify bool) *corev1.Pod {
 	name := seedImg.Name
 	namespace := seedImg.Namespace
 	baseImg := seedImg.Spec.BaseImage
@@ -570,7 +571,7 @@ func fillBuildImagePod(seedImg *elementalv1.SeedImage, buildImg string, pullPoli
 
 	var initContainers []corev1.Container
 	if seedImg.Spec.BuildContainer == nil {
-		initContainers = defaultInitContainers(seedImg, buildImg, pullPolicy)
+		initContainers = defaultInitContainers(seedImg, buildImg, pullPolicy, disablePullImageTLSVerify)
 	} else {
 		initContainers = userDefinedInitContainers(seedImg)
 	}
@@ -668,12 +669,12 @@ func imagePullSecrets(names []string) []corev1.LocalObjectReference {
 	return secrets
 }
 
-func defaultInitContainers(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy) []corev1.Container {
+func defaultInitContainers(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy, disablePullImageTLSVerify bool) []corev1.Container {
 	if seedImg.Spec.Type == elementalv1.TypeRaw {
 		return defaultRawInitContainers(seedImg, buildImg, pullPolicy)
 	}
 
-	return defaultIsoInitContainers(seedImg, buildImg, pullPolicy)
+	return defaultIsoInitContainers(seedImg, buildImg, pullPolicy, disablePullImageTLSVerify)
 }
 
 func defaultRawInitContainers(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy) []corev1.Container {
@@ -721,7 +722,7 @@ func defaultRawInitContainers(seedImg *elementalv1.SeedImage, buildImg string, p
 	}
 }
 
-func defaultIsoInitContainers(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy) []corev1.Container {
+func defaultIsoInitContainers(seedImg *elementalv1.SeedImage, buildImg string, pullPolicy corev1.PullPolicy, disablePullImageTLSVerify bool) []corev1.Container {
 	const baseIsoPath = "/iso/base.iso"
 
 	containers := []corev1.Container{}
@@ -740,7 +741,11 @@ func defaultIsoInitContainers(seedImg *elementalv1.SeedImage, buildImg string, p
 		if seedImg.Spec.TargetPlatform != "" {
 			image = buildImg
 			command = []string{"/bin/bash", "-c"}
-			args = []string{fmt.Sprintf("mkdir /work && elemental pull-image --platform=%s %s /work && cp /work/elemental-iso/*.iso %s", seedImg.Spec.TargetPlatform, seedImg.Spec.BaseImage, baseIsoPath)}
+			tlsVerifyArg := ""
+			if disablePullImageTLSVerify {
+				tlsVerifyArg = "--tls-verify=false "
+			}
+			args = []string{fmt.Sprintf("mkdir /work && elemental pull-image %s--platform=%s %s /work && cp /work/elemental-iso/*.iso %s", tlsVerifyArg, seedImg.Spec.TargetPlatform, seedImg.Spec.BaseImage, baseIsoPath)}
 		}
 
 		// If baseImg is not an HTTP url assume it is an image reference

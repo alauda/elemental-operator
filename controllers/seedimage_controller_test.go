@@ -579,6 +579,7 @@ var _ = Describe("createConfigMapObject", func() {
 			SeedImageImage:           "registry.suse.com/rancher/seedimage-builder:latest",
 			SeedImageImagePullPolicy: corev1.PullIfNotPresent,
 			ServerURL:                "https://example.com",
+			CACert:                   "test-ca",
 		}
 
 		mRegistration = &elementalv1.MachineRegistration{
@@ -772,7 +773,7 @@ var _ = Describe("fillBuildImagePod", func() {
 			},
 		}
 
-		pod := fillBuildImagePod(seedImg, defaultBuildImg, corev1.PullNever, nil)
+		pod := fillBuildImagePod(seedImg, defaultBuildImg, corev1.PullNever, nil, false)
 
 		Expect(len(pod.Spec.InitContainers)).To(Equal(1))
 		Expect(pod.Spec.InitContainers[0].Image).To(Equal(defaultBuildImg))
@@ -794,7 +795,7 @@ var _ = Describe("fillBuildImagePod", func() {
 			},
 		}
 
-		pod := fillBuildImagePod(seedImg, "", corev1.PullNever, nil)
+		pod := fillBuildImagePod(seedImg, "", corev1.PullNever, nil, false)
 
 		Expect(len(pod.Spec.InitContainers)).To(Equal(1))
 		Expect(pod.Spec.InitContainers[0].Image).To(Equal(buildImg))
@@ -810,18 +811,35 @@ var _ = Describe("fillBuildImagePod", func() {
 			},
 		}
 
-		pod := fillBuildImagePod(seedImg, defaultBuildImg, corev1.PullNever, nil)
+		pod := fillBuildImagePod(seedImg, defaultBuildImg, corev1.PullNever, nil, false)
 
 		Expect(len(pod.Spec.InitContainers)).To(Equal(2))
 		Expect(pod.Spec.InitContainers[0].Image).To(Equal(defaultBuildImg))
 		Expect(pod.Spec.InitContainers[0].Args[0]).To(ContainSubstring("elemental pull-image --platform=linux/riscv64"))
+		Expect(pod.Spec.InitContainers[0].Args[0]).ToNot(ContainSubstring("--tls-verify=false"))
 
+	})
+
+	It("should disable tls verify for elemental pull-image when configured", func() {
+		defaultBuildImg := "default-builder:latest"
+		seedImg := &elementalv1.SeedImage{
+			Spec: elementalv1.SeedImageSpec{
+				BaseImage:      "elemental/default-iso:latest",
+				TargetPlatform: "linux/amd64",
+			},
+		}
+
+		pod := fillBuildImagePod(seedImg, defaultBuildImg, corev1.PullNever, nil, true)
+
+		Expect(len(pod.Spec.InitContainers)).To(Equal(2))
+		Expect(pod.Spec.InitContainers[0].Image).To(Equal(defaultBuildImg))
+		Expect(pod.Spec.InitContainers[0].Args[0]).To(ContainSubstring("elemental pull-image --tls-verify=false --platform=linux/amd64"))
 	})
 
 	It("should configure image pull secrets", func() {
 		seedImg := &elementalv1.SeedImage{}
 
-		pod := fillBuildImagePod(seedImg, "default-builder:latest", corev1.PullNever, []string{"registry-secret", "", "registry-secret", " mirror-secret "})
+		pod := fillBuildImagePod(seedImg, "default-builder:latest", corev1.PullNever, []string{"registry-secret", "", "registry-secret", " mirror-secret "}, false)
 
 		Expect(pod.Spec.ImagePullSecrets).To(Equal([]corev1.LocalObjectReference{
 			{Name: "registry-secret"},

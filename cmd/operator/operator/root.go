@@ -82,6 +82,7 @@ type rootConfig struct {
 	seedimageImage              string
 	seedimageImagePullPolicy    string
 	seedimageImagePullSecrets   []string
+	seedimagePullImageTLSVerify bool
 	serverURL                   string
 	httpBindAddr                string
 	caCertFile                  string
@@ -214,6 +215,9 @@ func NewOperatorCommand() *cobra.Command {
 
 	cmd.PersistentFlags().StringSliceVar(&config.seedimageImagePullSecrets, "seedimage-image-pull-secrets", nil, "Comma-separated list of imagePullSecret names used by SeedImage builder Pods.")
 	_ = viper.BindPFlag("seedimage-image-pull-secrets", cmd.PersistentFlags().Lookup("seedimage-image-pull-secrets"))
+
+	cmd.PersistentFlags().BoolVar(&config.seedimagePullImageTLSVerify, "seedimage-pull-image-tls-verify", true, "Require HTTPS and verify certificates when SeedImage builder runs elemental pull-image.")
+	_ = viper.BindPFlag("seedimage-pull-image-tls-verify", cmd.PersistentFlags().Lookup("seedimage-pull-image-tls-verify"))
 
 	cmd.PersistentFlags().StringVar(&config.serverURL, "server-url", "", "External URL used by machines to reach the Elemental operator HTTP server.")
 	_ = viper.BindPFlag("server-url", cmd.PersistentFlags().Lookup("server-url"))
@@ -378,12 +382,13 @@ func setupReconcilers(mgr ctrl.Manager, config *rootConfig) {
 		os.Exit(1)
 	}
 	if err := (&controllers.SeedImageReconciler{
-		Client:                    mgr.GetClient(),
-		SeedImageImage:            config.seedimageImage,
-		SeedImageImagePullPolicy:  corev1.PullPolicy(config.seedimageImagePullPolicy),
-		SeedImageImagePullSecrets: config.seedimageImagePullSecrets,
-		ServerURL:                 config.serverURL,
-		CACert:                    config.caCert,
+		Client:                             mgr.GetClient(),
+		SeedImageImage:                     config.seedimageImage,
+		SeedImageImagePullPolicy:           corev1.PullPolicy(config.seedimageImagePullPolicy),
+		SeedImageImagePullSecrets:          config.seedimageImagePullSecrets,
+		DisableSeedImagePullImageTLSVerify: !config.seedimagePullImageTLSVerify,
+		ServerURL:                          config.serverURL,
+		CACert:                             config.caCert,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create reconciler", "controller", "SeedImage")
 		os.Exit(1)
