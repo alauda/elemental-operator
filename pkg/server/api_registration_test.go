@@ -346,6 +346,7 @@ func TestRegistrationMsgGet(t *testing.T) {
 		wantConnectionError bool
 		wantRawResponse     bool
 		wantMessageType     register.MessageType
+		wantSystemAgentURL  string
 	}{
 		{
 			name:                "returns not-found error for unknown machine",
@@ -359,11 +360,12 @@ func TestRegistrationMsgGet(t *testing.T) {
 			wantRawResponse: true,
 		},
 		{
-			name:            "returns MsgConfig for newer protoVersion",
-			machineName:     "machine-2",
-			protoVersion:    register.MsgError,
-			wantRawResponse: false,
-			wantMessageType: register.MsgConfig,
+			name:               "returns MsgConfig for newer protoVersion",
+			machineName:        "machine-2",
+			protoVersion:       register.MsgError,
+			wantRawResponse:    false,
+			wantMessageType:    register.MsgConfig,
+			wantSystemAgentURL: "https://global-vip.example.com/kubernetes/global",
 		},
 		{
 			name:            "returns MsgError for newer protoVersion and error",
@@ -409,6 +411,9 @@ func TestRegistrationMsgGet(t *testing.T) {
 	server.Client.Create(context.Background(), &elementalv1.MachineRegistration{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "machine-2",
+			Annotations: map[string]string{
+				elementalv1.SystemAgentServerURLAnnotation: "https://global-vip.example.com",
+			},
 		},
 		Spec: elementalv1.MachineRegistrationSpec{
 			MachineName: "machine-2",
@@ -508,7 +513,11 @@ func TestRegistrationMsgGet(t *testing.T) {
 			err = yaml.Unmarshal(data, &config)
 			assert.NilError(t, err)
 			if tc.wantMessageType == register.MsgConfig {
-				assert.Equal(t, "https://test-server.example.com/kubernetes/global", config.Elemental.SystemAgent.URL)
+				wantURL := tc.wantSystemAgentURL
+				if wantURL == "" {
+					wantURL = "https://test-server.example.com/kubernetes/global"
+				}
+				assert.Equal(t, wantURL, config.Elemental.SystemAgent.URL)
 			}
 		})
 	}

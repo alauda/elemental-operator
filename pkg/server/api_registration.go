@@ -146,7 +146,7 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 		return fmt.Errorf("failed to get secret: %w", err)
 	}
 
-	systemAgentURL, err := i.getSystemAgentURL()
+	systemAgentURL, err := i.getSystemAgentURL(registration)
 	if err != nil {
 		return fmt.Errorf("failed to get system-agent url: %w", err)
 	}

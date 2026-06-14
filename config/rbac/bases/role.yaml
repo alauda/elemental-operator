@@ -9,6 +9,8 @@ rules:
   resources:
   - configmaps
   - pods
+  - secrets
+  - serviceaccounts
   - services
   verbs:
   - create
@@ -33,27 +35,6 @@ rules:
   - services/status
   verbs:
   - get
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - serviceaccounts
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - watch
 - apiGroups:
   - elemental.cattle.io
   resources:
@@ -86,5 +67,8 @@ rules:
   verbs:
   - create
   - delete
+  - get
   - list
+  - patch
+  - update
   - watch

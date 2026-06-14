@@ -36,6 +36,10 @@ const (
 	// SASecretSuffix is the suffix used to name registration service account's token secret
 	SASecretSuffix = "-token"
 
+	// SystemAgentServerURLAnnotation overrides the base URL used in the system-agent
+	// kubeconfig returned for a MachineRegistration.
+	SystemAgentServerURLAnnotation = "baremetal.cluster.io/system-agent-server-url"
+
 	// TimeoutEnvVar is the environment variable key passed to pods to express a timeout
 	TimeoutEnvVar = "ELEMENTAL_TIMEOUT"
 )

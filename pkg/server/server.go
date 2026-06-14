@@ -50,6 +50,7 @@ const (
 
 type Options struct {
 	ServerURL              string
+	SystemAgentServerURL   string
 	CACert                 string
 	AgentTLSMode           string
 	SystemAgentClusterName string
@@ -60,6 +61,7 @@ type InventoryServer struct {
 	context.Context
 	authenticators         []authenticator
 	ServerURL              string
+	SystemAgentServerURL   string
 	CACert                 string
 	AgentTLSMode           string
 	SystemAgentClusterName string
@@ -84,6 +86,7 @@ func NewWithOptions(ctx context.Context, cl client.Client, options Options) *Inv
 		Client:                 cl,
 		Context:                ctx,
 		ServerURL:              strings.TrimRight(options.ServerURL, "/"),
+		SystemAgentServerURL:   strings.TrimRight(options.SystemAgentServerURL, "/"),
 		CACert:                 options.CACert,
 		AgentTLSMode:           agentTLSMode,
 		SystemAgentClusterName: NormalizeSystemAgentClusterName(options.SystemAgentClusterName),
@@ -172,10 +175,20 @@ func NormalizeSystemAgentClusterName(clusterName string) string {
 	return clusterName
 }
 
-func (i *InventoryServer) getSystemAgentURL() (string, error) {
-	serverURL, err := i.getServerURL()
-	if err != nil {
-		return "", err
+func (i *InventoryServer) getSystemAgentURL(registration *elementalv1.MachineRegistration) (string, error) {
+	serverURL := ""
+	if registration != nil && registration.Annotations != nil {
+		serverURL = strings.TrimRight(strings.TrimSpace(registration.Annotations[elementalv1.SystemAgentServerURLAnnotation]), "/")
+	}
+	if serverURL == "" {
+		serverURL = strings.TrimRight(strings.TrimSpace(i.SystemAgentServerURL), "/")
+	}
+	if serverURL == "" {
+		var err error
+		serverURL, err = i.getServerURL()
+		if err != nil {
+			return "", err
+		}
 	}
 
 	clusterName := NormalizeSystemAgentClusterName(i.SystemAgentClusterName)

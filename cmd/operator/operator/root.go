@@ -89,6 +89,9 @@ type rootConfig struct {
 	caCert                      string
 	agentTLSMode                string
 	systemAgentClusterName      string
+	systemAgentServerURL        string
+	systemAgentAuthMode         string
+	systemAgentServiceAccount   string
 }
 
 func init() {
@@ -112,18 +115,16 @@ func NewOperatorCommand() *cobra.Command {
 					config.seedimageImagePullPolicy,
 					corev1.PullAlways, corev1.PullIfNotPresent, corev1.PullNever)
 			}
-			serverURL := strings.TrimRight(config.serverURL, "/")
-			if serverURL == "" {
-				return fmt.Errorf("server-url is required")
-			}
-			parsedServerURL, err := url.Parse(serverURL)
-			if err != nil || parsedServerURL.Scheme == "" || parsedServerURL.Host == "" {
-				return fmt.Errorf("invalid server-url %q", config.serverURL)
-			}
-			if parsedServerURL.Scheme != "http" && parsedServerURL.Scheme != "https" {
-				return fmt.Errorf("invalid server-url scheme %q, expected http or https", parsedServerURL.Scheme)
+			serverURL, err := normalizeURL(config.serverURL, "server-url", true)
+			if err != nil {
+				return err
 			}
 			config.serverURL = serverURL
+			systemAgentServerURL, err := normalizeURL(config.systemAgentServerURL, "system-agent-server-url", false)
+			if err != nil {
+				return err
+			}
+			config.systemAgentServerURL = systemAgentServerURL
 			config.systemAgentClusterName = server.NormalizeSystemAgentClusterName(config.systemAgentClusterName)
 
 			agentTLSMode := strings.TrimSpace(config.agentTLSMode)
@@ -143,6 +144,20 @@ func NewOperatorCommand() *cobra.Command {
 				}
 				config.caCert = string(caCert)
 			}
+			config.systemAgentAuthMode = controllers.NormalizeSystemAgentAuthMode(config.systemAgentAuthMode)
+			switch config.systemAgentAuthMode {
+			case controllers.SystemAgentAuthModeRegistration:
+			case controllers.SystemAgentAuthModeShared:
+				if strings.TrimSpace(config.systemAgentServiceAccount) == "" {
+					return fmt.Errorf("system-agent-service-account is required when system-agent-auth-mode is shared")
+				}
+			default:
+				return fmt.Errorf("invalid system-agent-auth-mode %q, valid values: %q, %q",
+					config.systemAgentAuthMode,
+					controllers.SystemAgentAuthModeRegistration,
+					controllers.SystemAgentAuthModeShared)
+			}
+			config.systemAgentServiceAccount = strings.TrimSpace(config.systemAgentServiceAccount)
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
@@ -235,9 +250,36 @@ func NewOperatorCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&config.systemAgentClusterName, "system-agent-cluster-name", server.DefaultSystemAgentClusterName, "Cluster name used to build the Elemental system agent Kubernetes API URL.")
 	_ = viper.BindPFlag("system-agent-cluster-name", cmd.PersistentFlags().Lookup("system-agent-cluster-name"))
 
+	cmd.PersistentFlags().StringVar(&config.systemAgentServerURL, "system-agent-server-url", "", "Optional base URL used by elemental-system-agent to reach the platform Kubernetes API. Defaults to server-url.")
+	_ = viper.BindPFlag("system-agent-server-url", cmd.PersistentFlags().Lookup("system-agent-server-url"))
+
+	cmd.PersistentFlags().StringVar(&config.systemAgentAuthMode, "system-agent-auth-mode", controllers.SystemAgentAuthModeRegistration, "System-agent authentication mode. Valid values: registration, shared.")
+	_ = viper.BindPFlag("system-agent-auth-mode", cmd.PersistentFlags().Lookup("system-agent-auth-mode"))
+
+	cmd.PersistentFlags().StringVar(&config.systemAgentServiceAccount, "system-agent-service-account", controllers.DefaultSharedSystemAgentServiceAccountName, "ServiceAccount name used when system-agent-auth-mode is shared.")
+	_ = viper.BindPFlag("system-agent-service-account", cmd.PersistentFlags().Lookup("system-agent-service-account"))
+
 	cmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
 	return cmd
+}
+
+func normalizeURL(value, flagName string, required bool) (string, error) {
+	normalized := strings.TrimRight(strings.TrimSpace(value), "/")
+	if normalized == "" {
+		if required {
+			return "", fmt.Errorf("%s is required", flagName)
+		}
+		return "", nil
+	}
+	parsed, err := url.Parse(normalized)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid %s %q", flagName, value)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("invalid %s scheme %q, expected http or https", flagName, parsed.Scheme)
+	}
+	return normalized, nil
 }
 
 func operatorRun(config *rootConfig) {
@@ -287,7 +329,7 @@ func operatorRun(config *rootConfig) {
 	setupReconcilers(mgr, config)
 
 	// +kubebuilder:scaffold:builder
-	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL, config.caCert, config.agentTLSMode, config.systemAgentClusterName)
+	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL, config.caCert, config.agentTLSMode, config.systemAgentClusterName, config.systemAgentServerURL)
 	runManager(ctx, mgr)
 }
 
@@ -299,13 +341,14 @@ func runManager(ctx context.Context, mgr ctrl.Manager) {
 	}
 }
 
-func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL, caCert, agentTLSMode, systemAgentClusterName string) {
+func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL, caCert, agentTLSMode, systemAgentClusterName, systemAgentServerURL string) {
 	setupLog.Info("starting registration")
 	handler := server.NewWithOptions(ctx, mgr.GetClient(), server.Options{
 		ServerURL:              serverURL,
 		CACert:                 caCert,
 		AgentTLSMode:           agentTLSMode,
 		SystemAgentClusterName: systemAgentClusterName,
+		SystemAgentServerURL:   systemAgentServerURL,
 	})
 
 	if httpBindAddr != "" {
@@ -369,8 +412,10 @@ func setupChecks(mgr ctrl.Manager) {
 
 func setupReconcilers(mgr ctrl.Manager, config *rootConfig) {
 	if err := (&controllers.MachineRegistrationReconciler{
-		Client:    mgr.GetClient(),
-		ServerURL: config.serverURL,
+		Client:                    mgr.GetClient(),
+		ServerURL:                 config.serverURL,
+		SystemAgentAuthMode:       config.systemAgentAuthMode,
+		SystemAgentServiceAccount: config.systemAgentServiceAccount,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create reconciler", "controller", "MachineRegistration")
 		os.Exit(1)

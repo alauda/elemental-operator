@@ -35,9 +35,11 @@ import (
 	errorutils "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -65,9 +67,65 @@ type MachineInventoryReconciler struct {
 func (r *MachineInventoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&elementalv1.MachineInventory{}).
-		Owns(&corev1.Secret{}).
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(planSecretToMachineInventoryRequests),
+			builder.WithPredicates(planSecretPredicate()),
+		).
 		WithEventFilter(r.ignoreIncrementalStatusUpdate()).
 		Complete(r)
+}
+
+func planSecretToMachineInventoryRequests(_ context.Context, obj client.Object) []reconcile.Request {
+	if !isMachineInventoryPlanSecret(obj) {
+		return nil
+	}
+
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{
+			Namespace: obj.GetNamespace(),
+			Name:      obj.GetName(),
+		},
+	}}
+}
+
+func planSecretPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return isMachineInventoryPlanSecret(e.Object)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return isMachineInventoryPlanSecret(e.ObjectNew)
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return isMachineInventoryPlanSecret(e.Object)
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return isMachineInventoryPlanSecret(e.Object)
+		},
+	}
+}
+
+func isMachineInventoryPlanSecret(obj client.Object) bool {
+	secret, ok := obj.(*corev1.Secret)
+	if !ok || secret == nil {
+		return false
+	}
+	if secret.Namespace == "" || secret.Name == "" {
+		return false
+	}
+	if secret.Type == elementalv1.PlanSecretType {
+		return true
+	}
+	if secret.Labels[elementalv1.ElementalManagedLabel] != "true" {
+		return false
+	}
+	switch secret.Annotations[elementalv1.PlanTypeAnnotation] {
+	case elementalv1.PlanTypeEmpty, elementalv1.PlanTypeBootstrap, elementalv1.PlanTypeReset:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *MachineInventoryReconciler) Reconcile(ctx context.Context, req reconcile.Request) (ctrl.Result, error) { //nolint:dupl

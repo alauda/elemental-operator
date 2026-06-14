@@ -61,6 +61,25 @@ registryUrl: "%%IMG_REPO%%"
 # enable debug output for operator
 debug: false
 
+# External URL used by MachineRegistration and SeedImage URLs. Existing
+# deployments may provide this through another config path; set it here when the
+# chart should pass --server-url explicitly.
+serverURL: ""
+
+# TLS mode passed to elemental-system-agent.
+agentTLSMode: strict
+
+systemAgent:
+  # Optional cluster name used to build /kubernetes/<cluster>. Empty keeps the
+  # operator default.
+  clusterName: ""
+  # Optional base URL used in elemental-system-agent kubeconfigs. If empty, the
+  # operator falls back to serverURL.
+  serverURL: ""
+  # Valid values: registration, shared.
+  authMode: registration
+  serviceAccountName: baremetal-system-agent
+
 nodeSelector:
   kubernetes.io/os: linux
 

@@ -276,6 +276,77 @@ var _ = Describe("createRBACObjects", func() {
 		Expect(mRegistration.Status.ServiceAccountRef.Namespace).To(Equal(mRegistration.Namespace))
 	})
 
+	It("should reconcile shared RBAC objects with plan secret resource names", func() {
+		r.SystemAgentAuthMode = SystemAgentAuthModeShared
+		r.SystemAgentServiceAccount = DefaultSharedSystemAgentServiceAccountName
+
+		planSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "plan-from-secret",
+				Namespace: mRegistration.Namespace,
+			},
+			Type: elementalv1.PlanSecretType,
+		}
+		inventory := &elementalv1.MachineInventory{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "inventory-1",
+				Namespace: mRegistration.Namespace,
+			},
+			Status: elementalv1.MachineInventoryStatus{
+				Plan: &elementalv1.PlanStatus{
+					PlanSecretRef: &corev1.ObjectReference{
+						Name:      "plan-from-status",
+						Namespace: mRegistration.Namespace,
+					},
+				},
+			},
+		}
+		Expect(r.Create(ctx, planSecret)).To(Succeed())
+		Expect(r.Create(ctx, inventory)).To(Succeed())
+		inventory.Status.Plan = &elementalv1.PlanStatus{
+			PlanSecretRef: &corev1.ObjectReference{
+				Name:      "plan-from-status",
+				Namespace: mRegistration.Namespace,
+			},
+		}
+		Expect(r.Status().Update(ctx, inventory)).To(Succeed())
+		sharedRole := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: DefaultSharedSystemAgentServiceAccountName, Namespace: mRegistration.Namespace}}
+		sharedSA := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: DefaultSharedSystemAgentServiceAccountName, Namespace: mRegistration.Namespace}}
+		sharedRoleBinding := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: DefaultSharedSystemAgentServiceAccountName, Namespace: mRegistration.Namespace}}
+		sharedTokenSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: DefaultSharedSystemAgentServiceAccountName + elementalv1.SASecretSuffix, Namespace: mRegistration.Namespace}}
+		defer func() {
+			Expect(test.CleanupAndWait(ctx, cl, planSecret, inventory, sharedRole, sharedSA, sharedRoleBinding, sharedTokenSecret)).To(Succeed())
+		}()
+
+		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		sharedKey := types.NamespacedName{Namespace: mRegistration.Namespace, Name: DefaultSharedSystemAgentServiceAccountName}
+
+		role := &rbacv1.Role{}
+		Expect(r.Get(ctx, sharedKey, role)).To(Succeed())
+		Expect(role.OwnerReferences).To(BeEmpty())
+		Expect(role.Rules).To(HaveLen(1))
+		Expect(role.Rules[0].Resources).To(Equal([]string{"secrets"}))
+		Expect(role.Rules[0].ResourceNames).To(Equal([]string{"plan-from-secret", "plan-from-status"}))
+
+		sa := &corev1.ServiceAccount{}
+		Expect(r.Get(ctx, sharedKey, sa)).To(Succeed())
+		Expect(sa.OwnerReferences).To(BeEmpty())
+
+		tokenSecret := &corev1.Secret{}
+		Expect(r.Get(ctx, types.NamespacedName{Namespace: mRegistration.Namespace, Name: DefaultSharedSystemAgentServiceAccountName + elementalv1.SASecretSuffix}, tokenSecret)).To(Succeed())
+		Expect(tokenSecret.OwnerReferences).To(BeEmpty())
+		Expect(tokenSecret.Annotations).To(HaveKeyWithValue("kubernetes.io/service-account.name", DefaultSharedSystemAgentServiceAccountName))
+
+		roleBinding := &rbacv1.RoleBinding{}
+		Expect(r.Get(ctx, sharedKey, roleBinding)).To(Succeed())
+		Expect(roleBinding.OwnerReferences).To(BeEmpty())
+		Expect(roleBinding.Subjects[0].Name).To(Equal(DefaultSharedSystemAgentServiceAccountName))
+
+		Expect(mRegistration.Status.ServiceAccountRef.Kind).To(Equal("ServiceAccount"))
+		Expect(mRegistration.Status.ServiceAccountRef.Name).To(Equal(DefaultSharedSystemAgentServiceAccountName))
+		Expect(mRegistration.Status.ServiceAccountRef.Namespace).To(Equal(mRegistration.Namespace))
+	})
+
 	It("should error when RBAC fails to be created", func() {
 		r.Client = machineRegistrationFailingClient{}
 		err := r.createRBACObjects(ctx, mRegistration)

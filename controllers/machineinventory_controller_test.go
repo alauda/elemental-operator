@@ -186,6 +186,62 @@ var _ = Describe("reconcile machine inventory", func() {
 	})
 })
 
+var _ = Describe("plan secret watch mapping", func() {
+	It("should enqueue the same named machine inventory for a plan secret without owner reference", func() {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "machine-inventory-suite",
+			},
+			Type: elementalv1.PlanSecretType,
+		}
+
+		requests := planSecretToMachineInventoryRequests(context.Background(), secret)
+
+		Expect(requests).To(Equal([]reconcile.Request{{
+			NamespacedName: types.NamespacedName{
+				Namespace: secret.Namespace,
+				Name:      secret.Name,
+			},
+		}}))
+	})
+
+	It("should enqueue managed plan secrets even when the secret type is not set", func() {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "machine-inventory-suite",
+				Labels: map[string]string{
+					elementalv1.ElementalManagedLabel: "true",
+				},
+				Annotations: map[string]string{
+					elementalv1.PlanTypeAnnotation: elementalv1.PlanTypeBootstrap,
+				},
+			},
+		}
+
+		requests := planSecretToMachineInventoryRequests(context.Background(), secret)
+
+		Expect(requests).To(HaveLen(1))
+		Expect(requests[0].NamespacedName).To(Equal(types.NamespacedName{
+			Namespace: secret.Namespace,
+			Name:      secret.Name,
+		}))
+	})
+
+	It("should ignore unrelated secrets", func() {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "registry-auth",
+			},
+			Type: corev1.SecretTypeOpaque,
+		}
+
+		Expect(planSecretToMachineInventoryRequests(context.Background(), secret)).To(BeNil())
+	})
+})
+
 var _ = Describe("createPlanSecret", func() {
 	var r *MachineInventoryReconciler
 	var mInventory *elementalv1.MachineInventory

@@ -1,3 +1,4 @@
+{{- $systemAgent := .Values.systemAgent | default dict }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,6 +40,24 @@ spec:
         {{- end }}
         - --namespace
         - {{ .Release.Namespace }}
+        {{- with .Values.serverURL }}
+        - --server-url
+        - {{ trimSuffix "/" . }}
+        {{- end }}
+        - --agent-tls-mode
+        - {{ .Values.agentTLSMode | default "strict" }}
+        {{- with $systemAgent.clusterName }}
+        - --system-agent-cluster-name
+        - {{ . }}
+        {{- end }}
+        {{- with $systemAgent.serverURL }}
+        - --system-agent-server-url
+        - {{ trimSuffix "/" . }}
+        {{- end }}
+        - --system-agent-auth-mode
+        - {{ $systemAgent.authMode | default "registration" }}
+        - --system-agent-service-account
+        - {{ $systemAgent.serviceAccountName | default "baremetal-system-agent" }}
         - --operator-image
         - {{ template "registry_url" . }}{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
         - --seedimage-image

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/google/go-cmp/cmp"
@@ -36,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -47,21 +49,45 @@ import (
 // MachineRegistrationReconciler reconciles a MachineRegistration object.
 type MachineRegistrationReconciler struct {
 	client.Client
-	ServerURL string
+	ServerURL                 string
+	SystemAgentAuthMode       string
+	SystemAgentServiceAccount string
+}
+
+const (
+	SystemAgentAuthModeRegistration = "registration"
+	SystemAgentAuthModeShared       = "shared"
+
+	DefaultSharedSystemAgentServiceAccountName = "baremetal-system-agent"
+)
+
+func NormalizeSystemAgentAuthMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return SystemAgentAuthModeRegistration
+	}
+	return mode
 }
 
 // +kubebuilder:rbac:groups=elemental.cattle.io,resources=machineregistrations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=elemental.cattle.io,resources=machineregistrations/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=rolebindings;roles,verbs=create;delete;list;watch
-// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list;watch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=create;delete;list;watch;update
+// +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=rolebindings;roles,verbs=create;delete;get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=create;delete;get;list;watch;update;patch
+// +kubebuilder:rbac:groups=elemental.cattle.io,resources=machineinventories,verbs=get;list;watch
 
 func (r *MachineRegistrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&elementalv1.MachineRegistration{}).
 		Owns(&corev1.ServiceAccount{}).
-		WithEventFilter(r.ignoreIncrementalStatusUpdate()).
-		Complete(r)
+		WithEventFilter(r.ignoreIncrementalStatusUpdate())
+	if r.sharedAuthEnabled() {
+		builder = builder.Watches(
+			&elementalv1.MachineInventory{},
+			handler.EnqueueRequestsFromMapFunc(r.machineInventoryToMachineRegistrations),
+		)
+	}
+	return builder.Complete(r)
 }
 
 func (r *MachineRegistrationReconciler) Reconcile(ctx context.Context, req reconcile.Request) (ctrl.Result, error) { //nolint:dupl
@@ -120,7 +146,7 @@ func (r *MachineRegistrationReconciler) reconcile(ctx context.Context, mRegistra
 		return ctrl.Result{}, nil
 	}
 
-	if r.isReady(ctx, mRegistration) {
+	if r.isReady(ctx, mRegistration) && !r.sharedAuthEnabled() {
 		logger.Info("Machine registration is ready, no need to reconcile it")
 		return ctrl.Result{}, nil
 	}
@@ -160,7 +186,7 @@ func (r *MachineRegistrationReconciler) isReady(ctx context.Context, mRegistrati
 		// by the control plane during backup & restore operations see: rancher/elemental#776
 		if err := r.Get(ctx, types.NamespacedName{
 			Namespace: mRegistration.Namespace,
-			Name:      mRegistration.Name,
+			Name:      r.serviceAccountTokenSecretName(mRegistration),
 		}, &corev1.Secret{}); err != nil {
 			return false
 		}
@@ -206,6 +232,13 @@ func (r *MachineRegistrationReconciler) getServerURL() (string, error) {
 }
 
 func (r *MachineRegistrationReconciler) createRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration) error {
+	if r.sharedAuthEnabled() {
+		return r.createSharedRBACObjects(ctx, mRegistration)
+	}
+	return r.createRegistrationRBACObjects(ctx, mRegistration)
+}
+
+func (r *MachineRegistrationReconciler) createRegistrationRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration) error {
 	logger := ctrl.LoggerFrom(ctx)
 
 	logger.Info("Reconciling RBAC resources")
@@ -301,6 +334,207 @@ func (r *MachineRegistrationReconciler) createRBACObjects(ctx context.Context, m
 	}
 
 	return nil
+}
+
+func (r *MachineRegistrationReconciler) createSharedRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration) error {
+	logger := ctrl.LoggerFrom(ctx)
+	logger.Info("Reconciling shared RBAC resources")
+
+	saName := r.sharedServiceAccountName()
+	secretName := saName + elementalv1.SASecretSuffix
+	labels := map[string]string{
+		elementalv1.ElementalManagedLabel: "true",
+	}
+
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      saName,
+			Namespace: mRegistration.Namespace,
+		},
+	}
+	if _, err := controllerutil.CreateOrPatch(ctx, r.Client, sa, func() error {
+		mergeLabels(sa, labels)
+		sa.OwnerReferences = nil
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile shared service account: %w", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: mRegistration.Namespace,
+		},
+	}
+	if _, err := controllerutil.CreateOrPatch(ctx, r.Client, secret, func() error {
+		mergeLabels(secret, labels)
+		if secret.Annotations == nil {
+			secret.Annotations = map[string]string{}
+		}
+		secret.Annotations["kubernetes.io/service-account.name"] = saName
+		secret.OwnerReferences = nil
+		secret.Type = corev1.SecretTypeServiceAccountToken
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile shared service account token secret: %w", err)
+	}
+
+	planSecretNames, err := r.planSecretNames(ctx, mRegistration.Namespace)
+	if err != nil {
+		return err
+	}
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      saName,
+			Namespace: mRegistration.Namespace,
+		},
+	}
+	if _, err := controllerutil.CreateOrPatch(ctx, r.Client, role, func() error {
+		mergeLabels(role, labels)
+		role.OwnerReferences = nil
+		role.Rules = sharedSystemAgentRules(planSecretNames)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile shared role: %w", err)
+	}
+
+	roleBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      saName,
+			Namespace: mRegistration.Namespace,
+		},
+	}
+	if _, err := controllerutil.CreateOrPatch(ctx, r.Client, roleBinding, func() error {
+		mergeLabels(roleBinding, labels)
+		roleBinding.OwnerReferences = nil
+		roleBinding.Subjects = []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      saName,
+			Namespace: mRegistration.Namespace,
+		}}
+		roleBinding.RoleRef = rbacv1.RoleRef{
+			Kind:     "Role",
+			Name:     saName,
+			APIGroup: "rbac.authorization.k8s.io",
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile shared role binding: %w", err)
+	}
+
+	logger.Info("Setting shared service account ref")
+	mRegistration.Status.ServiceAccountRef = &corev1.ObjectReference{
+		Kind:      "ServiceAccount",
+		Namespace: mRegistration.Namespace,
+		Name:      saName,
+	}
+
+	return nil
+}
+
+func (r *MachineRegistrationReconciler) sharedAuthEnabled() bool {
+	return NormalizeSystemAgentAuthMode(r.SystemAgentAuthMode) == SystemAgentAuthModeShared
+}
+
+func (r *MachineRegistrationReconciler) sharedServiceAccountName() string {
+	name := strings.TrimSpace(r.SystemAgentServiceAccount)
+	if name == "" {
+		return DefaultSharedSystemAgentServiceAccountName
+	}
+	return name
+}
+
+func (r *MachineRegistrationReconciler) serviceAccountTokenSecretName(mRegistration *elementalv1.MachineRegistration) string {
+	if mRegistration.Status.ServiceAccountRef != nil && mRegistration.Status.ServiceAccountRef.Name != "" {
+		return mRegistration.Status.ServiceAccountRef.Name + elementalv1.SASecretSuffix
+	}
+	if r.sharedAuthEnabled() {
+		return r.sharedServiceAccountName() + elementalv1.SASecretSuffix
+	}
+	return mRegistration.Name + elementalv1.SASecretSuffix
+}
+
+func (r *MachineRegistrationReconciler) planSecretNames(ctx context.Context, namespace string) ([]string, error) {
+	names := map[string]struct{}{}
+
+	inventories := &elementalv1.MachineInventoryList{}
+	if err := r.List(ctx, inventories, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list machine inventories for shared role: %w", err)
+	}
+	for i := range inventories.Items {
+		inventory := &inventories.Items[i]
+		if inventory.Status.Plan == nil || inventory.Status.Plan.PlanSecretRef == nil {
+			continue
+		}
+		ref := inventory.Status.Plan.PlanSecretRef
+		if ref.Name == "" {
+			continue
+		}
+		if ref.Namespace != "" && ref.Namespace != namespace {
+			continue
+		}
+		names[ref.Name] = struct{}{}
+	}
+
+	secrets := &corev1.SecretList{}
+	if err := r.List(ctx, secrets, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list plan secrets for shared role: %w", err)
+	}
+	for i := range secrets.Items {
+		secret := &secrets.Items[i]
+		if secret.Type == elementalv1.PlanSecretType && secret.Name != "" {
+			names[secret.Name] = struct{}{}
+		}
+	}
+
+	out := make([]string, 0, len(names))
+	for name := range names {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func sharedSystemAgentRules(planSecretNames []string) []rbacv1.PolicyRule {
+	if len(planSecretNames) == 0 {
+		return nil
+	}
+	return []rbacv1.PolicyRule{{
+		APIGroups:     []string{""},
+		Verbs:         []string{"get", "watch", "list", "update", "patch"},
+		Resources:     []string{"secrets"},
+		ResourceNames: planSecretNames,
+	}}
+}
+
+func mergeLabels(obj client.Object, labels map[string]string) {
+	if obj.GetLabels() == nil {
+		obj.SetLabels(map[string]string{})
+	}
+	current := obj.GetLabels()
+	for k, v := range labels {
+		current[k] = v
+	}
+	obj.SetLabels(current)
+}
+
+func (r *MachineRegistrationReconciler) machineInventoryToMachineRegistrations(ctx context.Context, obj client.Object) []reconcile.Request {
+	if !r.sharedAuthEnabled() {
+		return nil
+	}
+	registrations := &elementalv1.MachineRegistrationList{}
+	if err := r.List(ctx, registrations, client.InNamespace(obj.GetNamespace())); err != nil {
+		log.Errorf("failed to list MachineRegistrations for shared role update: %s", err.Error())
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(registrations.Items))
+	for i := range registrations.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+			Namespace: registrations.Items[i].Namespace,
+			Name:      registrations.Items[i].Name,
+		}})
+	}
+	return requests
 }
 
 func (r *MachineRegistrationReconciler) ignoreIncrementalStatusUpdate() predicate.Funcs {
