@@ -54,6 +54,10 @@ type Options struct {
 	CACert                 string
 	AgentTLSMode           string
 	SystemAgentClusterName string
+	// APIServerCA is the in-cluster kube-apiserver CA bundle (PEM). It is used as
+	// the agent kubeconfig CA for MachineRegistrations annotated for direct
+	// apiserver access (SystemAgentDirectAPIServerAnnotation).
+	APIServerCA string
 }
 
 type InventoryServer struct {
@@ -65,6 +69,7 @@ type InventoryServer struct {
 	CACert                 string
 	AgentTLSMode           string
 	SystemAgentClusterName string
+	APIServerCA            string
 }
 
 func New(ctx context.Context, cl client.Client, serverURL ...string) *InventoryServer {
@@ -90,6 +95,7 @@ func NewWithOptions(ctx context.Context, cl client.Client, options Options) *Inv
 		CACert:                 options.CACert,
 		AgentTLSMode:           agentTLSMode,
 		SystemAgentClusterName: NormalizeSystemAgentClusterName(options.SystemAgentClusterName),
+		APIServerCA:            options.APIServerCA,
 		authenticators: []authenticator{
 			tpm.New(ctx, cl),
 			plainauth.New(ctx, cl),
@@ -191,8 +197,41 @@ func (i *InventoryServer) getSystemAgentURL(registration *elementalv1.MachineReg
 		}
 	}
 
+	// Direct kube-apiserver mode: the agent talks straight to the apiserver VIP,
+	// so the base URL is used verbatim with NO "/kubernetes/<cluster>" Erebus path.
+	if isDirectAPIServer(registration) {
+		return serverURL, nil
+	}
+
 	clusterName := NormalizeSystemAgentClusterName(i.SystemAgentClusterName)
 	return fmt.Sprintf("%s/kubernetes/%s", serverURL, url.PathEscape(clusterName)), nil
+}
+
+// isDirectAPIServer reports whether the MachineRegistration opts into direct
+// kube-apiserver access (no Erebus /kubernetes/<cluster> proxy path) via the
+// SystemAgentDirectAPIServerAnnotation.
+func isDirectAPIServer(registration *elementalv1.MachineRegistration) bool {
+	if registration == nil || registration.Annotations == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(registration.Annotations[elementalv1.SystemAgentDirectAPIServerAnnotation]), "true")
+}
+
+// concatCABundle joins two PEM CA bundles, dropping empties. A direct-apiserver
+// agent kubeconfig needs BOTH the registration URL CA (platform ingress) and the
+// kube-apiserver CA present, so the registration handshake and the apiserver VIP
+// connection each find their trust anchor.
+func concatCABundle(a, b string) string {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + "\n" + b
+	}
 }
 
 func (i *InventoryServer) authMachine(conn *websocket.Conn, req *http.Request, registerNamespace string) (*elementalv1.MachineInventory, error) {

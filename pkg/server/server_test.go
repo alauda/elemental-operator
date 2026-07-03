@@ -88,3 +88,37 @@ func TestInitNewInventory(t *testing.T) {
 		}
 	}
 }
+
+func TestGetSystemAgentURLDirectAPIServer(t *testing.T) {
+	srv := &InventoryServer{SystemAgentClusterName: "global"}
+
+	reg := &elementalv1.MachineRegistration{}
+	reg.Annotations = map[string]string{
+		elementalv1.SystemAgentServerURLAnnotation: "https://10.0.0.9:6443",
+	}
+
+	// Default (Erebus): the base URL gets the /kubernetes/<cluster> proxy path.
+	got, err := srv.getSystemAgentURL(reg)
+	assert.NilError(t, err)
+	assert.Equal(t, got, "https://10.0.0.9:6443/kubernetes/global")
+
+	// Direct: the base URL is used verbatim, with NO /kubernetes/<cluster> suffix.
+	reg.Annotations[elementalv1.SystemAgentDirectAPIServerAnnotation] = "true"
+	got, err = srv.getSystemAgentURL(reg)
+	assert.NilError(t, err)
+	assert.Equal(t, got, "https://10.0.0.9:6443")
+
+	// Annotation is case-insensitive and the base URL trailing slash is trimmed.
+	reg.Annotations[elementalv1.SystemAgentDirectAPIServerAnnotation] = "TRUE"
+	reg.Annotations[elementalv1.SystemAgentServerURLAnnotation] = "https://10.0.0.9:6443/"
+	got, err = srv.getSystemAgentURL(reg)
+	assert.NilError(t, err)
+	assert.Equal(t, got, "https://10.0.0.9:6443")
+}
+
+func TestConcatCABundle(t *testing.T) {
+	assert.Equal(t, concatCABundle("A", "B"), "A\nB")
+	assert.Equal(t, concatCABundle("", "B"), "B")
+	assert.Equal(t, concatCABundle("A", ""), "A")
+	assert.Equal(t, concatCABundle("  A  ", "  B  "), "A\nB")
+}

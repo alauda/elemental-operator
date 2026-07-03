@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -151,7 +152,21 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 		return fmt.Errorf("failed to get system-agent url: %w", err)
 	}
 
-	config, err := registration.GetClientRegistrationConfig(i.CACert)
+	// For direct kube-apiserver access, the agent kubeconfig CA must trust the
+	// apiserver VIP cert. Concatenate the apiserver CA with the registration CA so
+	// both the (ingress) registration URL and the direct apiserver connection
+	// verify from the single Registration.CACert field. Fail closed if we cannot
+	// supply the apiserver CA — emitting only the ingress CA would produce an agent
+	// kubeconfig that cannot verify the apiserver VIP and would fail later at connect.
+	registrationCACert := i.CACert
+	if isDirectAPIServer(registration) {
+		if strings.TrimSpace(i.APIServerCA) == "" {
+			return fmt.Errorf("registration %s/%s requests direct apiserver access (%s) but the operator has no in-cluster apiserver CA to trust the apiserver VIP certificate", registration.Namespace, registration.Name, elementalv1.SystemAgentDirectAPIServerAnnotation)
+		}
+		registrationCACert = concatCABundle(i.CACert, i.APIServerCA)
+	}
+
+	config, err := registration.GetClientRegistrationConfig(registrationCACert)
 	if err != nil {
 		return err
 	}

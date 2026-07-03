@@ -290,7 +290,8 @@ func operatorRun(config *rootConfig) {
 		}()
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restCfg := ctrl.GetConfigOrDie()
+	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: config.metricsBindAddr,
@@ -328,8 +329,20 @@ func operatorRun(config *rootConfig) {
 	setupChecks(mgr)
 	setupReconcilers(mgr, config)
 
+	// In-cluster kube-apiserver CA, used as the system-agent kubeconfig CA for
+	// MachineRegistrations annotated for direct apiserver access
+	// (SystemAgentDirectAPIServerAnnotation).
+	apiServerCA := string(restCfg.CAData)
+	if apiServerCA == "" && restCfg.CAFile != "" {
+		if caBytes, readErr := os.ReadFile(restCfg.CAFile); readErr == nil {
+			apiServerCA = string(caBytes)
+		} else {
+			setupLog.Error(readErr, "failed to read in-cluster apiserver CA; direct-apiserver system-agent registrations will lack a CA", "file", restCfg.CAFile)
+		}
+	}
+
 	// +kubebuilder:scaffold:builder
-	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL, config.caCert, config.agentTLSMode, config.systemAgentClusterName, config.systemAgentServerURL)
+	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL, config.caCert, config.agentTLSMode, config.systemAgentClusterName, config.systemAgentServerURL, apiServerCA)
 	runManager(ctx, mgr)
 }
 
@@ -341,7 +354,7 @@ func runManager(ctx context.Context, mgr ctrl.Manager) {
 	}
 }
 
-func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL, caCert, agentTLSMode, systemAgentClusterName, systemAgentServerURL string) {
+func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL, caCert, agentTLSMode, systemAgentClusterName, systemAgentServerURL, apiServerCA string) {
 	setupLog.Info("starting registration")
 	handler := server.NewWithOptions(ctx, mgr.GetClient(), server.Options{
 		ServerURL:              serverURL,
@@ -349,6 +362,7 @@ func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindA
 		AgentTLSMode:           agentTLSMode,
 		SystemAgentClusterName: systemAgentClusterName,
 		SystemAgentServerURL:   systemAgentServerURL,
+		APIServerCA:            apiServerCA,
 	})
 
 	if httpBindAddr != "" {
