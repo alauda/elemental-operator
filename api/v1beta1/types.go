@@ -117,6 +117,8 @@ type SystemAgent struct {
 	// +optional
 	URL string `json:"url,omitempty" yaml:"url,omitempty"`
 	// +optional
+	CACert string `json:"ca-cert,omitempty" yaml:"ca-cert,omitempty" mapstructure:"ca-cert"`
+	// +optional
 	Token string `json:"token,omitempty" yaml:"token,omitempty"`
 	// +optional
 	SecretName string `json:"secret-name,omitempty" yaml:"secret-name,omitempty"`

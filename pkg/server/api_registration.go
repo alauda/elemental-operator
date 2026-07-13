@@ -24,7 +24,6 @@ import (
 	"io"
 	"net/http"
 	"path"
-	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -107,7 +106,9 @@ func (i *InventoryServer) apiRegistration(resp http.ResponseWriter, req *http.Re
 	}
 
 	if isNewInventory(inventory) {
-		initInventory(inventory, registration)
+		if err := initInventory(inventory, registration, i.SystemAgentSplitAuthEnabled); err != nil {
+			return fmt.Errorf("failed to initialize MachineInventory: %w", err)
+		}
 	}
 
 	if err = i.serveLoop(conn, inventory, registration); err != nil {
@@ -147,32 +148,23 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 		return fmt.Errorf("failed to get secret: %w", err)
 	}
 
-	systemAgentURL, err := i.getSystemAgentURL(registration)
+	systemAgentURL, endpointMode, err := i.getSystemAgentEndpoint(registration)
 	if err != nil {
 		return fmt.Errorf("failed to get system-agent url: %w", err)
 	}
-
-	// For direct kube-apiserver access, the agent kubeconfig CA must trust the
-	// apiserver VIP cert. Concatenate the apiserver CA with the registration CA so
-	// both the (ingress) registration URL and the direct apiserver connection
-	// verify from the single Registration.CACert field. Fail closed if we cannot
-	// supply the apiserver CA — emitting only the ingress CA would produce an agent
-	// kubeconfig that cannot verify the apiserver VIP and would fail later at connect.
-	registrationCACert := i.CACert
-	if isDirectAPIServer(registration) {
-		if strings.TrimSpace(i.APIServerCA) == "" {
-			return fmt.Errorf("registration %s/%s requests direct apiserver access (%s) but the operator has no in-cluster apiserver CA to trust the apiserver VIP certificate", registration.Namespace, registration.Name, elementalv1.SystemAgentDirectAPIServerAnnotation)
-		}
-		registrationCACert = concatCABundle(i.CACert, i.APIServerCA)
+	systemAgentCACert, err := i.getSystemAgentCACert(endpointMode, secret)
+	if err != nil {
+		return fmt.Errorf("failed to get system-agent ca cert: %w", err)
 	}
 
-	config, err := registration.GetClientRegistrationConfig(registrationCACert)
+	config, err := registration.GetClientRegistrationConfig(i.CACert)
 	if err != nil {
 		return err
 	}
 	config.Elemental.SystemAgent = elementalv1.SystemAgent{
 		StrictTLSMode:   i.isAgentTLSModeStrict(),
 		URL:             systemAgentURL,
+		CACert:          systemAgentCACert,
 		Token:           string(secret.Data["token"]),
 		SecretName:      inventory.Name,
 		SecretNamespace: inventory.Namespace,
@@ -224,6 +216,18 @@ func (i *InventoryServer) isAgentTLSModeStrict() bool {
 		// Historically the default has been strict TLS verification
 		return true
 	}
+}
+
+func (i *InventoryServer) getSystemAgentCACert(endpointMode string, secret *corev1.Secret) (string, error) {
+	if endpointMode != SystemAgentEndpointModeDirectAPIServer {
+		return i.CACert, nil
+	}
+
+	caCert := string(secret.Data["ca.crt"])
+	if i.isAgentTLSModeStrict() && caCert == "" {
+		return "", fmt.Errorf("service account token secret %s/%s has no ca.crt for direct apiserver system-agent endpoint", secret.Namespace, secret.Name)
+	}
+	return caCert, nil
 }
 
 func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration) error { //nolint: gocyclo
