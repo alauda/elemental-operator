@@ -369,9 +369,11 @@ func TestRegistrationMsgGet(t *testing.T) {
 			wantRawResponse:    false,
 			wantMessageType:    register.MsgConfig,
 			wantSystemAgentURL: "https://global-vip.example.com/kubernetes/global",
+			wantSystemAgentCA:  "platform-ca",
+			wantRegistrationCA: "platform-ca",
 		},
 		{
-			name:                "returns direct apiserver system-agent endpoint for global machine",
+			name:                "returns direct apiserver CA with legacy-compatible registration bundle",
 			machineName:         "machine-4",
 			protoVersion:        register.MsgError,
 			wantRawResponse:     false,
@@ -379,7 +381,7 @@ func TestRegistrationMsgGet(t *testing.T) {
 			wantSystemAgentURL:  "https://global-vip.example.com:6443",
 			wantSystemAgentCA:   "apiserver-ca",
 			wantRegistrationURL: "https://platform.example.org/elemental/registration/machine-4",
-			wantRegistrationCA:  "platform-ca",
+			wantRegistrationCA:  "platform-ca\napiserver-ca",
 		},
 		{
 			name:            "returns MsgError for newer protoVersion and error",
@@ -473,8 +475,8 @@ func TestRegistrationMsgGet(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "machine-4",
 			Annotations: map[string]string{
-				elementalv1.SystemAgentServerURLAnnotation:       "https://global-vip.example.com:6443",
-				elementalv1.SystemAgentDirectAPIServerAnnotation: "true",
+				elementalv1.SystemAgentServerURLAnnotation:    "https://global-vip.example.com:6443",
+				elementalv1.SystemAgentEndpointModeAnnotation: SystemAgentEndpointModeDirectAPIServer,
 			},
 		},
 		Spec: elementalv1.MachineRegistrationSpec{
@@ -903,6 +905,12 @@ func TestDirectAPIServerSystemAgentCAFailsClosed(t *testing.T) {
 	caCert, err := server.getSystemAgentCACert(SystemAgentEndpointModeDirectAPIServer, secret)
 	assert.NilError(t, err)
 	assert.Equal(t, caCert, "")
+}
+
+func TestConcatCABundle(t *testing.T) {
+	assert.Equal(t, concatCABundle(" ingress-ca\n", "\napiserver-ca "), "ingress-ca\napiserver-ca")
+	assert.Equal(t, concatCABundle("", " apiserver-ca "), "apiserver-ca")
+	assert.Equal(t, concatCABundle("", " \n "), "")
 }
 
 func NewInventoryServer(auth authenticator) *InventoryServer {

@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -157,7 +158,18 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 		return fmt.Errorf("failed to get system-agent ca cert: %w", err)
 	}
 
-	config, err := registration.GetClientRegistrationConfig(i.CACert)
+	registrationCACert := i.CACert
+	if endpointMode == SystemAgentEndpointModeDirectAPIServer {
+		// SystemAgent.CACert was added after existing hosts had already shipped
+		// with elemental-register binaries that only know Registration.CACert.
+		// Keep the two CAs separate for current clients, but include the apiserver
+		// CA in the registration bundle so those legacy clients can still build a
+		// kubeconfig that trusts the direct apiserver endpoint. The ingress CA must
+		// remain in the bundle because the persisted registration URL still uses it.
+		registrationCACert = concatCABundle(i.CACert, systemAgentCACert)
+	}
+
+	config, err := registration.GetClientRegistrationConfig(registrationCACert)
 	if err != nil {
 		return err
 	}
@@ -228,6 +240,16 @@ func (i *InventoryServer) getSystemAgentCACert(endpointMode string, secret *core
 		return "", fmt.Errorf("service account token secret %s/%s has no ca.crt for direct apiserver system-agent endpoint", secret.Namespace, secret.Name)
 	}
 	return caCert, nil
+}
+
+func concatCABundle(caBundles ...string) string {
+	var nonEmpty []string
+	for _, bundle := range caBundles {
+		if bundle = strings.TrimSpace(bundle); bundle != "" {
+			nonEmpty = append(nonEmpty, bundle)
+		}
+	}
+	return strings.Join(nonEmpty, "\n")
 }
 
 func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration) error { //nolint: gocyclo
