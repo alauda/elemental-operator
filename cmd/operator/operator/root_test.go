@@ -74,3 +74,18 @@ func TestSharedSystemAgentSplitDefaultsOff(t *testing.T) {
 	assert.Assert(t, splitAuthFlag != nil)
 	assert.Equal(t, splitAuthFlag.DefValue, "false")
 }
+
+func TestSplitAndReadOnlyRequireSharedAuthMode(t *testing.T) {
+	for _, flag := range []string{"--system-agent-split-auth-enabled", "--system-agent-shared-auth-read-only"} {
+		t.Run(flag, func(t *testing.T) {
+			cmd := NewOperatorCommand()
+			assert.NilError(t, cmd.ParseFlags([]string{
+				"--server-url=https://elemental.example.com",
+				"--system-agent-auth-mode=registration",
+				flag,
+			}))
+			err := cmd.Args(cmd, nil)
+			assert.ErrorContains(t, err, "requires system-agent-auth-mode=shared")
+		})
+	}
+}
