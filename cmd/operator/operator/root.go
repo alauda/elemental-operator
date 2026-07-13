@@ -65,33 +65,37 @@ var (
 )
 
 type rootConfig struct {
-	debug                       bool
-	enableLeaderElection        bool
-	profilerAddress             string
-	metricsBindAddr             string
-	syncPeriod                  time.Duration
-	leaderElectionLeaseDuration time.Duration
-	leaderElectionRenewDeadline time.Duration
-	leaderElectionRetryPeriod   time.Duration
-	webhookPort                 int
-	webhookCertDir              string
-	healthAddr                  string
-	defaultRegistry             string
-	operatorImage               string
-	watchNamespace              string
-	seedimageImage              string
-	seedimageImagePullPolicy    string
-	seedimageImagePullSecrets   []string
-	seedimagePullImageTLSVerify bool
-	serverURL                   string
-	httpBindAddr                string
-	caCertFile                  string
-	caCert                      string
-	agentTLSMode                string
-	systemAgentClusterName      string
-	systemAgentServerURL        string
-	systemAgentAuthMode         string
-	systemAgentServiceAccount   string
+	debug                           bool
+	enableLeaderElection            bool
+	profilerAddress                 string
+	metricsBindAddr                 string
+	syncPeriod                      time.Duration
+	leaderElectionLeaseDuration     time.Duration
+	leaderElectionRenewDeadline     time.Duration
+	leaderElectionRetryPeriod       time.Duration
+	webhookPort                     int
+	webhookCertDir                  string
+	healthAddr                      string
+	defaultRegistry                 string
+	operatorImage                   string
+	watchNamespace                  string
+	seedimageImage                  string
+	seedimageImagePullPolicy        string
+	seedimageImagePullSecrets       []string
+	seedimagePullImageTLSVerify     bool
+	serverURL                       string
+	httpBindAddr                    string
+	caCertFile                      string
+	caCert                          string
+	agentTLSMode                    string
+	systemAgentClusterName          string
+	systemAgentServerURL            string
+	systemAgentEndpointMode         string
+	systemAgentAuthMode             string
+	systemAgentServiceAccount       string
+	systemAgentGlobalServiceAccount string
+	systemAgentSplitAuthEnabled     bool
+	systemAgentSharedAuthReadOnly   bool
 }
 
 func init() {
@@ -126,6 +130,10 @@ func NewOperatorCommand() *cobra.Command {
 			}
 			config.systemAgentServerURL = systemAgentServerURL
 			config.systemAgentClusterName = server.NormalizeSystemAgentClusterName(config.systemAgentClusterName)
+			config.systemAgentEndpointMode = server.NormalizeSystemAgentEndpointMode(config.systemAgentEndpointMode)
+			if err := server.ValidateSystemAgentEndpointMode(config.systemAgentEndpointMode); err != nil {
+				return err
+			}
 
 			agentTLSMode := strings.TrimSpace(config.agentTLSMode)
 			switch agentTLSMode {
@@ -151,6 +159,14 @@ func NewOperatorCommand() *cobra.Command {
 				if strings.TrimSpace(config.systemAgentServiceAccount) == "" {
 					return fmt.Errorf("system-agent-service-account is required when system-agent-auth-mode is shared")
 				}
+				if config.systemAgentSplitAuthEnabled {
+					if strings.TrimSpace(config.systemAgentGlobalServiceAccount) == "" {
+						return fmt.Errorf("system-agent-global-service-account is required when system-agent-split-auth-enabled is true")
+					}
+					if strings.TrimSpace(config.systemAgentServiceAccount) == strings.TrimSpace(config.systemAgentGlobalServiceAccount) {
+						return fmt.Errorf("system-agent-service-account and system-agent-global-service-account must be different when system-agent-split-auth-enabled is true")
+					}
+				}
 			default:
 				return fmt.Errorf("invalid system-agent-auth-mode %q, valid values: %q, %q",
 					config.systemAgentAuthMode,
@@ -158,6 +174,7 @@ func NewOperatorCommand() *cobra.Command {
 					controllers.SystemAgentAuthModeShared)
 			}
 			config.systemAgentServiceAccount = strings.TrimSpace(config.systemAgentServiceAccount)
+			config.systemAgentGlobalServiceAccount = strings.TrimSpace(config.systemAgentGlobalServiceAccount)
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
@@ -253,11 +270,23 @@ func NewOperatorCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&config.systemAgentServerURL, "system-agent-server-url", "", "Optional base URL used by elemental-system-agent to reach the platform Kubernetes API. Defaults to server-url.")
 	_ = viper.BindPFlag("system-agent-server-url", cmd.PersistentFlags().Lookup("system-agent-server-url"))
 
+	cmd.PersistentFlags().StringVar(&config.systemAgentEndpointMode, "system-agent-endpoint-mode", server.DefaultSystemAgentEndpointMode, "Default system-agent endpoint mode. Valid values: erebus, direct-apiserver.")
+	_ = viper.BindPFlag("system-agent-endpoint-mode", cmd.PersistentFlags().Lookup("system-agent-endpoint-mode"))
+
 	cmd.PersistentFlags().StringVar(&config.systemAgentAuthMode, "system-agent-auth-mode", controllers.SystemAgentAuthModeRegistration, "System-agent authentication mode. Valid values: registration, shared.")
 	_ = viper.BindPFlag("system-agent-auth-mode", cmd.PersistentFlags().Lookup("system-agent-auth-mode"))
 
 	cmd.PersistentFlags().StringVar(&config.systemAgentServiceAccount, "system-agent-service-account", controllers.DefaultSharedSystemAgentServiceAccountName, "ServiceAccount name used when system-agent-auth-mode is shared.")
 	_ = viper.BindPFlag("system-agent-service-account", cmd.PersistentFlags().Lookup("system-agent-service-account"))
+
+	cmd.PersistentFlags().StringVar(&config.systemAgentGlobalServiceAccount, "system-agent-global-service-account", controllers.DefaultGlobalSystemAgentServiceAccountName, "Cluster-local ServiceAccount name used by global-scoped MachineRegistrations when split auth is enabled.")
+	_ = viper.BindPFlag("system-agent-global-service-account", cmd.PersistentFlags().Lookup("system-agent-global-service-account"))
+
+	cmd.PersistentFlags().BoolVar(&config.systemAgentSplitAuthEnabled, "system-agent-split-auth-enabled", false, "Split shared system-agent authorization into DR-synchronized shared and cluster-local global scopes.")
+	_ = viper.BindPFlag("system-agent-split-auth-enabled", cmd.PersistentFlags().Lookup("system-agent-split-auth-enabled"))
+
+	cmd.PersistentFlags().BoolVar(&config.systemAgentSharedAuthReadOnly, "system-agent-shared-auth-read-only", false, "Treat shared system-agent ServiceAccount, token and RBAC as externally managed; with split auth enabled, global-scoped auth remains locally reconciled.")
+	_ = viper.BindPFlag("system-agent-shared-auth-read-only", cmd.PersistentFlags().Lookup("system-agent-shared-auth-read-only"))
 
 	cmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
@@ -329,20 +358,8 @@ func operatorRun(config *rootConfig) {
 	setupChecks(mgr)
 	setupReconcilers(mgr, config)
 
-	// In-cluster kube-apiserver CA, used as the system-agent kubeconfig CA for
-	// MachineRegistrations annotated for direct apiserver access
-	// (SystemAgentDirectAPIServerAnnotation).
-	apiServerCA := string(restCfg.CAData)
-	if apiServerCA == "" && restCfg.CAFile != "" {
-		if caBytes, readErr := os.ReadFile(restCfg.CAFile); readErr == nil {
-			apiServerCA = string(caBytes)
-		} else {
-			setupLog.Error(readErr, "failed to read in-cluster apiserver CA; direct-apiserver system-agent registrations will lack a CA", "file", restCfg.CAFile)
-		}
-	}
-
 	// +kubebuilder:scaffold:builder
-	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL, config.caCert, config.agentTLSMode, config.systemAgentClusterName, config.systemAgentServerURL, apiServerCA)
+	runRegistration(ctx, mgr, config.watchNamespace, config.httpBindAddr, config.serverURL, config.caCert, config.agentTLSMode, config.systemAgentClusterName, config.systemAgentServerURL, config.systemAgentEndpointMode, config.systemAgentSplitAuthEnabled)
 	runManager(ctx, mgr)
 }
 
@@ -354,15 +371,16 @@ func runManager(ctx context.Context, mgr ctrl.Manager) {
 	}
 }
 
-func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL, caCert, agentTLSMode, systemAgentClusterName, systemAgentServerURL, apiServerCA string) {
+func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindAddr, serverURL, caCert, agentTLSMode, systemAgentClusterName, systemAgentServerURL, systemAgentEndpointMode string, systemAgentSplitAuthEnabled bool) {
 	setupLog.Info("starting registration")
 	handler := server.NewWithOptions(ctx, mgr.GetClient(), server.Options{
-		ServerURL:              serverURL,
-		CACert:                 caCert,
-		AgentTLSMode:           agentTLSMode,
-		SystemAgentClusterName: systemAgentClusterName,
-		SystemAgentServerURL:   systemAgentServerURL,
-		APIServerCA:            apiServerCA,
+		ServerURL:                   serverURL,
+		CACert:                      caCert,
+		AgentTLSMode:                agentTLSMode,
+		SystemAgentClusterName:      systemAgentClusterName,
+		SystemAgentServerURL:        systemAgentServerURL,
+		SystemAgentEndpointMode:     systemAgentEndpointMode,
+		SystemAgentSplitAuthEnabled: systemAgentSplitAuthEnabled,
 	})
 
 	if httpBindAddr != "" {
@@ -426,10 +444,13 @@ func setupChecks(mgr ctrl.Manager) {
 
 func setupReconcilers(mgr ctrl.Manager, config *rootConfig) {
 	if err := (&controllers.MachineRegistrationReconciler{
-		Client:                    mgr.GetClient(),
-		ServerURL:                 config.serverURL,
-		SystemAgentAuthMode:       config.systemAgentAuthMode,
-		SystemAgentServiceAccount: config.systemAgentServiceAccount,
+		Client:                          mgr.GetClient(),
+		ServerURL:                       config.serverURL,
+		SystemAgentAuthMode:             config.systemAgentAuthMode,
+		SystemAgentServiceAccount:       config.systemAgentServiceAccount,
+		GlobalSystemAgentServiceAccount: config.systemAgentGlobalServiceAccount,
+		SystemAgentSplitAuthEnabled:     config.systemAgentSplitAuthEnabled,
+		SystemAgentSharedAuthReadOnly:   config.systemAgentSharedAuthReadOnly,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create reconciler", "controller", "MachineRegistration")
 		os.Exit(1)

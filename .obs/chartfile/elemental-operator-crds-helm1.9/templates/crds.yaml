@@ -907,6 +907,8 @@ spec:
                         type: object
                       system-agent:
                         properties:
+                          ca-cert:
+                            type: string
                           secret-name:
                             type: string
                           secret-namespace:

@@ -43,6 +43,9 @@ func updateInventoryWithTemplates(tmpl templater.Templater, inv *elementalv1.Mac
 	if err := updateInventoryAnnotations(tmpl, inv, reg); err != nil {
 		return fmt.Errorf("failed to update inventory annotations: %w", err)
 	}
+	if err := applyMachineInventoryAuthScope(inv, reg); err != nil {
+		return fmt.Errorf("failed to apply system-agent auth scope: %w", err)
+	}
 	return nil
 }
 

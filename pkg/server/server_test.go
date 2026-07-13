@@ -22,6 +22,7 @@ import (
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 	"gotest.tools/v3/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestInitNewInventory(t *testing.T) {
@@ -79,7 +80,9 @@ func TestInitNewInventory(t *testing.T) {
 		}
 
 		inventory := &elementalv1.MachineInventory{}
-		initInventory(inventory, registration)
+		assert.NilError(t, initInventory(inventory, registration, false))
+		_, hasAuthScope := inventory.Annotations[elementalv1.SystemAgentAuthScopeAnnotation]
+		assert.Equal(t, hasAuthScope, false)
 
 		if test.initName == "" {
 			assert.Check(t, mUUID.Match([]byte(inventory.Name)), inventory.Name+" is not UUID based")
@@ -116,9 +119,77 @@ func TestGetSystemAgentURLDirectAPIServer(t *testing.T) {
 	assert.Equal(t, got, "https://10.0.0.9:6443")
 }
 
-func TestConcatCABundle(t *testing.T) {
-	assert.Equal(t, concatCABundle("A", "B"), "A\nB")
-	assert.Equal(t, concatCABundle("", "B"), "B")
-	assert.Equal(t, concatCABundle("A", ""), "A")
-	assert.Equal(t, concatCABundle("  A  ", "  B  "), "A\nB")
+func TestInitInventoryAuthScope(t *testing.T) {
+	registration := &elementalv1.MachineRegistration{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				elementalv1.SystemAgentAuthScopeAnnotation: elementalv1.SystemAgentAuthScopeGlobal,
+			},
+		},
+		Spec: elementalv1.MachineRegistrationSpec{
+			MachineInventoryAnnotations: map[string]string{
+				elementalv1.SystemAgentAuthScopeAnnotation: elementalv1.SystemAgentAuthScopeShared,
+			},
+		},
+	}
+	inventory := &elementalv1.MachineInventory{}
+
+	assert.NilError(t, initInventory(inventory, registration, true))
+	assert.Equal(t, inventory.Annotations[elementalv1.SystemAgentAuthScopeAnnotation], elementalv1.SystemAgentAuthScopeGlobal)
+	assert.Equal(t, registration.Spec.MachineInventoryAnnotations[elementalv1.SystemAgentAuthScopeAnnotation], elementalv1.SystemAgentAuthScopeShared)
+}
+
+func TestApplyMachineInventoryAuthScopeRejectsChange(t *testing.T) {
+	registration := &elementalv1.MachineRegistration{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{
+			elementalv1.SystemAgentAuthScopeAnnotation: elementalv1.SystemAgentAuthScopeGlobal,
+		},
+	}}
+	inventory := &elementalv1.MachineInventory{ObjectMeta: metav1.ObjectMeta{
+		CreationTimestamp: metav1.Now(),
+		Annotations: map[string]string{
+			elementalv1.SystemAgentAuthScopeAnnotation: elementalv1.SystemAgentAuthScopeShared,
+		},
+	}}
+
+	err := applyMachineInventoryAuthScope(inventory, registration)
+	assert.ErrorContains(t, err, "cannot change MachineInventory system-agent auth scope")
+}
+
+func TestApplyMachineInventoryAuthScopePreservesUnscopedLegacyInventory(t *testing.T) {
+	registration := &elementalv1.MachineRegistration{}
+	inventory := &elementalv1.MachineInventory{ObjectMeta: metav1.ObjectMeta{
+		CreationTimestamp: metav1.Now(),
+		Annotations: map[string]string{
+			"baremetal.alauda.io/owner-cluster": "global",
+		},
+	}}
+
+	assert.NilError(t, applyMachineInventoryAuthScope(inventory, registration))
+	_, found := inventory.Annotations[elementalv1.SystemAgentAuthScopeAnnotation]
+	assert.Equal(t, found, false)
+}
+
+func TestInitInventoryRejectsInvalidAuthScope(t *testing.T) {
+	registration := &elementalv1.MachineRegistration{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{
+			elementalv1.SystemAgentAuthScopeAnnotation: "invalid",
+		},
+	}}
+
+	err := initInventory(&elementalv1.MachineInventory{}, registration, true)
+	assert.ErrorContains(t, err, "invalid system-agent auth scope")
+}
+
+func TestInitInventoryIgnoresAuthScopeWhenSplitDisabled(t *testing.T) {
+	registration := &elementalv1.MachineRegistration{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{
+			elementalv1.SystemAgentAuthScopeAnnotation: "invalid",
+		},
+	}}
+	inventory := &elementalv1.MachineInventory{}
+
+	assert.NilError(t, initInventory(inventory, registration, false))
+	_, found := inventory.Annotations[elementalv1.SystemAgentAuthScopeAnnotation]
+	assert.Equal(t, found, false)
 }

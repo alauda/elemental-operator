@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -46,30 +47,33 @@ const (
 	AgentTLSModeSystemStore = "system-store"
 
 	DefaultSystemAgentClusterName = "local"
+
+	SystemAgentEndpointModeErebus          = "erebus"
+	SystemAgentEndpointModeDirectAPIServer = "direct-apiserver"
+	DefaultSystemAgentEndpointMode         = SystemAgentEndpointModeErebus
 )
 
 type Options struct {
-	ServerURL              string
-	SystemAgentServerURL   string
-	CACert                 string
-	AgentTLSMode           string
-	SystemAgentClusterName string
-	// APIServerCA is the in-cluster kube-apiserver CA bundle (PEM). It is used as
-	// the agent kubeconfig CA for MachineRegistrations annotated for direct
-	// apiserver access (SystemAgentDirectAPIServerAnnotation).
-	APIServerCA string
+	ServerURL                   string
+	SystemAgentServerURL        string
+	CACert                      string
+	AgentTLSMode                string
+	SystemAgentClusterName      string
+	SystemAgentEndpointMode     string
+	SystemAgentSplitAuthEnabled bool
 }
 
 type InventoryServer struct {
 	client.Client
 	context.Context
-	authenticators         []authenticator
-	ServerURL              string
-	SystemAgentServerURL   string
-	CACert                 string
-	AgentTLSMode           string
-	SystemAgentClusterName string
-	APIServerCA            string
+	authenticators              []authenticator
+	ServerURL                   string
+	SystemAgentServerURL        string
+	CACert                      string
+	AgentTLSMode                string
+	SystemAgentClusterName      string
+	SystemAgentEndpointMode     string
+	SystemAgentSplitAuthEnabled bool
 }
 
 func New(ctx context.Context, cl client.Client, serverURL ...string) *InventoryServer {
@@ -88,14 +92,15 @@ func NewWithOptions(ctx context.Context, cl client.Client, options Options) *Inv
 	}
 
 	server := &InventoryServer{
-		Client:                 cl,
-		Context:                ctx,
-		ServerURL:              strings.TrimRight(options.ServerURL, "/"),
-		SystemAgentServerURL:   strings.TrimRight(options.SystemAgentServerURL, "/"),
-		CACert:                 options.CACert,
-		AgentTLSMode:           agentTLSMode,
-		SystemAgentClusterName: NormalizeSystemAgentClusterName(options.SystemAgentClusterName),
-		APIServerCA:            options.APIServerCA,
+		Client:                      cl,
+		Context:                     ctx,
+		ServerURL:                   strings.TrimRight(options.ServerURL, "/"),
+		SystemAgentServerURL:        strings.TrimRight(options.SystemAgentServerURL, "/"),
+		CACert:                      options.CACert,
+		AgentTLSMode:                agentTLSMode,
+		SystemAgentClusterName:      NormalizeSystemAgentClusterName(options.SystemAgentClusterName),
+		SystemAgentEndpointMode:     NormalizeSystemAgentEndpointMode(options.SystemAgentEndpointMode),
+		SystemAgentSplitAuthEnabled: options.SystemAgentSplitAuthEnabled,
 		authenticators: []authenticator{
 			tpm.New(ctx, cl),
 			plainauth.New(ctx, cl),
@@ -181,7 +186,49 @@ func NormalizeSystemAgentClusterName(clusterName string) string {
 	return clusterName
 }
 
-func (i *InventoryServer) getSystemAgentURL(registration *elementalv1.MachineRegistration) (string, error) {
+func NormalizeSystemAgentEndpointMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", SystemAgentEndpointModeErebus:
+		return SystemAgentEndpointModeErebus
+	case SystemAgentEndpointModeDirectAPIServer, "direct", "apiserver", "kube-apiserver":
+		return SystemAgentEndpointModeDirectAPIServer
+	default:
+		return strings.ToLower(strings.TrimSpace(mode))
+	}
+}
+
+func ValidateSystemAgentEndpointMode(mode string) error {
+	switch NormalizeSystemAgentEndpointMode(mode) {
+	case SystemAgentEndpointModeErebus, SystemAgentEndpointModeDirectAPIServer:
+		return nil
+	default:
+		return fmt.Errorf("invalid system-agent endpoint mode %q, valid values: %q, %q",
+			mode, SystemAgentEndpointModeErebus, SystemAgentEndpointModeDirectAPIServer)
+	}
+}
+
+func (i *InventoryServer) getSystemAgentEndpointMode(registration *elementalv1.MachineRegistration) (string, error) {
+	mode := ""
+	explicitMode := false
+	if registration != nil && registration.Annotations != nil {
+		if annotationMode, found := registration.Annotations[elementalv1.SystemAgentEndpointModeAnnotation]; found {
+			mode = annotationMode
+			explicitMode = true
+		} else if strings.EqualFold(strings.TrimSpace(registration.Annotations[elementalv1.SystemAgentDirectAPIServerAnnotation]), "true") {
+			mode = SystemAgentEndpointModeDirectAPIServer
+		}
+	}
+	if !explicitMode && strings.TrimSpace(mode) == "" {
+		mode = i.SystemAgentEndpointMode
+	}
+	mode = NormalizeSystemAgentEndpointMode(mode)
+	if err := ValidateSystemAgentEndpointMode(mode); err != nil {
+		return "", err
+	}
+	return mode, nil
+}
+
+func (i *InventoryServer) getSystemAgentEndpoint(registration *elementalv1.MachineRegistration) (string, string, error) {
 	serverURL := ""
 	if registration != nil && registration.Annotations != nil {
 		serverURL = strings.TrimRight(strings.TrimSpace(registration.Annotations[elementalv1.SystemAgentServerURLAnnotation]), "/")
@@ -193,45 +240,25 @@ func (i *InventoryServer) getSystemAgentURL(registration *elementalv1.MachineReg
 		var err error
 		serverURL, err = i.getServerURL()
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
 
-	// Direct kube-apiserver mode: the agent talks straight to the apiserver VIP,
-	// so the base URL is used verbatim with NO "/kubernetes/<cluster>" Erebus path.
-	if isDirectAPIServer(registration) {
-		return serverURL, nil
+	mode, err := i.getSystemAgentEndpointMode(registration)
+	if err != nil {
+		return "", "", err
+	}
+	if mode == SystemAgentEndpointModeDirectAPIServer {
+		return serverURL, mode, nil
 	}
 
 	clusterName := NormalizeSystemAgentClusterName(i.SystemAgentClusterName)
-	return fmt.Sprintf("%s/kubernetes/%s", serverURL, url.PathEscape(clusterName)), nil
+	return fmt.Sprintf("%s/kubernetes/%s", serverURL, url.PathEscape(clusterName)), mode, nil
 }
 
-// isDirectAPIServer reports whether the MachineRegistration opts into direct
-// kube-apiserver access (no Erebus /kubernetes/<cluster> proxy path) via the
-// SystemAgentDirectAPIServerAnnotation.
-func isDirectAPIServer(registration *elementalv1.MachineRegistration) bool {
-	if registration == nil || registration.Annotations == nil {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(registration.Annotations[elementalv1.SystemAgentDirectAPIServerAnnotation]), "true")
-}
-
-// concatCABundle joins two PEM CA bundles, dropping empties. A direct-apiserver
-// agent kubeconfig needs BOTH the registration URL CA (platform ingress) and the
-// kube-apiserver CA present, so the registration handshake and the apiserver VIP
-// connection each find their trust anchor.
-func concatCABundle(a, b string) string {
-	a = strings.TrimSpace(a)
-	b = strings.TrimSpace(b)
-	switch {
-	case a == "":
-		return b
-	case b == "":
-		return a
-	default:
-		return a + "\n" + b
-	}
+func (i *InventoryServer) getSystemAgentURL(registration *elementalv1.MachineRegistration) (string, error) {
+	systemAgentURL, _, err := i.getSystemAgentEndpoint(registration)
+	return systemAgentURL, err
 }
 
 func (i *InventoryServer) authMachine(conn *websocket.Conn, req *http.Request, registerNamespace string) (*elementalv1.MachineInventory, error) {
@@ -252,13 +279,18 @@ func generateInventoryName() string {
 	return namePrefix + uuid.NewString()
 }
 
-func initInventory(inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration) {
+func initInventory(inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration, splitAuthEnabled bool) error {
 	inventory.Name = registration.Spec.MachineName
 	if inventory.Name == "" {
 		inventory.Name = generateInventoryName()
 	}
 	inventory.Namespace = registration.Namespace
-	inventory.Annotations = registration.Spec.MachineInventoryAnnotations
+	inventory.Annotations = maps.Clone(registration.Spec.MachineInventoryAnnotations)
+	if splitAuthEnabled {
+		if err := applyMachineInventoryAuthScope(inventory, registration); err != nil {
+			return err
+		}
+	}
 
 	// Set the labels later as we may need to do some template decoding and we need
 	// to get data from the client first
@@ -281,6 +313,37 @@ func initInventory(inventory *elementalv1.MachineInventory, registration *elemen
 	if registration.Spec.Config.Network.Configurator == "" {
 		inventory.Spec.Network.Configurator = network.ConfiguratorNone
 	}
+
+	return nil
+}
+
+func applyMachineInventoryAuthScope(inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration) error {
+	_, registrationScopeExplicit := registration.Annotations[elementalv1.SystemAgentAuthScopeAnnotation]
+	if !isNewInventory(inventory) && !registrationScopeExplicit {
+		// Preserve legacy inventories so the controller can continue to use the
+		// owner-cluster fallback until their registration is explicitly scoped.
+		return nil
+	}
+
+	scope, err := elementalv1.ResolveSystemAgentAuthScope(registration.Annotations)
+	if err != nil {
+		return err
+	}
+	if inventory.Annotations == nil {
+		inventory.Annotations = map[string]string{}
+	}
+
+	if !isNewInventory(inventory) {
+		if current, found := inventory.Annotations[elementalv1.SystemAgentAuthScopeAnnotation]; found {
+			current = elementalv1.NormalizeSystemAgentAuthScope(current)
+			if current != scope {
+				return fmt.Errorf("cannot change MachineInventory system-agent auth scope from %q to %q", current, scope)
+			}
+		}
+	}
+
+	inventory.Annotations[elementalv1.SystemAgentAuthScopeAnnotation] = scope
+	return nil
 }
 
 func (i *InventoryServer) createMachineInventory(inventory *elementalv1.MachineInventory) (*elementalv1.MachineInventory, error) {

@@ -16,6 +16,11 @@ limitations under the License.
 
 package v1beta1
 
+import (
+	"fmt"
+	"strings"
+)
+
 const (
 	// ElementalManagedLabel label used to put on resources managed by the elemental operator.
 	ElementalManagedLabel = "elemental.cattle.io/managed"
@@ -40,16 +45,51 @@ const (
 	// kubeconfig returned for a MachineRegistration.
 	SystemAgentServerURLAnnotation = "baremetal.cluster.io/system-agent-server-url"
 
-	// SystemAgentDirectAPIServerAnnotation, when set to "true" on a
-	// MachineRegistration, makes the operator emit a system-agent kubeconfig that
-	// talks DIRECTLY to the kube-apiserver: the base URL (from
-	// SystemAgentServerURLAnnotation / --system-agent-server-url / --server-url) is
-	// used verbatim with NO "/kubernetes/<cluster>" Erebus proxy path, and the agent
-	// CA becomes the kube-apiserver CA (concatenated with the registration CA so
-	// both the registration URL and the apiserver VIP verify). Used for
-	// global-cluster machines that reach their own control-plane VIP:6443.
+	// SystemAgentEndpointModeAnnotation overrides how the system-agent URL is built
+	// for a MachineRegistration. Supported values are "erebus" and
+	// "direct-apiserver".
+	SystemAgentEndpointModeAnnotation = "baremetal.cluster.io/system-agent-endpoint-mode"
+
+	// SystemAgentDirectAPIServerAnnotation is the legacy boolean alias for
+	// SystemAgentEndpointModeAnnotation=direct-apiserver. The enum annotation,
+	// when present, takes precedence over this alias.
 	SystemAgentDirectAPIServerAnnotation = "baremetal.cluster.io/system-agent-direct"
+
+	// SystemAgentAuthScopeAnnotation selects which shared system-agent identity a
+	// MachineRegistration and its MachineInventories use when split auth is
+	// enabled. Global machines use a cluster-local identity while all other
+	// machines use the DR-synchronized shared identity.
+	SystemAgentAuthScopeAnnotation = "baremetal.cluster.io/system-agent-auth-scope"
+
+	SystemAgentAuthScopeGlobal = "global"
+	SystemAgentAuthScopeShared = "shared"
 
 	// TimeoutEnvVar is the environment variable key passed to pods to express a timeout
 	TimeoutEnvVar = "ELEMENTAL_TIMEOUT"
 )
+
+// NormalizeSystemAgentAuthScope normalizes an auth scope. The empty value is
+// kept backwards compatible with the original single shared identity.
+func NormalizeSystemAgentAuthScope(scope string) string {
+	scope = strings.ToLower(strings.TrimSpace(scope))
+	if scope == "" {
+		return SystemAgentAuthScopeShared
+	}
+	return scope
+}
+
+// ResolveSystemAgentAuthScope returns the auth scope selected by annotations.
+func ResolveSystemAgentAuthScope(annotations map[string]string) (string, error) {
+	scope := ""
+	if annotations != nil {
+		scope = annotations[SystemAgentAuthScopeAnnotation]
+	}
+	scope = NormalizeSystemAgentAuthScope(scope)
+	switch scope {
+	case SystemAgentAuthScopeGlobal, SystemAgentAuthScopeShared:
+		return scope, nil
+	default:
+		return "", fmt.Errorf("invalid system-agent auth scope %q, valid values: %q, %q",
+			scope, SystemAgentAuthScopeGlobal, SystemAgentAuthScopeShared)
+	}
+}

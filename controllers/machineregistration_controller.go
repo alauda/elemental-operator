@@ -49,9 +49,20 @@ import (
 // MachineRegistrationReconciler reconciles a MachineRegistration object.
 type MachineRegistrationReconciler struct {
 	client.Client
-	ServerURL                 string
-	SystemAgentAuthMode       string
-	SystemAgentServiceAccount string
+	ServerURL                       string
+	SystemAgentAuthMode             string
+	SystemAgentServiceAccount       string
+	GlobalSystemAgentServiceAccount string
+	SystemAgentSplitAuthEnabled     bool
+	SystemAgentSharedAuthReadOnly   bool
+}
+
+type planSecretScopeConflictError struct {
+	Names []string
+}
+
+func (e *planSecretScopeConflictError) Error() string {
+	return fmt.Sprintf("plan Secrets are referenced by both global and shared MachineInventories: %s", strings.Join(e.Names, ", "))
 }
 
 const (
@@ -59,6 +70,10 @@ const (
 	SystemAgentAuthModeShared       = "shared"
 
 	DefaultSharedSystemAgentServiceAccountName = "baremetal-system-agent"
+	DefaultGlobalSystemAgentServiceAccountName = "baremetal-global-system-agent"
+
+	legacyMachineInventoryOwnerClusterAnnotation = "baremetal.alauda.io/owner-cluster"
+	globalClusterName                            = "global"
 )
 
 func NormalizeSystemAgentAuthMode(mode string) string {
@@ -146,7 +161,7 @@ func (r *MachineRegistrationReconciler) reconcile(ctx context.Context, mRegistra
 		return ctrl.Result{}, nil
 	}
 
-	if r.isReady(ctx, mRegistration) && !r.sharedAuthEnabled() {
+	if !r.sharedAuthEnabled() && r.isReady(ctx, mRegistration) {
 		logger.Info("Machine registration is ready, no need to reconcile it")
 		return ctrl.Result{}, nil
 	}
@@ -233,7 +248,14 @@ func (r *MachineRegistrationReconciler) getServerURL() (string, error) {
 
 func (r *MachineRegistrationReconciler) createRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration) error {
 	if r.sharedAuthEnabled() {
-		return r.createSharedRBACObjects(ctx, mRegistration)
+		if !r.splitAuthEnabled() {
+			return r.createScopedRBACObjects(ctx, mRegistration, elementalv1.SystemAgentAuthScopeShared)
+		}
+		scope, err := elementalv1.ResolveSystemAgentAuthScope(mRegistration.Annotations)
+		if err != nil {
+			return err
+		}
+		return r.createScopedRBACObjects(ctx, mRegistration, scope)
 	}
 	return r.createRegistrationRBACObjects(ctx, mRegistration)
 }
@@ -336,12 +358,22 @@ func (r *MachineRegistrationReconciler) createRegistrationRBACObjects(ctx contex
 	return nil
 }
 
-func (r *MachineRegistrationReconciler) createSharedRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration) error {
+func (r *MachineRegistrationReconciler) createScopedRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration, scope string) error {
 	logger := ctrl.LoggerFrom(ctx)
-	logger.Info("Reconciling shared RBAC resources")
+	logger.Info("Reconciling scoped system-agent RBAC resources", "scope", scope)
 
-	saName := r.sharedServiceAccountName()
+	saName := r.serviceAccountNameForScope(scope)
 	secretName := saName + elementalv1.SASecretSuffix
+	mRegistration.Status.ServiceAccountRef = &corev1.ObjectReference{
+		Kind:      "ServiceAccount",
+		Namespace: mRegistration.Namespace,
+		Name:      saName,
+	}
+
+	if scope == elementalv1.SystemAgentAuthScopeShared && r.SystemAgentSharedAuthReadOnly {
+		return r.validateExternallyManagedSystemAgentAuth(ctx, mRegistration.Namespace, saName)
+	}
+
 	labels := map[string]string{
 		elementalv1.ElementalManagedLabel: "true",
 	}
@@ -357,7 +389,7 @@ func (r *MachineRegistrationReconciler) createSharedRBACObjects(ctx context.Cont
 		sa.OwnerReferences = nil
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile shared service account: %w", err)
+		return fmt.Errorf("failed to reconcile %s system-agent service account: %w", scope, err)
 	}
 
 	secret := &corev1.Secret{
@@ -376,13 +408,17 @@ func (r *MachineRegistrationReconciler) createSharedRBACObjects(ctx context.Cont
 		secret.Type = corev1.SecretTypeServiceAccountToken
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile shared service account token secret: %w", err)
+		return fmt.Errorf("failed to reconcile %s system-agent token secret: %w", scope, err)
 	}
 
-	planSecretNames, err := r.planSecretNames(ctx, mRegistration.Namespace)
-	if err != nil {
-		return err
+	planSecretNames, planSecretErr := r.planSecretNames(ctx, mRegistration.Namespace, scope)
+	var scopeConflict *planSecretScopeConflictError
+	if planSecretErr != nil && !errors.As(planSecretErr, &scopeConflict) {
+		return planSecretErr
 	}
+	// A scope conflict still returns a safe set with every conflicting name
+	// removed. Reconcile that set first so stale Roles cannot retain cross-scope
+	// access, then return the conflict below to keep the registration NotReady.
 	role := &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      saName,
@@ -392,10 +428,10 @@ func (r *MachineRegistrationReconciler) createSharedRBACObjects(ctx context.Cont
 	if _, err := controllerutil.CreateOrPatch(ctx, r.Client, role, func() error {
 		mergeLabels(role, labels)
 		role.OwnerReferences = nil
-		role.Rules = sharedSystemAgentRules(planSecretNames)
+		role.Rules = systemAgentRules(planSecretNames)
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile shared role: %w", err)
+		return fmt.Errorf("failed to reconcile %s system-agent role: %w", scope, err)
 	}
 
 	roleBinding := &rbacv1.RoleBinding{
@@ -419,21 +455,72 @@ func (r *MachineRegistrationReconciler) createSharedRBACObjects(ctx context.Cont
 		}
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile shared role binding: %w", err)
+		return fmt.Errorf("failed to reconcile %s system-agent role binding: %w", scope, err)
 	}
 
-	logger.Info("Setting shared service account ref")
-	mRegistration.Status.ServiceAccountRef = &corev1.ObjectReference{
-		Kind:      "ServiceAccount",
-		Namespace: mRegistration.Namespace,
-		Name:      saName,
+	return planSecretErr
+}
+
+func (r *MachineRegistrationReconciler) validateExternallyManagedSystemAgentAuth(ctx context.Context, namespace, saName string) error {
+	key := types.NamespacedName{Name: saName, Namespace: namespace}
+	sa := &corev1.ServiceAccount{}
+	if err := r.Get(ctx, key, sa); err != nil {
+		return fmt.Errorf("externally managed shared system-agent ServiceAccount %s/%s is not ready: %w", namespace, saName, err)
 	}
 
-	return nil
+	secretKey := types.NamespacedName{Name: saName + elementalv1.SASecretSuffix, Namespace: namespace}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, secretKey, secret); err != nil {
+		return fmt.Errorf("externally managed shared system-agent token Secret %s/%s is not ready: %w", namespace, secretKey.Name, err)
+	}
+	if secret.Type != corev1.SecretTypeServiceAccountToken ||
+		secret.Annotations["kubernetes.io/service-account.name"] != saName ||
+		len(secret.Data["token"]) == 0 {
+		return fmt.Errorf("externally managed shared system-agent token Secret %s/%s is invalid", namespace, secretKey.Name)
+	}
+	if tokenSAUID := secret.Annotations["kubernetes.io/service-account.uid"]; tokenSAUID != "" && tokenSAUID != string(sa.UID) {
+		return fmt.Errorf("externally managed shared system-agent token Secret %s/%s references ServiceAccount UID %q, expected %q",
+			namespace, secretKey.Name, tokenSAUID, sa.UID)
+	}
+
+	role := &rbacv1.Role{}
+	if err := r.Get(ctx, key, role); err != nil {
+		return fmt.Errorf("externally managed shared system-agent Role %s/%s is not ready: %w", namespace, saName, err)
+	}
+	expectedPlanSecretNames, planSecretErr := r.planSecretNames(ctx, namespace, elementalv1.SystemAgentAuthScopeShared)
+	var scopeConflict *planSecretScopeConflictError
+	if planSecretErr != nil && !errors.As(planSecretErr, &scopeConflict) {
+		return planSecretErr
+	}
+	expectedRules := systemAgentRules(expectedPlanSecretNames)
+	if !(len(role.Rules) == 0 && len(expectedRules) == 0) && !cmp.Equal(role.Rules, expectedRules) {
+		return fmt.Errorf("externally managed shared system-agent Role %s/%s rules do not match expected MachineInventory plan Secret references: %s",
+			namespace, saName, cmp.Diff(expectedRules, role.Rules))
+	}
+
+	roleBinding := &rbacv1.RoleBinding{}
+	if err := r.Get(ctx, key, roleBinding); err != nil {
+		return fmt.Errorf("externally managed shared system-agent RoleBinding %s/%s is not ready: %w", namespace, saName, err)
+	}
+	if roleBinding.RoleRef.Kind != "Role" || roleBinding.RoleRef.Name != saName || roleBinding.RoleRef.APIGroup != rbacv1.GroupName {
+		return fmt.Errorf("externally managed shared system-agent RoleBinding %s/%s has an invalid roleRef", namespace, saName)
+	}
+	if len(roleBinding.Subjects) != 1 {
+		return fmt.Errorf("externally managed shared system-agent RoleBinding %s/%s must have exactly one subject", namespace, saName)
+	}
+	subject := roleBinding.Subjects[0]
+	if subject.APIGroup != "" || subject.Kind != "ServiceAccount" || subject.Name != saName || subject.Namespace != namespace {
+		return fmt.Errorf("externally managed shared system-agent RoleBinding %s/%s does not bind only ServiceAccount %s/%s", namespace, saName, namespace, saName)
+	}
+	return planSecretErr
 }
 
 func (r *MachineRegistrationReconciler) sharedAuthEnabled() bool {
 	return NormalizeSystemAgentAuthMode(r.SystemAgentAuthMode) == SystemAgentAuthModeShared
+}
+
+func (r *MachineRegistrationReconciler) splitAuthEnabled() bool {
+	return r.sharedAuthEnabled() && r.SystemAgentSplitAuthEnabled
 }
 
 func (r *MachineRegistrationReconciler) sharedServiceAccountName() string {
@@ -444,25 +531,57 @@ func (r *MachineRegistrationReconciler) sharedServiceAccountName() string {
 	return name
 }
 
+func (r *MachineRegistrationReconciler) globalServiceAccountName() string {
+	name := strings.TrimSpace(r.GlobalSystemAgentServiceAccount)
+	if name == "" {
+		return DefaultGlobalSystemAgentServiceAccountName
+	}
+	return name
+}
+
+func (r *MachineRegistrationReconciler) serviceAccountNameForScope(scope string) string {
+	if scope == elementalv1.SystemAgentAuthScopeGlobal {
+		return r.globalServiceAccountName()
+	}
+	return r.sharedServiceAccountName()
+}
+
 func (r *MachineRegistrationReconciler) serviceAccountTokenSecretName(mRegistration *elementalv1.MachineRegistration) string {
 	if mRegistration.Status.ServiceAccountRef != nil && mRegistration.Status.ServiceAccountRef.Name != "" {
 		return mRegistration.Status.ServiceAccountRef.Name + elementalv1.SASecretSuffix
 	}
 	if r.sharedAuthEnabled() {
-		return r.sharedServiceAccountName() + elementalv1.SASecretSuffix
+		if !r.splitAuthEnabled() {
+			return r.sharedServiceAccountName() + elementalv1.SASecretSuffix
+		}
+		scope, err := elementalv1.ResolveSystemAgentAuthScope(mRegistration.Annotations)
+		if err == nil {
+			return r.serviceAccountNameForScope(scope) + elementalv1.SASecretSuffix
+		}
 	}
 	return mRegistration.Name + elementalv1.SASecretSuffix
 }
 
-func (r *MachineRegistrationReconciler) planSecretNames(ctx context.Context, namespace string) ([]string, error) {
-	names := map[string]struct{}{}
+func (r *MachineRegistrationReconciler) planSecretNames(ctx context.Context, namespace, scope string) ([]string, error) {
+	if !r.splitAuthEnabled() {
+		return r.allPlanSecretNames(ctx, namespace)
+	}
+
+	planScopes := map[string]map[string]struct{}{}
 
 	inventories := &elementalv1.MachineInventoryList{}
 	if err := r.List(ctx, inventories, client.InNamespace(namespace)); err != nil {
-		return nil, fmt.Errorf("failed to list machine inventories for shared role: %w", err)
+		return nil, fmt.Errorf("failed to list machine inventories for %s system-agent role: %w", scope, err)
 	}
 	for i := range inventories.Items {
 		inventory := &inventories.Items[i]
+		inventoryScope, valid := machineInventorySystemAgentAuthScope(inventory)
+		if !valid {
+			ctrl.LoggerFrom(ctx).Info("Skipping MachineInventory with invalid system-agent auth scope",
+				"machineInventory", client.ObjectKeyFromObject(inventory),
+				"scope", inventory.Annotations[elementalv1.SystemAgentAuthScopeAnnotation])
+			continue
+		}
 		if inventory.Status.Plan == nil || inventory.Status.Plan.PlanSecretRef == nil {
 			continue
 		}
@@ -473,18 +592,48 @@ func (r *MachineRegistrationReconciler) planSecretNames(ctx context.Context, nam
 		if ref.Namespace != "" && ref.Namespace != namespace {
 			continue
 		}
-		names[ref.Name] = struct{}{}
+		if planScopes[ref.Name] == nil {
+			planScopes[ref.Name] = map[string]struct{}{}
+		}
+		planScopes[ref.Name][inventoryScope] = struct{}{}
 	}
 
-	secrets := &corev1.SecretList{}
-	if err := r.List(ctx, secrets, client.InNamespace(namespace)); err != nil {
-		return nil, fmt.Errorf("failed to list plan secrets for shared role: %w", err)
-	}
-	for i := range secrets.Items {
-		secret := &secrets.Items[i]
-		if secret.Type == elementalv1.PlanSecretType && secret.Name != "" {
-			names[secret.Name] = struct{}{}
+	out := make([]string, 0, len(planScopes))
+	conflicts := []string{}
+	for name, scopes := range planScopes {
+		if len(scopes) > 1 {
+			conflicts = append(conflicts, name)
+			continue
 		}
+		if _, found := scopes[scope]; found {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	if len(conflicts) > 0 {
+		sort.Strings(conflicts)
+		return out, &planSecretScopeConflictError{Names: conflicts}
+	}
+	return out, nil
+}
+
+func (r *MachineRegistrationReconciler) allPlanSecretNames(ctx context.Context, namespace string) ([]string, error) {
+	names := map[string]struct{}{}
+
+	inventories := &elementalv1.MachineInventoryList{}
+	if err := r.List(ctx, inventories, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list machine inventories for shared system-agent role: %w", err)
+	}
+	for i := range inventories.Items {
+		inventory := &inventories.Items[i]
+		if inventory.Status.Plan == nil || inventory.Status.Plan.PlanSecretRef == nil {
+			continue
+		}
+		ref := inventory.Status.Plan.PlanSecretRef
+		if ref.Name == "" || (ref.Namespace != "" && ref.Namespace != namespace) {
+			continue
+		}
+		names[ref.Name] = struct{}{}
 	}
 
 	out := make([]string, 0, len(names))
@@ -495,7 +644,25 @@ func (r *MachineRegistrationReconciler) planSecretNames(ctx context.Context, nam
 	return out, nil
 }
 
-func sharedSystemAgentRules(planSecretNames []string) []rbacv1.PolicyRule {
+func machineInventorySystemAgentAuthScope(inventory *elementalv1.MachineInventory) (string, bool) {
+	if inventory.Annotations != nil {
+		if rawScope, found := inventory.Annotations[elementalv1.SystemAgentAuthScopeAnnotation]; found {
+			scope := elementalv1.NormalizeSystemAgentAuthScope(rawScope)
+			switch scope {
+			case elementalv1.SystemAgentAuthScopeGlobal, elementalv1.SystemAgentAuthScopeShared:
+				return scope, true
+			default:
+				return "", false
+			}
+		}
+		if strings.EqualFold(strings.TrimSpace(inventory.Annotations[legacyMachineInventoryOwnerClusterAnnotation]), globalClusterName) {
+			return elementalv1.SystemAgentAuthScopeGlobal, true
+		}
+	}
+	return elementalv1.SystemAgentAuthScopeShared, true
+}
+
+func systemAgentRules(planSecretNames []string) []rbacv1.PolicyRule {
 	if len(planSecretNames) == 0 {
 		return nil
 	}

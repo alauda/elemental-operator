@@ -54,10 +54,20 @@ spec:
         - --system-agent-server-url
         - {{ trimSuffix "/" . }}
         {{- end }}
+        - --system-agent-endpoint-mode
+        - {{ $systemAgent.endpointMode | default "erebus" }}
         - --system-agent-auth-mode
         - {{ $systemAgent.authMode | default "registration" }}
         - --system-agent-service-account
         - {{ $systemAgent.serviceAccountName | default "baremetal-system-agent" }}
+        - --system-agent-global-service-account
+        - {{ $systemAgent.globalServiceAccountName | default "baremetal-global-system-agent" }}
+        {{- if $systemAgent.splitAuthEnabled }}
+        - --system-agent-split-auth-enabled
+        {{- end }}
+        {{- if $systemAgent.sharedAuthReadOnly }}
+        - --system-agent-shared-auth-read-only
+        {{- end }}
         - --operator-image
         - {{ template "registry_url" . }}{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
         - --seedimage-image

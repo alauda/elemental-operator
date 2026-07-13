@@ -423,13 +423,18 @@ func (i *installer) networkConfigYip(networkConfig elementalv1.NetworkConfig) ([
 }
 
 func (i *installer) getConnectionInfoBytes(config elementalv1.Elemental) ([]byte, error) {
+	systemAgentCACert := config.SystemAgent.CACert
+	if systemAgentCACert == "" {
+		systemAgentCACert = config.Registration.CACert
+	}
+
 	kubeConfig := api.Config{
 		Kind:       "Config",
 		APIVersion: "v1",
 		Clusters: map[string]*api.Cluster{
 			"cluster": {
 				Server:                   config.SystemAgent.URL,
-				CertificateAuthorityData: []byte(config.Registration.CACert),
+				CertificateAuthorityData: []byte(systemAgentCACert),
 			}},
 		AuthInfos: map[string]*api.AuthInfo{
 			"user": {

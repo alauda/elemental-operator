@@ -347,6 +347,9 @@ func TestRegistrationMsgGet(t *testing.T) {
 		wantRawResponse     bool
 		wantMessageType     register.MessageType
 		wantSystemAgentURL  string
+		wantSystemAgentCA   string
+		wantRegistrationURL string
+		wantRegistrationCA  string
 	}{
 		{
 			name:                "returns not-found error for unknown machine",
@@ -368,6 +371,17 @@ func TestRegistrationMsgGet(t *testing.T) {
 			wantSystemAgentURL: "https://global-vip.example.com/kubernetes/global",
 		},
 		{
+			name:                "returns direct apiserver system-agent endpoint for global machine",
+			machineName:         "machine-4",
+			protoVersion:        register.MsgError,
+			wantRawResponse:     false,
+			wantMessageType:     register.MsgConfig,
+			wantSystemAgentURL:  "https://global-vip.example.com:6443",
+			wantSystemAgentCA:   "apiserver-ca",
+			wantRegistrationURL: "https://platform.example.org/elemental/registration/machine-4",
+			wantRegistrationCA:  "platform-ca",
+		},
+		{
 			name:            "returns MsgError for newer protoVersion and error",
 			machineName:     "machine-2",
 			protoVersion:    register.MsgError,
@@ -385,6 +399,7 @@ func TestRegistrationMsgGet(t *testing.T) {
 
 	server := NewInventoryServer(&FakeAuthServer{})
 	server.SystemAgentClusterName = "global"
+	server.CACert = "platform-ca"
 
 	server.Client.Create(context.Background(), &elementalv1.MachineRegistration{
 		ObjectMeta: metav1.ObjectMeta{
@@ -445,6 +460,32 @@ func TestRegistrationMsgGet(t *testing.T) {
 				Name: "test-account",
 			},
 			RegistrationToken: "machine-3",
+			Conditions: []metav1.Condition{
+				{
+					Type:   "Ready",
+					Status: "True",
+				},
+			},
+		},
+	})
+
+	server.Client.Create(context.Background(), &elementalv1.MachineRegistration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "machine-4",
+			Annotations: map[string]string{
+				elementalv1.SystemAgentServerURLAnnotation:       "https://global-vip.example.com:6443",
+				elementalv1.SystemAgentDirectAPIServerAnnotation: "true",
+			},
+		},
+		Spec: elementalv1.MachineRegistrationSpec{
+			MachineName: "machine-4",
+		},
+		Status: elementalv1.MachineRegistrationStatus{
+			ServiceAccountRef: &v1.ObjectReference{
+				Name: "test-account",
+			},
+			RegistrationURL:   "https://platform.example.org/elemental/registration/machine-4",
+			RegistrationToken: "machine-4",
 			Conditions: []metav1.Condition{
 				{
 					Type:   "Ready",
@@ -518,6 +559,15 @@ func TestRegistrationMsgGet(t *testing.T) {
 					wantURL = "https://test-server.example.com/kubernetes/global"
 				}
 				assert.Equal(t, wantURL, config.Elemental.SystemAgent.URL)
+				if tc.wantSystemAgentCA != "" {
+					assert.Equal(t, tc.wantSystemAgentCA, config.Elemental.SystemAgent.CACert)
+				}
+				if tc.wantRegistrationURL != "" {
+					assert.Equal(t, tc.wantRegistrationURL, config.Elemental.Registration.URL)
+				}
+				if tc.wantRegistrationCA != "" {
+					assert.Equal(t, tc.wantRegistrationCA, config.Elemental.Registration.CACert)
+				}
 			}
 		})
 	}
@@ -734,6 +784,127 @@ func TestAgentTLSMode(t *testing.T) {
 
 }
 
+func TestSystemAgentEndpointMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty defaults to erebus", want: SystemAgentEndpointModeErebus},
+		{name: "erebus", mode: SystemAgentEndpointModeErebus, want: SystemAgentEndpointModeErebus},
+		{name: "direct apiserver", mode: SystemAgentEndpointModeDirectAPIServer, want: SystemAgentEndpointModeDirectAPIServer},
+		{name: "direct alias", mode: "direct", want: SystemAgentEndpointModeDirectAPIServer},
+		{name: "invalid", mode: "bad-mode", want: "bad-mode", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NormalizeSystemAgentEndpointMode(tt.mode)
+			assert.Equal(t, got, tt.want)
+			err := ValidateSystemAgentEndpointMode(tt.mode)
+			if tt.wantErr {
+				assert.Assert(t, err != nil)
+				return
+			}
+			assert.NilError(t, err)
+		})
+	}
+}
+
+func TestMachineRegistrationSystemAgentEndpointModePrecedence(t *testing.T) {
+	tests := []struct {
+		name        string
+		defaultMode string
+		annotations map[string]string
+		want        string
+		wantErr     bool
+	}{
+		{
+			name:        "operator default is used without annotations",
+			defaultMode: SystemAgentEndpointModeDirectAPIServer,
+			want:        SystemAgentEndpointModeDirectAPIServer,
+		},
+		{
+			name: "legacy true selects direct apiserver",
+			annotations: map[string]string{
+				elementalv1.SystemAgentDirectAPIServerAnnotation: " true ",
+			},
+			want: SystemAgentEndpointModeDirectAPIServer,
+		},
+		{
+			name:        "legacy false does not override the operator default",
+			defaultMode: SystemAgentEndpointModeDirectAPIServer,
+			annotations: map[string]string{
+				elementalv1.SystemAgentDirectAPIServerAnnotation: "false",
+			},
+			want: SystemAgentEndpointModeDirectAPIServer,
+		},
+		{
+			name: "explicit erebus overrides legacy true",
+			annotations: map[string]string{
+				elementalv1.SystemAgentEndpointModeAnnotation:    SystemAgentEndpointModeErebus,
+				elementalv1.SystemAgentDirectAPIServerAnnotation: "true",
+			},
+			want: SystemAgentEndpointModeErebus,
+		},
+		{
+			name:        "explicit empty enum normalizes to erebus and overrides legacy true",
+			defaultMode: SystemAgentEndpointModeDirectAPIServer,
+			annotations: map[string]string{
+				elementalv1.SystemAgentEndpointModeAnnotation:    "",
+				elementalv1.SystemAgentDirectAPIServerAnnotation: "true",
+			},
+			want: SystemAgentEndpointModeErebus,
+		},
+		{
+			name: "explicit direct overrides legacy false",
+			annotations: map[string]string{
+				elementalv1.SystemAgentEndpointModeAnnotation:    SystemAgentEndpointModeDirectAPIServer,
+				elementalv1.SystemAgentDirectAPIServerAnnotation: "false",
+			},
+			want: SystemAgentEndpointModeDirectAPIServer,
+		},
+		{
+			name: "invalid explicit enum fails instead of falling back to legacy true",
+			annotations: map[string]string{
+				elementalv1.SystemAgentEndpointModeAnnotation:    "invalid",
+				elementalv1.SystemAgentDirectAPIServerAnnotation: "true",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := NewInventoryServer(&FakeAuthServer{})
+			server.SystemAgentEndpointMode = NormalizeSystemAgentEndpointMode(tt.defaultMode)
+			registration := &elementalv1.MachineRegistration{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}}
+
+			got, err := server.getSystemAgentEndpointMode(registration)
+			if tt.wantErr {
+				assert.Assert(t, err != nil)
+				return
+			}
+			assert.NilError(t, err)
+			assert.Equal(t, got, tt.want)
+		})
+	}
+}
+
+func TestDirectAPIServerSystemAgentCAFailsClosed(t *testing.T) {
+	server := NewInventoryServer(&FakeAuthServer{})
+	secret := &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agent-token", Namespace: "default"}}
+
+	_, err := server.getSystemAgentCACert(SystemAgentEndpointModeDirectAPIServer, secret)
+	assert.ErrorContains(t, err, "has no ca.crt")
+
+	server.AgentTLSMode = AgentTLSModeSystemStore
+	caCert, err := server.getSystemAgentCACert(SystemAgentEndpointModeDirectAPIServer, secret)
+	assert.NilError(t, err)
+	assert.Equal(t, caCert, "")
+}
+
 func NewInventoryServer(auth authenticator) *InventoryServer {
 	scheme := runtime.NewScheme()
 	elementalv1.AddToScheme(scheme)
@@ -784,6 +955,10 @@ func createDefaultResources(t *testing.T, server *InventoryServer) {
 		},
 
 		Type: v1.SecretTypeServiceAccountToken,
+		Data: map[string][]byte{
+			"ca.crt": []byte("apiserver-ca"),
+			"token":  []byte("system-agent-token"),
+		},
 	})
 
 	server.Client.Create(context.Background(), &v1.ServiceAccount{

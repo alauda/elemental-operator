@@ -76,9 +76,23 @@ systemAgent:
   # Optional base URL used in elemental-system-agent kubeconfigs. If empty, the
   # operator falls back to serverURL.
   serverURL: ""
+  # Valid values: erebus, direct-apiserver. MachineRegistrations can override
+  # this with baremetal.cluster.io/system-agent-endpoint-mode. The legacy
+  # baremetal.cluster.io/system-agent-direct=true annotation remains supported.
+  endpointMode: erebus
   # Valid values: registration, shared.
   authMode: registration
+  # DR-synchronized identity used by shared-scoped MachineRegistrations.
   serviceAccountName: baremetal-system-agent
+  # Cluster-local identity used by global-scoped MachineRegistrations.
+  globalServiceAccountName: baremetal-global-system-agent
+  # Enables separate shared/global identities and exact per-scope plan Secret
+  # RBAC. Disabled by default to preserve the legacy single shared identity.
+  splitAuthEnabled: false
+  # Set on an inactive DR Global whose shared identity and RBAC are supplied by
+  # etcd-sync. With splitAuthEnabled, Global-scoped identity and RBAC remain
+  # locally reconciled; without it, the single shared bundle is only validated.
+  sharedAuthReadOnly: false
 
 nodeSelector:
   kubernetes.io/os: linux

@@ -78,6 +78,7 @@ var (
 			SystemAgent: elementalv1.SystemAgent{
 				StrictTLSMode:   true,
 				URL:             "https://127.0.0.1.sslip.io/test/control/plane/endpoint",
+				CACert:          "a system agent ca",
 				Token:           "a test token",
 				SecretName:      "a test secret name",
 				SecretNamespace: "a test namespace",
