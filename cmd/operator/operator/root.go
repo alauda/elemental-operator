@@ -155,6 +155,12 @@ func NewOperatorCommand() *cobra.Command {
 			config.systemAgentAuthMode = controllers.NormalizeSystemAgentAuthMode(config.systemAgentAuthMode)
 			switch config.systemAgentAuthMode {
 			case controllers.SystemAgentAuthModeRegistration:
+				if config.systemAgentSplitAuthEnabled {
+					return fmt.Errorf("system-agent-split-auth-enabled requires system-agent-auth-mode=%s", controllers.SystemAgentAuthModeShared)
+				}
+				if config.systemAgentSharedAuthReadOnly {
+					return fmt.Errorf("system-agent-shared-auth-read-only requires system-agent-auth-mode=%s", controllers.SystemAgentAuthModeShared)
+				}
 			case controllers.SystemAgentAuthModeShared:
 				if strings.TrimSpace(config.systemAgentServiceAccount) == "" {
 					return fmt.Errorf("system-agent-service-account is required when system-agent-auth-mode is shared")
