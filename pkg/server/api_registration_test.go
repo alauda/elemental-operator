@@ -373,7 +373,7 @@ func TestRegistrationMsgGet(t *testing.T) {
 			wantRegistrationCA: "platform-ca",
 		},
 		{
-			name:                "returns direct apiserver CA with legacy-compatible registration bundle",
+			name:                "returns direct apiserver CA separately from registration CA",
 			machineName:         "machine-4",
 			protoVersion:        register.MsgError,
 			wantRawResponse:     false,
@@ -381,7 +381,7 @@ func TestRegistrationMsgGet(t *testing.T) {
 			wantSystemAgentURL:  "https://global-vip.example.com:6443",
 			wantSystemAgentCA:   "apiserver-ca",
 			wantRegistrationURL: "https://platform.example.org/elemental/registration/machine-4",
-			wantRegistrationCA:  "platform-ca\napiserver-ca",
+			wantRegistrationCA:  "platform-ca",
 		},
 		{
 			name:            "returns MsgError for newer protoVersion and error",
@@ -905,12 +905,6 @@ func TestDirectAPIServerSystemAgentCAFailsClosed(t *testing.T) {
 	caCert, err := server.getSystemAgentCACert(SystemAgentEndpointModeDirectAPIServer, secret)
 	assert.NilError(t, err)
 	assert.Equal(t, caCert, "")
-}
-
-func TestConcatCABundle(t *testing.T) {
-	assert.Equal(t, concatCABundle(" ingress-ca\n", "\napiserver-ca "), "ingress-ca\napiserver-ca")
-	assert.Equal(t, concatCABundle("", " apiserver-ca "), "apiserver-ca")
-	assert.Equal(t, concatCABundle("", " \n "), "")
 }
 
 func NewInventoryServer(auth authenticator) *InventoryServer {
