@@ -212,6 +212,87 @@ spec:
                       type: string
                     type: array
                 type: object
+              observedStorage:
+                description: |-
+                  ObservedStorage is a registration-time snapshot of the host's physical
+                  block devices. It is informational and intended for inventory UI and
+                  allocation preflight; provisioning code must inspect the live device again
+                  before making any change.
+                properties:
+                  devices:
+                    description: Devices observed on the host.
+                    items:
+                      description: |-
+                        ObservedStorageDevice describes one physical disk. ByID is empty only when
+                        no stable /dev/disk/by-id path exists; such a device is always ineligible.
+                      properties:
+                        byID:
+                          description: ByID is the canonical stable /dev/disk/by-id
+                            path for this disk.
+                          type: string
+                        eligible:
+                          description: |-
+                            Eligible indicates that the registration-time snapshot matches the safe
+                            v1 data-disk layouts. Host-side plan checks remain authoritative.
+                          type: boolean
+                        ineligibleReasons:
+                          description: IneligibleReasons explains why the disk cannot
+                            be selected.
+                          items:
+                            type: string
+                          type: array
+                        model:
+                          description: Model reported by udev or lsblk.
+                          type: string
+                        partitions:
+                          description: |-
+                            Partitions describes filesystems and mounts below the disk. A filesystem
+                            directly on the whole disk is represented with Number 0.
+                          items:
+                            description: ObservedStoragePartition describes one partition
+                              or a whole-disk filesystem.
+                            properties:
+                              filesystemType:
+                                description: FilesystemType is the detected filesystem
+                                  or signature type.
+                                type: string
+                              filesystemUUID:
+                                description: FilesystemUUID is the detected filesystem
+                                  UUID.
+                                type: string
+                              mountPoint:
+                                description: MountPoint is one observed mount target,
+                                  if any.
+                                type: string
+                              number:
+                                description: Number is the partition number. Zero
+                                  denotes a whole-disk filesystem.
+                                type: integer
+                            type: object
+                          type: array
+                        rotational:
+                          description: Rotational is true for rotational media.
+                          type: boolean
+                        serial:
+                          description: Serial reported by udev or lsblk.
+                          type: string
+                        sizeBytes:
+                          description: SizeBytes is the disk capacity in bytes.
+                          format: int64
+                          type: integer
+                        systemDisk:
+                          description: |-
+                            SystemDisk marks a disk that backs the installed OS or carries an
+                            Elemental/EFI system label.
+                          type: boolean
+                        wwn:
+                          description: WWN reported by udev or lsblk.
+                          type: string
+                      required:
+                      - byID
+                      type: object
+                    type: array
+                type: object
               tpmHash:
                 description: |-
                   TPMHash the hash of the TPM EK public key. This is used if you are

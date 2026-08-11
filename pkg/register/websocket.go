@@ -33,17 +33,18 @@ const (
 	MsgReady
 	MsgSmbios
 	MsgLabels
-	MsgGet                              // v0.5.0
-	MsgVersion                          // v1.1.0
-	MsgSystemData                       // v1.1.1 deprecated by MsgSystemDataV2
-	MsgConfig                           // v1.1.1
-	MsgError                            // v1.1.1
-	MsgAnnotations                      // v1.1.4
-	MsgUpdate                           // v1.2.6
-	MsgSystemDataV2                                 // v1.6.0
-	MsgNetworkConfig                                // v1.7.0
-	MsgObservedNetworkConfig                        // Alauda fork: live-ISO observed network snapshot
-	MsgLast                  = MsgObservedNetworkConfig // MsgLast must point to the last message
+	MsgGet                                              // v0.5.0
+	MsgVersion                                          // v1.1.0
+	MsgSystemData                                       // v1.1.1 deprecated by MsgSystemDataV2
+	MsgConfig                                           // v1.1.1
+	MsgError                                            // v1.1.1
+	MsgAnnotations                                      // v1.1.4
+	MsgUpdate                                           // v1.2.6
+	MsgSystemDataV2                                     // v1.6.0
+	MsgNetworkConfig                                    // v1.7.0
+	MsgObservedNetworkConfig                            // Alauda fork: live-ISO observed network snapshot
+	MsgObservedStorageConfig                            // Alauda fork: observed physical storage snapshot
+	MsgLast                  = MsgObservedStorageConfig // MsgLast must point to the last message
 )
 
 func (mt MessageType) String() string {
@@ -76,6 +77,8 @@ func (mt MessageType) String() string {
 		return "NetworkConfig"
 	case MsgObservedNetworkConfig:
 		return "ObservedNetworkConfig"
+	case MsgObservedStorageConfig:
+		return "ObservedStorageConfig"
 	default:
 		return "Unknown"
 	}

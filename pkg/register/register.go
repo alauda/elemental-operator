@@ -126,6 +126,14 @@ func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *St
 		}
 	}
 
+	if protoVersion >= MsgObservedStorageConfig {
+		log.Info("Send observed storage snapshot")
+		if err := sendObservedStorage(conn); err != nil {
+			// Informational data: warn but continue registration.
+			log.Warningf("failed to send observed storage snapshot: %v", err)
+		}
+	}
+
 	log.Info("Get elemental configuration")
 	if err := WriteMessage(conn, MsgGet, []byte{}); err != nil {
 		return nil, fmt.Errorf("request elemental configuration: %w", err)
@@ -212,10 +220,15 @@ func initWebsocketConn(url string, caCert []byte, auth authClient) (*websocket.C
 		return nil, err
 	}
 	log.Infof("Local Address: %s", conn.LocalAddr().String())
-	_ = conn.SetWriteDeadline(time.Now().Add(RegistrationDeadlineSeconds * time.Second))
-	_ = conn.SetReadDeadline(time.Now().Add(RegistrationDeadlineSeconds * time.Second))
+	refreshRegistrationDeadline(conn)
 
 	return conn, nil
+}
+
+func refreshRegistrationDeadline(conn *websocket.Conn) {
+	deadline := time.Now().Add(RegistrationDeadlineSeconds * time.Second)
+	_ = conn.SetWriteDeadline(deadline)
+	_ = conn.SetReadDeadline(deadline)
 }
 
 func authenticate(conn *websocket.Conn, auth authClient) error {

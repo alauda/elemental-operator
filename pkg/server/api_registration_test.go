@@ -338,6 +338,46 @@ func TestMergeInventoryAnnotations(t *testing.T) {
 	}
 }
 
+func TestUpdateInventoryObservedStorage(t *testing.T) {
+	inventory := &elementalv1.MachineInventory{}
+	data := []byte(`{
+		"devices": [{
+			"byID": "/dev/disk/by-id/wwn-data",
+			"wwn": "0x5000c50000000001",
+			"serial": "DATA-SERIAL",
+			"model": "ExampleDataDisk",
+			"sizeBytes": 1099511627776,
+			"rotational": false,
+			"partitions": [{
+				"number": 1,
+				"filesystemType": "xfs",
+				"filesystemUUID": "11111111-2222-3333-4444-555555555555"
+			}],
+			"eligible": true
+		}]
+	}`)
+
+	if err := updateInventoryObservedStorage(data, inventory); err != nil {
+		t.Fatalf("updateInventoryObservedStorage: %v", err)
+	}
+	if inventory.Spec.ObservedStorage == nil || len(inventory.Spec.ObservedStorage.Devices) != 1 {
+		t.Fatalf("unexpected observed storage: %#v", inventory.Spec.ObservedStorage)
+	}
+	device := inventory.Spec.ObservedStorage.Devices[0]
+	assert.Equal(t, device.ByID, "/dev/disk/by-id/wwn-data")
+	assert.Equal(t, device.SizeBytes, int64(1099511627776))
+	assert.Equal(t, device.Eligible, true)
+	assert.Equal(t, device.Partitions[0].FilesystemType, "xfs")
+
+	previous := inventory.Spec.ObservedStorage
+	if err := updateInventoryObservedStorage([]byte("not-json"), inventory); err == nil {
+		t.Fatal("expected invalid JSON error")
+	}
+	if inventory.Spec.ObservedStorage != previous {
+		t.Fatal("malformed snapshot replaced the previous observed storage")
+	}
+}
+
 func TestRegistrationMsgGet(t *testing.T) {
 	testCases := []struct {
 		name                string

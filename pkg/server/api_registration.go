@@ -298,6 +298,10 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 				return fmt.Errorf("failed to parse observed network config: %w", err)
 			}
 			inventory.Spec.ObservedNetwork = observed
+		case register.MsgObservedStorageConfig:
+			if err := updateInventoryObservedStorage(data, inventory); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("got unexpected message: %s", msgType)
 		}
@@ -305,6 +309,15 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 			return fmt.Errorf("cannot complete %s exchange", msgType)
 		}
 	}
+}
+
+func updateInventoryObservedStorage(data []byte, inventory *elementalv1.MachineInventory) error {
+	observed := &elementalv1.ObservedStorage{}
+	if err := json.Unmarshal(data, observed); err != nil {
+		return fmt.Errorf("failed to parse observed storage config: %w", err)
+	}
+	inventory.Spec.ObservedStorage = observed
+	return nil
 }
 
 func (i *InventoryServer) handleUpdate(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory) error {
