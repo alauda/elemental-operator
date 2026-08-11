@@ -54,13 +54,16 @@ var (
 		"/run/cos/live_mode",
 		"/run/elemental/live_mode",
 	}
+	// Keep this list compatible with util-linux 2.37 in the Elemental base
+	// image. In particular, PARTN is unavailable there; partitionNumber derives
+	// the number from the device path instead.
 	lsblkStorageArgs = []string{
 		"--json",
 		"--bytes",
 		"--paths",
 		"--tree",
 		"--output",
-		"NAME,PATH,TYPE,SIZE,ROTA,RM,MODEL,SERIAL,WWN,FSTYPE,UUID,LABEL,MOUNTPOINTS,PTTYPE,PARTTYPE,PARTN",
+		"NAME,PATH,TYPE,SIZE,ROTA,RM,MODEL,SERIAL,WWN,FSTYPE,UUID,LABEL,MOUNTPOINTS,PTTYPE,PARTTYPE",
 	}
 )
 
@@ -212,7 +215,6 @@ type lsblkDevice struct {
 	MountPoints nullableStringSlice `json:"mountpoints"`
 	PTType      string              `json:"pttype"`
 	PartType    string              `json:"parttype"`
-	PartNumber  flexibleInt64       `json:"partn"`
 	Children    []lsblkDevice       `json:"children"`
 }
 
@@ -575,9 +577,6 @@ func partitionDevices(descendants []lsblkDevice) []lsblkDevice {
 }
 
 func partitionNumber(device lsblkDevice) int {
-	if device.PartNumber > 0 {
-		return int(device.PartNumber)
-	}
 	match := partitionNumberSuffix.FindStringSubmatch(device.devicePath())
 	if len(match) != 2 {
 		return 0

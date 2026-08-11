@@ -366,6 +366,36 @@ func TestObservedStorageCollectionErrors(t *testing.T) {
 	}
 }
 
+func TestObservedStorageLSBLKArgsDoNotRequirePARTN(t *testing.T) {
+	for _, arg := range lsblkStorageArgs {
+		for _, column := range strings.Split(arg, ",") {
+			if column == "PARTN" {
+				t.Fatal("PARTN is not supported by util-linux 2.37 used in the Elemental base image")
+			}
+		}
+	}
+}
+
+func TestPartitionNumberFromDevicePath(t *testing.T) {
+	tests := []struct {
+		path string
+		want int
+	}{
+		{path: "/dev/sdb1", want: 1},
+		{path: "/dev/nvme0n1p12", want: 12},
+		{path: "/dev/mmcblk0p3", want: 3},
+		{path: "/dev/mapper/data", want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := partitionNumber(lsblkDevice{Path: tt.path}); got != tt.want {
+				t.Fatalf("partitionNumber(%q) = %d, want %d", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestObservedStorageProtocolMessage(t *testing.T) {
 	if MsgObservedStorageConfig <= MsgObservedNetworkConfig {
 		t.Fatalf("storage protocol message %d must follow observed network %d", MsgObservedStorageConfig, MsgObservedNetworkConfig)
