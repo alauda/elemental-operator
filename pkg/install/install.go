@@ -61,6 +61,7 @@ const (
 	stateConfigPath        = "elemental-state.yaml"
 	cloudInitConfigPath    = "elemental-cloud-init.yaml"
 	systemAgentConfigPath  = "elemental-system-agent.yaml"
+	storageObserverPath    = "elemental-storage-observer.yaml"
 	networkConfigPath      = "elemental-network.yaml"
 
 	// OEM is mounted on different paths depending if we are resetting (from recovery) or installing (from live media)
@@ -280,6 +281,13 @@ func (i *installer) writeHookConfigurator(stage string, oemMount string, config 
 	}
 	systemAgentYip := yipHookWrap(string(systemAgentYipBytes), filepath.Join(oemMount, systemAgentConfigPath), "Elemental System Agent Config")
 	afterHookConfigurator.Stages[stage] = append(afterHookConfigurator.Stages[stage], systemAgentYip)
+
+	storageObserverYipBytes, err := i.storageObserverYip()
+	if err != nil {
+		return fmt.Errorf("getting storage observer config yip: %w", err)
+	}
+	storageObserverYip := yipHookWrap(string(storageObserverYipBytes), filepath.Join(oemMount, storageObserverPath), "Elemental Storage Observer Config")
+	afterHookConfigurator.Stages[stage] = append(afterHookConfigurator.Stages[stage], storageObserverYip)
 
 	// Network Config
 	networkConfigYipBytes, err := i.networkConfigYip(networkConfig)
@@ -576,6 +584,49 @@ func (i *installer) elementalSystemAgentYip(config elementalv1.Elemental) ([]byt
 	}
 
 	return yipConfigBytes, nil
+}
+
+const storageObserverService = `[Unit]
+Description=Elemental objective storage observer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/elemental-register --observe-storage --observe-interval=60s --config-path=/oem/registration/config.yaml --state-path=/oem/registration/state.yaml
+Restart=always
+RestartSec=15s
+
+# The observer is informational and must not stall shutdown or recovery reset.
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target
+`
+
+func (i *installer) storageObserverYip() ([]byte, error) {
+	yipConfig := schema.YipConfig{
+		Name: "Elemental Storage Observer",
+		Stages: map[string][]schema.Stage{
+			"boot": {{
+				Name: "Install and start objective storage observer",
+				Files: []schema.File{{
+					Path:        "/etc/systemd/system/elemental-storage-observer.service",
+					Content:     storageObserverService,
+					Permissions: 0644,
+				}},
+				Commands: []string{
+					"systemctl daemon-reload",
+					"systemctl enable --now elemental-storage-observer.service",
+				},
+			}},
+		},
+	}
+	out, err := yaml.Marshal(yipConfig)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling storage observer yip: %w", err)
+	}
+	return out, nil
 }
 
 func (i *installer) cleanupResetPlan() error {

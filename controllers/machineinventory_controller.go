@@ -188,6 +188,10 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 		}
 	} else {
 		// The object is up for deletion
+		if controllerutil.ContainsFinalizer(mInventory, elementalv1.MachineInventoryStorageFinalizer) {
+			logger.Info("Waiting for provider-managed storage release before native reset")
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
 		if controllerutil.ContainsFinalizer(mInventory, elementalv1.MachineInventoryFinalizer) {
 			if err := r.reconcileResetPlanSecret(ctx, mInventory); err != nil {
 				meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{

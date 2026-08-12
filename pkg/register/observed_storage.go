@@ -24,46 +24,32 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
-
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 	"github.com/rancher/elemental-operator/pkg/log"
 )
 
-const (
-	storageReasonSystemDisk    = "system disk"
-	storageReasonLiveISO       = "live ISO cannot determine the installation target disk; refresh after installation"
-	storageReasonRemovable     = "removable device"
-	storageReasonNoByID        = "no stable /dev/disk/by-id path"
-	storageReasonNoIdentity    = "no stable WWN or serial identity"
-	storageReasonSignatureRead = "cannot verify that the blank disk has no existing signatures"
-	storageCommandTimeout      = 5 * time.Second
-)
+const storageCommandTimeout = 10 * time.Second
 
 var (
-	partitionByIDPattern  = regexp.MustCompile(`-part[0-9]+$`)
-	partitionNumberSuffix = regexp.MustCompile(`p?([0-9]+)$`)
-	liveEnvironmentPaths  = []string{
+	liveEnvironmentPaths = []string{
 		"/run/initramfs/live",
 		"/run/cos/live_mode",
 		"/run/elemental/live_mode",
 	}
-	// Keep this list compatible with util-linux 2.37 in the Elemental base
-	// image. In particular, PARTN is unavailable there; partitionNumber derives
-	// the number from the device path instead.
+	// Keep the column set compatible with util-linux 2.37 shipped in the
+	// Elemental image. PARTN is deliberately not used.
 	lsblkStorageArgs = []string{
 		"--json",
 		"--bytes",
 		"--paths",
 		"--tree",
 		"--output",
-		"NAME,PATH,TYPE,SIZE,ROTA,RM,MODEL,SERIAL,WWN,FSTYPE,UUID,LABEL,MOUNTPOINTS,PTTYPE,PARTTYPE",
+		"NAME,PATH,TYPE,SIZE,START,LOG-SEC,RO,ROTA,RM,MODEL,SERIAL,WWN,TRAN,FSTYPE,UUID,LABEL,MOUNTPOINTS,OPTIONS,PTTYPE,PARTTYPE,PARTUUID,PKNAME",
 	}
 )
 
@@ -73,6 +59,7 @@ type observedStorageCollector struct {
 	run             storageCommandRunner
 	byIDPaths       func() (map[string][]string, error)
 	liveEnvironment func() bool
+	bootID          func() string
 }
 
 func newObservedStorageCollector() *observedStorageCollector {
@@ -80,25 +67,15 @@ func newObservedStorageCollector() *observedStorageCollector {
 		run:             runStorageCommand,
 		byIDPaths:       collectByIDPaths,
 		liveEnvironment: isLiveEnvironment,
+		bootID:          currentBootID,
 	}
-}
-
-// sendObservedStorage collects a read-only, best-effort snapshot and sends it
-// to the operator. The caller deliberately treats failures as informational so
-// storage discovery cannot prevent machine registration.
-func sendObservedStorage(conn *websocket.Conn) error {
-	observed := collectObservedStorage()
-	// Collection runs after the websocket is established and may legitimately
-	// consume part of the registration deadline on hosts with many disks.
-	refreshRegistrationDeadline(conn)
-	return SendJSONData(conn, MsgObservedStorageConfig, observed)
 }
 
 func collectObservedStorage() *elementalv1.ObservedStorage {
 	observed, err := newObservedStorageCollector().collect()
 	if err != nil {
 		log.Warningf("failed to collect observed storage: %v", err)
-		return &elementalv1.ObservedStorage{}
+		return &elementalv1.ObservedStorage{BootID: currentBootID()}
 	}
 	return observed
 }
@@ -120,31 +97,160 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 		byIDPaths = map[string][]string{}
 	}
 
-	live := c.liveEnvironment()
-	records := buildDiskRecords(topology.BlockDevices)
-	observed := &elementalv1.ObservedStorage{Devices: make([]elementalv1.ObservedStorageDevice, 0, len(records))}
-	for _, record := range records {
-		observed.Devices = append(observed.Devices, c.observeDisk(record, byIDPaths, live))
+	records := flattenBlockTopology(topology.BlockDevices)
+	ids := make(map[string]string, len(records))
+	for path, record := range records {
+		ids[path] = canonicalDeviceID(record.device, byIDPaths[path])
+	}
+
+	systemPaths, systemEvidence := classifySystemClosure(records)
+	multipathMembers := multipathMemberPaths(records)
+	health := c.collectMultipathHealth(records, ids)
+	live := c.liveEnvironment != nil && c.liveEnvironment()
+
+	paths := make([]string, 0, len(records))
+	for path, record := range records {
+		if isObservableLogicalDevice(record.device.Type) {
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+
+	observed := &elementalv1.ObservedStorage{BootID: c.bootID()}
+	for _, devicePath := range paths {
+		record := records[devicePath]
+		// Physical paths underneath a Multipath map are reported as memberIDs
+		// on the aggregate map, never as independently selectable DirectDisks.
+		if strings.EqualFold(record.device.Type, "disk") && multipathMembers.Has(devicePath) {
+			continue
+		}
+
+		deviceID := ids[devicePath]
+		if deviceID == "" {
+			// Preserve visibility for diagnostics while making the record
+			// impossible to select through provider admission.
+			deviceID = "unidentified:" + sanitizeDiagnosticID(devicePath)
+		}
+
+		role := elementalv1.ObservedStorageSystemRoleData
+		evidence := append([]string(nil), systemEvidence[devicePath]...)
+		if systemPaths.Has(devicePath) {
+			role = elementalv1.ObservedStorageSystemRoleSystem
+		} else if live || strings.HasPrefix(deviceID, "unidentified:") || record.topologyAmbiguous {
+			role = elementalv1.ObservedStorageSystemRoleUnknown
+			if live {
+				evidence = append(evidence, "live environment cannot prove the installation target")
+			}
+			if strings.HasPrefix(deviceID, "unidentified:") {
+				evidence = append(evidence, "no supported stable device identity")
+			}
+			if record.topologyAmbiguous {
+				evidence = append(evidence, "block topology is ambiguous")
+			}
+		}
+
+		signatures, signatureComplete := c.observeSignatures(record.device)
+		if !signatureComplete {
+			evidence = append(evidence, "wipefs signature inspection failed")
+			if role == elementalv1.ObservedStorageSystemRoleData {
+				role = elementalv1.ObservedStorageSystemRoleUnknown
+			}
+		}
+
+		device := elementalv1.ObservedStorageDevice{
+			ID:                 deviceID,
+			Kind:               observedDeviceKind(record.device.Type),
+			Path:               devicePath,
+			StablePaths:        sortedUniqueStrings(byIDPaths[devicePath]),
+			SizeBytes:          int64(record.device.Size),
+			StartBytes:         partitionStartBytes(record.device),
+			ReadOnly:           bool(record.device.ReadOnly),
+			Rotational:         bool(record.device.Rotational),
+			Removable:          bool(record.device.Removable),
+			SystemRole:         role,
+			SystemEvidence:     sortedUniqueStrings(evidence),
+			PartitionTableType: strings.TrimSpace(record.device.PTType),
+			Signatures:         signatures,
+			Filesystem:         observedFilesystem(record.device),
+			Mounts:             observedMounts(record.device),
+			Transport:          strings.TrimSpace(record.device.Transport),
+			Model:              strings.TrimSpace(record.device.Model),
+			Serial:             strings.TrimSpace(record.device.Serial),
+			WWN:                strings.TrimSpace(record.device.WWN),
+			Consumers:          observedBlockConsumers(devicePath, records),
+		}
+		if parent := canonicalParentID(record, records, ids); parent != "" {
+			device.ParentID = parent
+		}
+		if device.Kind == elementalv1.ObservedStorageDeviceMultipath {
+			device.MemberIDs = observedMultipathMembers(devicePath, records, byIDPaths)
+			if value, found := health[deviceID]; found {
+				valueCopy := value
+				device.Health = &valueCopy
+			}
+		}
+		observed.Devices = append(observed.Devices, device)
 	}
 
 	sort.SliceStable(observed.Devices, func(i, j int) bool {
-		left := observed.Devices[i].ByID
-		right := observed.Devices[j].ByID
-		if left == "" {
-			return false
-		}
-		if right == "" {
-			return true
-		}
-		return left < right
+		return observed.Devices[i].ID < observed.Devices[j].ID
 	})
 	return observed, nil
+}
+
+func observedBlockConsumers(path string, records map[string]*blockRecord) []elementalv1.ObservedStorageConsumer {
+	seen := stringSet{}
+	queue := []string{path}
+	consumers := []elementalv1.ObservedStorageConsumer{}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		record := records[current]
+		if record == nil {
+			continue
+		}
+		children := make([]string, 0, len(record.children))
+		for child := range record.children {
+			children = append(children, child)
+		}
+		sort.Strings(children)
+		for _, child := range children {
+			if child == path || seen.Has(child) {
+				continue
+			}
+			seen.Add(child)
+			queue = append(queue, child)
+			childRecord := records[child]
+			if childRecord == nil {
+				continue
+			}
+			mounts := make([]string, 0, len(childRecord.device.MountPoints))
+			for _, mount := range childRecord.device.MountPoints {
+				if value := strings.TrimSpace(mount); value != "" {
+					mounts = append(mounts, filepath.Clean(value))
+				}
+			}
+			consumers = append(consumers, elementalv1.ObservedStorageConsumer{
+				Path:           child,
+				Type:           strings.ToLower(strings.TrimSpace(childRecord.device.Type)),
+				FilesystemType: strings.ToLower(strings.TrimSpace(childRecord.device.FSType)),
+				Mounts:         sortedUniqueStrings(mounts),
+			})
+		}
+	}
+	sort.Slice(consumers, func(i, j int) bool {
+		if consumers[i].Path != consumers[j].Path {
+			return consumers[i].Path < consumers[j].Path
+		}
+		return consumers[i].Type < consumers[j].Type
+	})
+	return consumers
 }
 
 func runStorageCommand(name string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), storageCommandTimeout)
 	defer cancel()
-	// #nosec G204 -- name and args are fixed by this package and never contain user input.
+	// #nosec G204 -- callers use fixed command names and generated arguments.
 	cmd := exec.CommandContext(ctx, name, args...)
 	output, err := cmd.CombinedOutput()
 	if err == nil {
@@ -169,10 +275,9 @@ func collectByIDPathsFrom(byIDDir string) (map[string][]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	paths := map[string][]string{}
 	for _, entry := range entries {
-		if entry.IsDir() || partitionByIDPattern.MatchString(entry.Name()) {
+		if entry.IsDir() {
 			continue
 		}
 		byID := filepath.Join(byIDDir, entry.Name())
@@ -182,6 +287,9 @@ func collectByIDPathsFrom(byIDDir string) (map[string][]string, error) {
 		}
 		resolved = filepath.Clean(resolved)
 		paths[resolved] = append(paths[resolved], byID)
+	}
+	for path := range paths {
+		paths[path] = sortedUniqueStrings(paths[path])
 	}
 	return paths, nil
 }
@@ -195,35 +303,50 @@ func isLiveEnvironment() bool {
 	return false
 }
 
+func currentBootID() string {
+	data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 type lsblkOutput struct {
 	BlockDevices []lsblkDevice `json:"blockdevices"`
 }
 
 type lsblkDevice struct {
-	Name        string              `json:"name"`
-	Path        string              `json:"path"`
-	Type        string              `json:"type"`
-	Size        flexibleInt64       `json:"size"`
-	Rotational  flexibleBool        `json:"rota"`
-	Removable   flexibleBool        `json:"rm"`
-	Model       string              `json:"model"`
-	Serial      string              `json:"serial"`
-	WWN         string              `json:"wwn"`
-	FSType      string              `json:"fstype"`
-	UUID        string              `json:"uuid"`
-	Label       string              `json:"label"`
-	MountPoints nullableStringSlice `json:"mountpoints"`
-	PTType      string              `json:"pttype"`
-	PartType    string              `json:"parttype"`
-	Children    []lsblkDevice       `json:"children"`
+	Name          string              `json:"name"`
+	Path          string              `json:"path"`
+	Type          string              `json:"type"`
+	Size          flexibleInt64       `json:"size"`
+	Start         flexibleInt64       `json:"start"`
+	LogicalSector flexibleInt64       `json:"log-sec"`
+	ReadOnly      flexibleBool        `json:"ro"`
+	Rotational    flexibleBool        `json:"rota"`
+	Removable     flexibleBool        `json:"rm"`
+	Model         string              `json:"model"`
+	Serial        string              `json:"serial"`
+	WWN           string              `json:"wwn"`
+	Transport     string              `json:"tran"`
+	FSType        string              `json:"fstype"`
+	UUID          string              `json:"uuid"`
+	Label         string              `json:"label"`
+	MountPoints   nullableStringSlice `json:"mountpoints"`
+	Options       nullableStringSlice `json:"options"`
+	PTType        string              `json:"pttype"`
+	PartType      string              `json:"parttype"`
+	PartUUID      string              `json:"partuuid"`
+	PKName        string              `json:"pkname"`
+	Children      []lsblkDevice       `json:"children"`
 }
 
 func (d lsblkDevice) devicePath() string {
-	if path := strings.TrimSpace(d.Path); path != "" {
-		return filepath.Clean(path)
+	if value := strings.TrimSpace(d.Path); value != "" {
+		return filepath.Clean(value)
 	}
-	if name := strings.TrimSpace(d.Name); name != "" {
-		return filepath.Clean(name)
+	if value := strings.TrimSpace(d.Name); value != "" {
+		return filepath.Clean(value)
 	}
 	return ""
 }
@@ -293,7 +416,6 @@ func (s *nullableStringSlice) UnmarshalJSON(data []byte) error {
 		}
 		return nil
 	}
-
 	values := []json.RawMessage{}
 	if err := json.Unmarshal(data, &values); err != nil {
 		return err
@@ -307,7 +429,7 @@ func (s *nullableStringSlice) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(raw, &value); err != nil {
 			return err
 		}
-		if value != "" {
+		if value = strings.TrimSpace(value); value != "" {
 			result = append(result, value)
 		}
 	}
@@ -315,458 +437,477 @@ func (s *nullableStringSlice) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type diskRecord struct {
-	path          string
-	disk          lsblkDevice
-	descendants   map[string]lsblkDevice
-	ancestorTypes map[string]struct{}
+type blockRecord struct {
+	device            lsblkDevice
+	parents           map[string]struct{}
+	children          map[string]struct{}
+	topologyAmbiguous bool
 }
 
-func buildDiskRecords(devices []lsblkDevice) []diskRecord {
-	records := map[string]*diskRecord{}
-	var walk func(lsblkDevice, []string)
-	walk = func(device lsblkDevice, ancestors []string) {
-		if strings.EqualFold(device.Type, "disk") {
-			path := device.devicePath()
-			if path == "" {
-				return
-			}
-			record, found := records[path]
-			if !found {
-				record = &diskRecord{
-					path:          path,
-					disk:          device,
-					descendants:   map[string]lsblkDevice{},
-					ancestorTypes: map[string]struct{}{},
-				}
-				records[path] = record
-			}
-			for _, ancestor := range ancestors {
-				record.ancestorTypes[ancestor] = struct{}{}
-			}
-			addDescendants(record.descendants, device.Children)
-		}
-
-		nextAncestors := append(append([]string(nil), ancestors...), device.Type)
-		for _, child := range device.Children {
-			walk(child, nextAncestors)
-		}
-	}
-	for _, device := range devices {
-		walk(device, nil)
-	}
-
-	result := make([]diskRecord, 0, len(records))
-	for _, record := range records {
-		result = append(result, *record)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].path < result[j].path })
-	return result
-}
-
-func addDescendants(result map[string]lsblkDevice, devices []lsblkDevice) {
-	for _, device := range devices {
+func flattenBlockTopology(devices []lsblkDevice) map[string]*blockRecord {
+	records := map[string]*blockRecord{}
+	var walk func(lsblkDevice, string)
+	walk = func(device lsblkDevice, parent string) {
 		path := device.devicePath()
-		if path != "" && path != "." {
-			result[path] = device
-		}
-		addDescendants(result, device.Children)
-	}
-}
-
-func (r diskRecord) sortedDescendants() []lsblkDevice {
-	result := make([]lsblkDevice, 0, len(r.descendants))
-	for _, device := range r.descendants {
-		result = append(result, device)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].devicePath() < result[j].devicePath() })
-	return result
-}
-
-func (c *observedStorageCollector) observeDisk(record diskRecord, byIDPaths map[string][]string, live bool) elementalv1.ObservedStorageDevice {
-	properties := map[string]string{}
-	if record.disk.WWN == "" || record.disk.Serial == "" || record.disk.Model == "" {
-		properties = c.udevProperties(record.path)
-	}
-	byID := canonicalByID(byIDPaths[record.path])
-	if byID == "" {
-		for path, candidates := range byIDPaths {
-			if sameDevicePath(path, record.path) {
-				byID = canonicalByID(candidates)
-				break
-			}
-		}
-	}
-
-	wwn := firstNonEmpty(properties["ID_WWN"], record.disk.WWN, properties["ID_WWN_WITH_EXTENSION"])
-	serial := firstNonEmpty(properties["ID_SERIAL_SHORT"], record.disk.Serial, properties["ID_SERIAL"])
-	model := firstNonEmpty(record.disk.Model, properties["ID_MODEL"], properties["ID_MODEL_FROM_DATABASE"])
-	descendants := record.sortedDescendants()
-	partitions := observedPartitions(record.disk, descendants)
-	systemDisk := isSystemDisk(record.disk, descendants)
-
-	reasons := []string{}
-	seenReasons := map[string]struct{}{}
-	addReason := func(reason string) {
-		if _, found := seenReasons[reason]; found {
+		if path == "" || path == "." {
 			return
 		}
-		seenReasons[reason] = struct{}{}
-		reasons = append(reasons, reason)
-	}
-
-	if systemDisk {
-		addReason(storageReasonSystemDisk)
-	} else if live {
-		// The installation config is returned only after this snapshot is sent.
-		// Until the installed system registers again, no blank disk can safely be
-		// distinguished from the impending Elemental installation target.
-		addReason(storageReasonLiveISO)
-	}
-	if bool(record.disk.Removable) {
-		addReason(storageReasonRemovable)
-	}
-	if byID == "" {
-		addReason(storageReasonNoByID)
-	}
-	if wwn == "" && serial == "" {
-		addReason(storageReasonNoIdentity)
-	}
-	for _, reason := range topologyReasons(record, descendants) {
-		addReason(reason)
-	}
-	for _, reason := range mountReasons(record.disk, descendants) {
-		addReason(reason)
-	}
-	for _, reason := range c.layoutReasons(record, descendants) {
-		addReason(reason)
-	}
-
-	return elementalv1.ObservedStorageDevice{
-		ByID:              byID,
-		WWN:               strings.TrimSpace(wwn),
-		Serial:            strings.TrimSpace(serial),
-		Model:             strings.TrimSpace(model),
-		SizeBytes:         int64(record.disk.Size),
-		Rotational:        bool(record.disk.Rotational),
-		SystemDisk:        systemDisk,
-		Partitions:        partitions,
-		Eligible:          len(reasons) == 0,
-		IneligibleReasons: reasons,
-	}
-}
-
-func (c *observedStorageCollector) udevProperties(path string) map[string]string {
-	properties := map[string]string{}
-	data, err := c.run("udevadm", "info", "--query=property", "--name", path)
-	if err != nil {
-		log.Debugf("failed to inspect udev properties for %s: %v", path, err)
-		return properties
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		key, value, found := strings.Cut(line, "=")
+		record, found := records[path]
 		if !found {
-			continue
+			record = &blockRecord{device: device, parents: map[string]struct{}{}, children: map[string]struct{}{}}
+			records[path] = record
+		} else if !sameBlockFacts(record.device, device) {
+			record.topologyAmbiguous = true
 		}
-		properties[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		if parent != "" {
+			record.parents[parent] = struct{}{}
+			if parentRecord := records[parent]; parentRecord != nil {
+				parentRecord.children[path] = struct{}{}
+			}
+		}
+		for _, child := range device.Children {
+			walk(child, path)
+		}
 	}
-	return properties
+	for _, device := range devices {
+		walk(device, "")
+	}
+	return records
 }
 
-func canonicalByID(paths []string) string {
-	if len(paths) == 0 {
+func sameBlockFacts(left, right lsblkDevice) bool {
+	return left.devicePath() == right.devicePath() &&
+		strings.EqualFold(left.Type, right.Type) &&
+		int64(left.Size) == int64(right.Size) &&
+		strings.EqualFold(strings.TrimSpace(left.UUID), strings.TrimSpace(right.UUID))
+}
+
+func isObservableLogicalDevice(deviceType string) bool {
+	switch strings.ToLower(strings.TrimSpace(deviceType)) {
+	case "disk", "part", "mpath":
+		return true
+	default:
+		return false
+	}
+}
+
+func observedDeviceKind(deviceType string) elementalv1.ObservedStorageDeviceKind {
+	switch strings.ToLower(strings.TrimSpace(deviceType)) {
+	case "part":
+		return elementalv1.ObservedStorageDevicePartition
+	case "mpath":
+		return elementalv1.ObservedStorageDeviceMultipath
+	default:
+		return elementalv1.ObservedStorageDeviceDirectDisk
+	}
+}
+
+func canonicalDeviceID(device lsblkDevice, stablePaths []string) string {
+	if strings.EqualFold(device.Type, "part") {
+		if value := canonicalPartUUID(device.PartUUID); value != "" {
+			return "partuuid:" + value
+		}
 		return ""
 	}
-	candidates := append([]string(nil), paths...)
-	sort.Slice(candidates, func(i, j int) bool {
-		leftPriority := byIDPriority(filepath.Base(candidates[i]))
-		rightPriority := byIDPriority(filepath.Base(candidates[j]))
-		if leftPriority != rightPriority {
-			return leftPriority < rightPriority
-		}
-		return candidates[i] < candidates[j]
-	})
-	return candidates[0]
-}
-
-func byIDPriority(name string) int {
-	switch {
-	case strings.HasPrefix(name, "wwn-"):
-		return 0
-	case strings.HasPrefix(name, "nvme-eui."), strings.HasPrefix(name, "nvme-eui-"):
-		return 1
-	case strings.HasPrefix(name, "nvme-uuid."), strings.HasPrefix(name, "nvme-uuid-"):
-		return 2
-	case strings.HasPrefix(name, "scsi-"):
-		return 3
-	case strings.HasPrefix(name, "ata-"):
-		return 4
-	case strings.HasPrefix(name, "virtio-"):
-		return 5
-	case strings.HasPrefix(name, "nvme-"):
-		return 6
-	case strings.HasPrefix(name, "usb-"):
-		return 7
-	default:
-		return 8
-	}
-}
-
-func sameDevicePath(left, right string) bool {
-	leftResolved, leftErr := filepath.EvalSymlinks(left)
-	rightResolved, rightErr := filepath.EvalSymlinks(right)
-	if leftErr == nil {
-		left = leftResolved
-	}
-	if rightErr == nil {
-		right = rightResolved
-	}
-	return filepath.Clean(left) == filepath.Clean(right)
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if value = strings.TrimSpace(value); value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func observedPartitions(disk lsblkDevice, descendants []lsblkDevice) []elementalv1.ObservedStoragePartition {
-	partitionDevices := partitionDevices(descendants)
-	if len(partitionDevices) == 0 {
-		if disk.FSType == "" {
-			return nil
-		}
-		return []elementalv1.ObservedStoragePartition{{
-			FilesystemType: disk.FSType,
-			FilesystemUUID: disk.UUID,
-			MountPoint:     firstMountPoint(disk),
-		}}
-	}
-
-	result := make([]elementalv1.ObservedStoragePartition, 0, len(partitionDevices))
-	for _, partition := range partitionDevices {
-		result = append(result, elementalv1.ObservedStoragePartition{
-			Number:         partitionNumber(partition),
-			FilesystemType: partition.FSType,
-			FilesystemUUID: partition.UUID,
-			MountPoint:     firstMountPoint(partition),
-		})
-	}
-	return result
-}
-
-func partitionDevices(descendants []lsblkDevice) []lsblkDevice {
-	result := []lsblkDevice{}
-	for _, device := range descendants {
-		if strings.EqualFold(device.Type, "part") {
-			result = append(result, device)
-		}
-	}
-	sort.Slice(result, func(i, j int) bool {
-		left := partitionNumber(result[i])
-		right := partitionNumber(result[j])
-		if left != right {
-			return left < right
-		}
-		return result[i].devicePath() < result[j].devicePath()
-	})
-	return result
-}
-
-func partitionNumber(device lsblkDevice) int {
-	match := partitionNumberSuffix.FindStringSubmatch(device.devicePath())
-	if len(match) != 2 {
-		return 0
-	}
-	number, _ := strconv.Atoi(match[1])
-	return number
-}
-
-func firstMountPoint(device lsblkDevice) string {
-	for _, mountPoint := range device.MountPoints {
-		if mountPoint = strings.TrimSpace(mountPoint); mountPoint != "" {
-			return mountPoint
-		}
-	}
-	return ""
-}
-
-func isSystemDisk(disk lsblkDevice, descendants []lsblkDevice) bool {
-	devices := append([]lsblkDevice{disk}, descendants...)
-	for _, device := range devices {
-		label := strings.ToUpper(strings.TrimSpace(device.Label))
-		if strings.HasPrefix(label, "COS_") || label == "EFI" || label == "EFI_SYSTEM" || label == "EFI SYSTEM PARTITION" {
-			return true
-		}
-		if strings.EqualFold(device.PartType, "c12a7328-f81f-11d2-ba4b-00a0c93ec93b") {
-			return true
-		}
-		for _, mountPoint := range device.MountPoints {
-			if isSystemMountPoint(mountPoint) {
-				return true
+	if strings.EqualFold(device.Type, "mpath") {
+		for _, stable := range stablePaths {
+			base := filepath.Base(stable)
+			if strings.HasPrefix(base, "dm-uuid-mpath-") {
+				return "wwid:" + canonicalHexIdentity(strings.TrimPrefix(base, "dm-uuid-mpath-"))
 			}
 		}
+		if value := canonicalHexIdentity(device.WWN); value != "" {
+			return "wwid:" + value
+		}
+		if name := filepath.Base(device.devicePath()); strings.TrimSpace(name) != "" {
+			return "wwid:" + canonicalHexIdentity(name)
+		}
+		return ""
 	}
-	return false
-}
 
-func isSystemMountPoint(mountPoint string) bool {
-	mountPoint = filepath.Clean(strings.TrimSpace(mountPoint))
-	switch mountPoint {
-	case "/", "/boot", "/boot/efi", "/oem":
-		return true
-	}
-	return strings.HasPrefix(mountPoint, "/run/cos/") || strings.HasPrefix(mountPoint, "/run/elemental/")
-}
-
-func topologyReasons(record diskRecord, descendants []lsblkDevice) []string {
-	unsafeTypes := map[string]struct{}{}
-	for ancestor := range record.ancestorTypes {
-		if isUnsafeBlockType(ancestor) {
-			unsafeTypes[strings.ToLower(ancestor)] = struct{}{}
+	for _, stable := range stablePaths {
+		base := filepath.Base(stable)
+		switch {
+		case strings.HasPrefix(base, "wwn-"):
+			return "wwn:" + canonicalHexIdentity(strings.TrimPrefix(base, "wwn-"))
+		case strings.HasPrefix(base, "nvme-eui."):
+			return "nvme-eui:" + canonicalHexIdentity(strings.TrimPrefix(base, "nvme-eui."))
+		case strings.HasPrefix(base, "nvme-eui-"):
+			return "nvme-eui:" + canonicalHexIdentity(strings.TrimPrefix(base, "nvme-eui-"))
+		case strings.HasPrefix(base, "nvme-uuid."):
+			return "nvme-nguid:" + canonicalHexIdentity(strings.TrimPrefix(base, "nvme-uuid."))
+		case strings.HasPrefix(base, "nvme-uuid-"):
+			return "nvme-nguid:" + canonicalHexIdentity(strings.TrimPrefix(base, "nvme-uuid-"))
 		}
 	}
-	for _, device := range descendants {
-		if isUnsafeBlockType(device.Type) {
-			unsafeTypes[strings.ToLower(device.Type)] = struct{}{}
-		}
+	if value := canonicalHexIdentity(device.WWN); value != "" {
+		return "wwn:" + value
 	}
-
-	protectedSignatures := map[string]struct{}{}
-	devices := append([]lsblkDevice{record.disk}, descendants...)
-	for _, device := range devices {
-		if isProtectedFilesystem(device.FSType) {
-			protectedSignatures[device.FSType] = struct{}{}
-		}
+	if localTransport(device.Transport) && strings.TrimSpace(device.Serial) != "" && strings.TrimSpace(device.Model) != "" {
+		return "serial:" + canonicalSerialPart(device.Model) + ":" + canonicalSerialPart(device.Serial)
 	}
-
-	reasons := []string{}
-	for _, blockType := range sortedKeys(unsafeTypes) {
-		reasons = append(reasons, fmt.Sprintf("contains unsupported block topology %s", blockType))
-	}
-	for _, signature := range sortedKeys(protectedSignatures) {
-		reasons = append(reasons, fmt.Sprintf("contains protected filesystem signature %s", signature))
-	}
-	return reasons
+	return ""
 }
 
-func isUnsafeBlockType(blockType string) bool {
-	switch strings.ToLower(strings.TrimSpace(blockType)) {
-	case "", "disk", "part":
-		return false
-	default:
-		return true
+func canonicalPartUUID(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimPrefix(value, "{")
+	value = strings.TrimSuffix(value, "}")
+	if value == "" || strings.HasPrefix(value, "-") || strings.HasSuffix(value, "-") || strings.Contains(value, "--") {
+		return ""
 	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && r != '-' {
+			return ""
+		}
+	}
+	return value
 }
 
-func isProtectedFilesystem(filesystem string) bool {
-	switch strings.ToLower(strings.TrimSpace(filesystem)) {
-	case "swap", "lvm2_member", "linux_raid_member", "crypto_luks", "mpath_member":
+func canonicalHexIdentity(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimPrefix(value, "0x")
+	value = strings.ReplaceAll(value, "-", "")
+	value = strings.ReplaceAll(value, ":", "")
+	value = strings.ReplaceAll(value, ".", "")
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return ""
+		}
+	}
+	return value
+}
+
+func canonicalSerialPart(value string) string {
+	value = strings.TrimSpace(value)
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+func localTransport(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "ata", "sata", "nvme", "virtio", "mmc":
 		return true
 	default:
 		return false
 	}
 }
 
-func mountReasons(disk lsblkDevice, descendants []lsblkDevice) []string {
-	mounts := map[string]struct{}{}
-	devices := append([]lsblkDevice{disk}, descendants...)
-	for _, device := range devices {
-		for _, mountPoint := range device.MountPoints {
-			if mountPoint = strings.TrimSpace(mountPoint); mountPoint != "" {
-				mounts[mountPoint] = struct{}{}
-			}
+func canonicalParentID(record *blockRecord, records map[string]*blockRecord, ids map[string]string) string {
+	if record == nil || len(record.parents) != 1 {
+		return ""
+	}
+	for parent := range record.parents {
+		if records[parent] != nil {
+			return ids[parent]
 		}
 	}
-	reasons := []string{}
-	for _, mountPoint := range sortedKeys(mounts) {
-		reasons = append(reasons, fmt.Sprintf("mounted at %s", mountPoint))
-	}
-	return reasons
+	return ""
 }
 
-func (c *observedStorageCollector) layoutReasons(record diskRecord, descendants []lsblkDevice) []string {
-	partitions := partitionDevices(descendants)
-	switch len(partitions) {
-	case 0:
-		return c.wholeDiskLayoutReasons(record)
-	case 1:
-		return singlePartitionLayoutReasons(record.disk, partitions[0])
-	default:
-		return []string{fmt.Sprintf("contains %d partitions; v1 requires an empty disk, whole-disk XFS, or one XFS partition", len(partitions))}
+func partitionStartBytes(device lsblkDevice) int64 {
+	sector := int64(device.LogicalSector)
+	if sector <= 0 {
+		sector = 512
 	}
+	start := int64(device.Start)
+	if start <= 0 || start > (1<<63-1)/sector {
+		return 0
+	}
+	return start * sector
 }
 
-func (c *observedStorageCollector) wholeDiskLayoutReasons(record diskRecord) []string {
-	filesystem := strings.TrimSpace(record.disk.FSType)
-	if strings.EqualFold(filesystem, "xfs") {
-		if strings.TrimSpace(record.disk.UUID) == "" {
-			return []string{"whole-disk XFS filesystem has no UUID"}
-		}
+func observedFilesystem(device lsblkDevice) *elementalv1.ObservedStorageFilesystem {
+	if strings.TrimSpace(device.FSType) == "" {
 		return nil
 	}
-	if filesystem != "" {
-		return []string{fmt.Sprintf("whole disk has unsupported filesystem %s; v1 requires XFS", filesystem)}
+	return &elementalv1.ObservedStorageFilesystem{
+		Type: strings.TrimSpace(device.FSType),
+		UUID: strings.TrimSpace(device.UUID),
 	}
-	if strings.TrimSpace(record.disk.PTType) != "" {
-		return []string{"contains a partition table without one usable XFS partition"}
-	}
-
-	empty, err := c.hasNoSignatures(record.path)
-	if err != nil {
-		log.Debugf("failed to inspect signatures on %s: %v", record.path, err)
-		return []string{storageReasonSignatureRead}
-	}
-	if !empty {
-		return []string{"contains an existing partition-table or filesystem signature without a usable XFS volume"}
-	}
-	return nil
 }
 
-func singlePartitionLayoutReasons(disk, partition lsblkDevice) []string {
-	reasons := []string{}
-	if filesystem := strings.TrimSpace(disk.FSType); filesystem != "" {
-		reasons = append(reasons, fmt.Sprintf("whole disk also reports filesystem signature %s", filesystem))
-	}
-	filesystem := strings.TrimSpace(partition.FSType)
-	if !strings.EqualFold(filesystem, "xfs") {
-		if filesystem == "" {
-			filesystem = "none"
+func observedMounts(device lsblkDevice) []elementalv1.ObservedStorageMount {
+	mounts := make([]elementalv1.ObservedStorageMount, 0, len(device.MountPoints))
+	for i, mountPath := range device.MountPoints {
+		mountPath = strings.TrimSpace(mountPath)
+		if mountPath == "" {
+			continue
 		}
-		reasons = append(reasons, fmt.Sprintf("single partition has filesystem %s; v1 requires XFS", filesystem))
-	} else if strings.TrimSpace(partition.UUID) == "" {
-		reasons = append(reasons, "single XFS partition has no UUID")
+		mount := elementalv1.ObservedStorageMount{Path: filepath.Clean(mountPath)}
+		if i < len(device.Options) {
+			mount.Options = sortedUniqueStrings(strings.Split(device.Options[i], ","))
+		} else if len(device.Options) == 1 {
+			mount.Options = sortedUniqueStrings(strings.Split(device.Options[0], ","))
+		}
+		mounts = append(mounts, mount)
 	}
-	return reasons
+	sort.Slice(mounts, func(i, j int) bool { return mounts[i].Path < mounts[j].Path })
+	return mounts
 }
 
 type wipefsOutput struct {
-	Signatures []struct {
-		Type  string `json:"type"`
-		Usage string `json:"usage"`
-	} `json:"signatures"`
+	Signatures []map[string]any `json:"signatures"`
 }
 
-func (c *observedStorageCollector) hasNoSignatures(path string) (bool, error) {
-	data, err := c.run("wipefs", "--no-act", "--json", path)
+func (c *observedStorageCollector) observeSignatures(device lsblkDevice) ([]elementalv1.ObservedStorageSignature, bool) {
+	signatures := []elementalv1.ObservedStorageSignature{}
+	if value := strings.TrimSpace(device.PTType); value != "" {
+		signatures = append(signatures, elementalv1.ObservedStorageSignature{Type: "partition-table", Value: value})
+	}
+	if value := strings.TrimSpace(device.FSType); value != "" {
+		signatures = append(signatures, elementalv1.ObservedStorageSignature{Type: "filesystem", Value: value})
+	}
+	data, err := c.run("wipefs", "--json", "--no-act", device.devicePath())
 	if err != nil {
-		return false, err
+		return sortedSignatures(signatures), false
 	}
-	result := wipefsOutput{}
-	if err := json.Unmarshal(data, &result); err != nil {
-		return false, fmt.Errorf("decoding wipefs JSON: %w", err)
+	decoded := wipefsOutput{}
+	if len(bytes.TrimSpace(data)) > 0 {
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			return sortedSignatures(signatures), false
+		}
 	}
-	return len(result.Signatures) == 0, nil
+	for _, item := range decoded.Signatures {
+		usage := stringValue(item["usage"])
+		typeValue := stringValue(item["type"])
+		value := typeValue
+		if label := stringValue(item["label"]); label != "" {
+			value = typeValue + ":" + label
+		}
+		if usage == "" {
+			usage = "signature"
+		}
+		if value != "" {
+			signatures = append(signatures, elementalv1.ObservedStorageSignature{Type: usage, Value: value})
+		}
+	}
+	return sortedSignatures(signatures), true
 }
 
-func sortedKeys(values map[string]struct{}) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
+func stringValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case json.Number:
+		return typed.String()
+	default:
+		return ""
 	}
-	sort.Strings(keys)
-	return keys
+}
+
+func sortedSignatures(in []elementalv1.ObservedStorageSignature) []elementalv1.ObservedStorageSignature {
+	seen := map[string]struct{}{}
+	out := make([]elementalv1.ObservedStorageSignature, 0, len(in))
+	for _, signature := range in {
+		key := signature.Type + "\x00" + signature.Value
+		if _, found := seen[key]; found {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, signature)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Type != out[j].Type {
+			return out[i].Type < out[j].Type
+		}
+		return out[i].Value < out[j].Value
+	})
+	return out
+}
+
+func classifySystemClosure(records map[string]*blockRecord) (stringSet, map[string][]string) {
+	system := stringSet{}
+	evidence := map[string][]string{}
+	queue := []string{}
+	for path, record := range records {
+		if reason := systemSeedEvidence(record.device); reason != "" {
+			system.Add(path)
+			evidence[path] = append(evidence[path], reason)
+			queue = append(queue, path)
+		}
+	}
+	for len(queue) > 0 {
+		path := queue[0]
+		queue = queue[1:]
+		record := records[path]
+		if record == nil {
+			continue
+		}
+		for related := range unionStringSets(record.parents, record.children) {
+			if system.Has(related) {
+				continue
+			}
+			system.Add(related)
+			evidence[related] = append(evidence[related], "topology closure of system device "+path)
+			queue = append(queue, related)
+		}
+	}
+	return system, evidence
+}
+
+func systemSeedEvidence(device lsblkDevice) string {
+	label := strings.ToUpper(strings.TrimSpace(device.Label))
+	if strings.HasPrefix(label, "COS_") || label == "EFI" || label == "EFI_SYSTEM" || label == "EFI SYSTEM PARTITION" {
+		return "system filesystem label " + label
+	}
+	if strings.EqualFold(device.PartType, "c12a7328-f81f-11d2-ba4b-00a0c93ec93b") {
+		return "EFI system partition type"
+	}
+	for _, mountPoint := range device.MountPoints {
+		mountPoint = filepath.Clean(strings.TrimSpace(mountPoint))
+		switch mountPoint {
+		case "/", "/boot", "/boot/efi", "/oem", "/run/elemental/persistent", "/run/cos/persistent":
+			return "system mount " + mountPoint
+		}
+		if strings.HasPrefix(mountPoint, "/run/cos/") || strings.HasPrefix(mountPoint, "/run/elemental/") {
+			return "Elemental system mount " + mountPoint
+		}
+	}
+	return ""
+}
+
+func multipathMemberPaths(records map[string]*blockRecord) stringSet {
+	members := stringSet{}
+	for path, record := range records {
+		if !strings.EqualFold(record.device.Type, "mpath") {
+			continue
+		}
+		for parent := range record.parents {
+			members.Add(parent)
+		}
+		_ = path
+	}
+	return members
+}
+
+func observedMultipathMembers(path string, records map[string]*blockRecord, byIDPaths map[string][]string) []string {
+	record := records[path]
+	if record == nil {
+		return nil
+	}
+	members := []string{}
+	for parent := range record.parents {
+		stable := byIDPaths[parent]
+		added := false
+		for _, candidate := range stable {
+			base := filepath.Base(candidate)
+			if strings.HasPrefix(base, "scsi-") || strings.HasPrefix(base, "wwn-") {
+				members = append(members, "scsi-path:"+base)
+				added = true
+			}
+		}
+		if !added {
+			members = append(members, "path:"+sanitizeDiagnosticID(parent))
+		}
+	}
+	return sortedUniqueStrings(members)
+}
+
+func (c *observedStorageCollector) collectMultipathHealth(records map[string]*blockRecord, ids map[string]string) map[string]elementalv1.ObservedStorageMultipathHealth {
+	result := map[string]elementalv1.ObservedStorageMultipathHealth{}
+	hasMultipath := false
+	for _, record := range records {
+		if strings.EqualFold(record.device.Type, "mpath") {
+			hasMultipath = true
+			break
+		}
+	}
+	if !hasMultipath {
+		return result
+	}
+	data, err := c.run("multipathd", "show", "paths", "raw", "format", "%w|%d|%t")
+	if err != nil {
+		return result
+	}
+	byWWID := map[string]elementalv1.ObservedStorageMultipathHealth{}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Split(strings.TrimSpace(line), "|")
+		if len(fields) < 3 {
+			continue
+		}
+		wwid := canonicalHexIdentity(fields[0])
+		if wwid == "" {
+			continue
+		}
+		health := byWWID[wwid]
+		health.TotalPaths++
+		switch strings.ToLower(strings.TrimSpace(fields[2])) {
+		case "active", "ready", "running", "up":
+			health.ActivePaths++
+		}
+		byWWID[wwid] = health
+	}
+	for path, record := range records {
+		if !strings.EqualFold(record.device.Type, "mpath") {
+			continue
+		}
+		id := ids[path]
+		wwid := strings.TrimPrefix(id, "wwid:")
+		if value, found := byWWID[wwid]; found {
+			result[id] = value
+		}
+	}
+	return result
+}
+
+type stringSet map[string]struct{}
+
+func (s stringSet) Add(value string) { s[value] = struct{}{} }
+func (s stringSet) Has(value string) bool {
+	_, found := s[value]
+	return found
+}
+
+func unionStringSets(left, right map[string]struct{}) stringSet {
+	result := stringSet{}
+	for value := range left {
+		result.Add(value)
+	}
+	for value := range right {
+		result.Add(value)
+	}
+	return result
+}
+
+func sortedUniqueStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value == "" {
+			continue
+		}
+		if _, found := seen[value]; found {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sanitizeDiagnosticID(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-', r == ':':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return strings.Trim(b.String(), "_")
 }

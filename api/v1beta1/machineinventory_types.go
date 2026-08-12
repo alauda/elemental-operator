@@ -61,12 +61,10 @@ type MachineInventorySpec struct {
 	// before install-time network reconfiguration.
 	// +optional
 	ObservedNetwork *ObservedNetwork `json:"observedNetwork,omitempty"`
-	// ObservedStorage is a registration-time snapshot of the host's physical
-	// block devices. It is informational and intended for inventory UI and
-	// allocation preflight; provisioning code must inspect the live device again
-	// before making any change.
+	// Storage is the explicit desired state for Inventory-owned data volumes.
+	// Devices omitted from this list remain unmanaged.
 	// +optional
-	ObservedStorage *ObservedStorage `json:"observedStorage,omitempty"`
+	Storage *MachineInventoryStorageSpec `json:"storage,omitempty"`
 }
 
 // ObservedNetwork captures a snapshot of the host's actual network state as
@@ -120,67 +118,6 @@ type ObservedRoute struct {
 	Metric int `json:"metric,omitempty"`
 }
 
-// ObservedStorage captures stable identities and the non-destructive state of
-// physical block devices seen by elemental-register.
-type ObservedStorage struct {
-	// Devices observed on the host.
-	// +optional
-	Devices []ObservedStorageDevice `json:"devices,omitempty"`
-}
-
-// ObservedStorageDevice describes one physical disk. ByID is empty only when
-// no stable /dev/disk/by-id path exists; such a device is always ineligible.
-type ObservedStorageDevice struct {
-	// ByID is the canonical stable /dev/disk/by-id path for this disk.
-	ByID string `json:"byID"`
-	// WWN reported by udev or lsblk.
-	// +optional
-	WWN string `json:"wwn,omitempty"`
-	// Serial reported by udev or lsblk.
-	// +optional
-	Serial string `json:"serial,omitempty"`
-	// Model reported by udev or lsblk.
-	// +optional
-	Model string `json:"model,omitempty"`
-	// SizeBytes is the disk capacity in bytes.
-	// +optional
-	SizeBytes int64 `json:"sizeBytes,omitempty"`
-	// Rotational is true for rotational media.
-	// +optional
-	Rotational bool `json:"rotational,omitempty"`
-	// SystemDisk marks a disk that backs the installed OS or carries an
-	// Elemental/EFI system label.
-	// +optional
-	SystemDisk bool `json:"systemDisk,omitempty"`
-	// Partitions describes filesystems and mounts below the disk. A filesystem
-	// directly on the whole disk is represented with Number 0.
-	// +optional
-	Partitions []ObservedStoragePartition `json:"partitions,omitempty"`
-	// Eligible indicates that the registration-time snapshot matches the safe
-	// v1 data-disk layouts. Host-side plan checks remain authoritative.
-	// +optional
-	Eligible bool `json:"eligible,omitempty"`
-	// IneligibleReasons explains why the disk cannot be selected.
-	// +optional
-	IneligibleReasons []string `json:"ineligibleReasons,omitempty"`
-}
-
-// ObservedStoragePartition describes one partition or a whole-disk filesystem.
-type ObservedStoragePartition struct {
-	// Number is the partition number. Zero denotes a whole-disk filesystem.
-	// +optional
-	Number int `json:"number,omitempty"`
-	// FilesystemType is the detected filesystem or signature type.
-	// +optional
-	FilesystemType string `json:"filesystemType,omitempty"`
-	// FilesystemUUID is the detected filesystem UUID.
-	// +optional
-	FilesystemUUID string `json:"filesystemUUID,omitempty"`
-	// MountPoint is one observed mount target, if any.
-	// +optional
-	MountPoint string `json:"mountPoint,omitempty"`
-}
-
 type MachineInventoryStatus struct {
 	// Conditions describe the state of the machine inventory object.
 	// +optional
@@ -188,6 +125,14 @@ type MachineInventoryStatus struct {
 	// PlanStatus reflect the status of the plan owned by the machine inventory object.
 	// +optional
 	Plan *PlanStatus `json:"plan,omitempty"`
+	// ObservedStorage is objective host state written only by the authenticated
+	// periodic observer channel.
+	// +optional
+	ObservedStorage *ObservedStorage `json:"observedStorage,omitempty"`
+	// Storage is desired-state convergence written only by the baremetal
+	// provider Inventory Storage Reconciler.
+	// +optional
+	Storage *MachineInventoryStorageStatus `json:"storage,omitempty"`
 }
 
 type PlanState string
