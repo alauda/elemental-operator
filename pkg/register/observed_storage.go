@@ -49,7 +49,13 @@ var (
 		"--paths",
 		"--tree",
 		"--output",
-		"NAME,PATH,TYPE,SIZE,START,LOG-SEC,RO,ROTA,RM,MODEL,SERIAL,WWN,TRAN,FSTYPE,UUID,LABEL,MOUNTPOINTS,OPTIONS,PTTYPE,PARTTYPE,PARTUUID,PKNAME",
+		"NAME,KNAME,PATH,TYPE,SIZE,LOG-SEC,RO,ROTA,RM,MODEL,SERIAL,WWN,TRAN,FSTYPE,UUID,LABEL,MOUNTPOINTS,PTTYPE,PARTTYPE,PARTUUID,PKNAME",
+	}
+	findmntStorageArgs = []string{
+		"--json",
+		"--list",
+		"--output",
+		"TARGET,OPTIONS",
 	}
 )
 
@@ -58,17 +64,22 @@ type storageCommandRunner func(name string, args ...string) ([]byte, error)
 type observedStorageCollector struct {
 	run             storageCommandRunner
 	byIDPaths       func() (map[string][]string, error)
+	mountOptions    func() (map[string][]string, error)
+	partitionStart  func(lsblkDevice) int64
 	liveEnvironment func() bool
 	bootID          func() string
 }
 
 func newObservedStorageCollector() *observedStorageCollector {
-	return &observedStorageCollector{
+	collector := &observedStorageCollector{
 		run:             runStorageCommand,
 		byIDPaths:       collectByIDPaths,
+		partitionStart:  partitionStartBytesFromSysfs,
 		liveEnvironment: isLiveEnvironment,
 		bootID:          currentBootID,
 	}
+	collector.mountOptions = collector.collectMountOptions
+	return collector
 }
 
 func collectObservedStorage() *elementalv1.ObservedStorage {
@@ -95,6 +106,14 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 	if err != nil {
 		log.Warningf("failed to enumerate /dev/disk/by-id: %v", err)
 		byIDPaths = map[string][]string{}
+	}
+	mountOptions := map[string][]string{}
+	if c.mountOptions != nil {
+		mountOptions, err = c.mountOptions()
+		if err != nil {
+			log.Warningf("failed to collect mount options: %v", err)
+			mountOptions = map[string][]string{}
+		}
 	}
 
 	records := flattenBlockTopology(topology.BlockDevices)
@@ -157,13 +176,17 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 			}
 		}
 
+		startBytes := partitionStartBytes(record.device)
+		if c.partitionStart != nil {
+			startBytes = c.partitionStart(record.device)
+		}
 		device := elementalv1.ObservedStorageDevice{
 			ID:                 deviceID,
 			Kind:               observedDeviceKind(record.device.Type),
 			Path:               devicePath,
 			StablePaths:        sortedUniqueStrings(byIDPaths[devicePath]),
 			SizeBytes:          int64(record.device.Size),
-			StartBytes:         partitionStartBytes(record.device),
+			StartBytes:         startBytes,
 			ReadOnly:           bool(record.device.ReadOnly),
 			Rotational:         bool(record.device.Rotational),
 			Removable:          bool(record.device.Removable),
@@ -172,7 +195,7 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 			PartitionTableType: strings.TrimSpace(record.device.PTType),
 			Signatures:         signatures,
 			Filesystem:         observedFilesystem(record.device),
-			Mounts:             observedMounts(record.device),
+			Mounts:             observedMounts(record.device, mountOptions),
 			Transport:          strings.TrimSpace(record.device.Transport),
 			Model:              strings.TrimSpace(record.device.Model),
 			Serial:             strings.TrimSpace(record.device.Serial),
@@ -311,12 +334,33 @@ func currentBootID() string {
 	return strings.TrimSpace(string(data))
 }
 
+func (c *observedStorageCollector) collectMountOptions() (map[string][]string, error) {
+	data, err := c.run("findmnt", findmntStorageArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("running findmnt: %w", err)
+	}
+	decoded := findmntOutput{}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, fmt.Errorf("decoding findmnt JSON: %w", err)
+	}
+	options := make(map[string][]string, len(decoded.Filesystems))
+	for _, filesystem := range decoded.Filesystems {
+		target := strings.TrimSpace(filesystem.Target)
+		if target == "" {
+			continue
+		}
+		options[filepath.Clean(target)] = sortedUniqueStrings(strings.Split(filesystem.Options, ","))
+	}
+	return options, nil
+}
+
 type lsblkOutput struct {
 	BlockDevices []lsblkDevice `json:"blockdevices"`
 }
 
 type lsblkDevice struct {
 	Name          string              `json:"name"`
+	KName         string              `json:"kname"`
 	Path          string              `json:"path"`
 	Type          string              `json:"type"`
 	Size          flexibleInt64       `json:"size"`
@@ -339,6 +383,15 @@ type lsblkDevice struct {
 	PartUUID      string              `json:"partuuid"`
 	PKName        string              `json:"pkname"`
 	Children      []lsblkDevice       `json:"children"`
+}
+
+type findmntOutput struct {
+	Filesystems []findmntFilesystem `json:"filesystems"`
+}
+
+type findmntFilesystem struct {
+	Target  string `json:"target"`
+	Options string `json:"options"`
 }
 
 func (d lsblkDevice) devicePath() string {
@@ -627,6 +680,34 @@ func partitionStartBytes(device lsblkDevice) int64 {
 	return start * sector
 }
 
+func partitionStartBytesFromSysfs(device lsblkDevice) int64 {
+	return partitionStartBytesFromSysfsRoot(device, "/sys/class/block")
+}
+
+func partitionStartBytesFromSysfsRoot(device lsblkDevice, sysfsRoot string) int64 {
+	if !strings.EqualFold(strings.TrimSpace(device.Type), "part") {
+		return 0
+	}
+	kernelPath := strings.TrimSpace(device.KName)
+	kernelName := strings.TrimPrefix(kernelPath, "/dev/")
+	if kernelName == kernelPath || kernelName == "" || kernelName == "." || strings.ContainsAny(kernelName, `/\\`) {
+		return 0
+	}
+	data, err := os.ReadFile(filepath.Join(sysfsRoot, kernelName, "start"))
+	if err != nil {
+		return 0
+	}
+	start, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	sector := int64(device.LogicalSector)
+	if sector <= 0 {
+		sector = 512
+	}
+	if err != nil || start <= 0 || start > (1<<63-1)/sector {
+		return 0
+	}
+	return start * sector
+}
+
 func observedFilesystem(device lsblkDevice) *elementalv1.ObservedStorageFilesystem {
 	if strings.TrimSpace(device.FSType) == "" {
 		return nil
@@ -637,7 +718,7 @@ func observedFilesystem(device lsblkDevice) *elementalv1.ObservedStorageFilesyst
 	}
 }
 
-func observedMounts(device lsblkDevice) []elementalv1.ObservedStorageMount {
+func observedMounts(device lsblkDevice, optionsByTarget map[string][]string) []elementalv1.ObservedStorageMount {
 	mounts := make([]elementalv1.ObservedStorageMount, 0, len(device.MountPoints))
 	for i, mountPath := range device.MountPoints {
 		mountPath = strings.TrimSpace(mountPath)
@@ -645,7 +726,9 @@ func observedMounts(device lsblkDevice) []elementalv1.ObservedStorageMount {
 			continue
 		}
 		mount := elementalv1.ObservedStorageMount{Path: filepath.Clean(mountPath)}
-		if i < len(device.Options) {
+		if options, found := optionsByTarget[mount.Path]; found {
+			mount.Options = append([]string(nil), options...)
+		} else if i < len(device.Options) {
 			mount.Options = sortedUniqueStrings(strings.Split(device.Options[i], ","))
 		} else if len(device.Options) == 1 {
 			mount.Options = sortedUniqueStrings(strings.Split(device.Options[0], ","))

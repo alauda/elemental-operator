@@ -95,6 +95,9 @@ func TestObservedStorageReportsObjectiveTopology(t *testing.T) {
 				mpath:    {"/dev/disk/by-id/dm-uuid-mpath-3600508b400105e210000900000490000"},
 			}, nil
 		},
+		mountOptions: func() (map[string][]string, error) {
+			return map[string][]string{"/data/application": {"noatime", "rw"}}, nil
+		},
 		liveEnvironment: func() bool { return false },
 		bootID:          func() string { return "boot-1" },
 	}
@@ -310,13 +313,52 @@ func TestObservedStorageCollectionErrors(t *testing.T) {
 
 func TestObservedStorageLSBLKArgsRemainUtilLinux237Compatible(t *testing.T) {
 	joined := strings.Join(lsblkStorageArgs, ",")
-	if strings.Contains(joined, "PARTN") {
-		t.Fatal("PARTN is not supported by util-linux 2.37 used in the Elemental base image")
+	for _, unsupported := range []string{"PARTN", "START", "OPTIONS"} {
+		for _, column := range strings.Split(joined, ",") {
+			if column == unsupported {
+				t.Fatalf("%s is not supported by util-linux 2.37.4 used in the Elemental base image", unsupported)
+			}
+		}
 	}
-	for _, required := range []string{"PARTUUID", "PKNAME", "START", "LOG-SEC", "OPTIONS"} {
+	for _, required := range []string{"KNAME", "PARTUUID", "PKNAME", "LOG-SEC"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("lsblk columns do not include %s: %s", required, joined)
 		}
+	}
+}
+
+func TestObservedStorageCollectsMountOptionsWithFindmnt(t *testing.T) {
+	collector := &observedStorageCollector{run: func(name string, args ...string) ([]byte, error) {
+		if name != "findmnt" || !reflect.DeepEqual(args, findmntStorageArgs) {
+			return nil, fmt.Errorf("unexpected command %s %v", name, args)
+		}
+		return []byte(`{"filesystems":[{"target":"/data/application","options":"rw,noatime,nodev"},{"target":null,"options":null}]}`), nil
+	}}
+	got, err := collector.collectMountOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, map[string][]string{"/data/application": {"noatime", "nodev", "rw"}}) {
+		t.Fatalf("mount options = %#v", got)
+	}
+}
+
+func TestPartitionStartBytesFromUtilLinux237SysfsFallback(t *testing.T) {
+	sysfsRoot := t.TempDir()
+	deviceDir := filepath.Join(sysfsRoot, "sda1")
+	if err := os.MkdirAll(deviceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deviceDir, "start"), []byte("2048\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	device := lsblkDevice{KName: "/dev/sda1", Type: "part", LogicalSector: 512}
+	if got := partitionStartBytesFromSysfsRoot(device, sysfsRoot); got != 1048576 {
+		t.Fatalf("partition start bytes = %d, want 1048576", got)
+	}
+	device.KName = "/dev/../sda1"
+	if got := partitionStartBytesFromSysfsRoot(device, sysfsRoot); got != 0 {
+		t.Fatalf("unsafe kernel name returned %d", got)
 	}
 }
 
