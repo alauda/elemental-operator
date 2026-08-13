@@ -119,7 +119,7 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 	records := flattenBlockTopology(topology.BlockDevices)
 	ids := make(map[string]string, len(records))
 	for path, record := range records {
-		ids[path] = canonicalDeviceID(record.device, byIDPaths[path])
+		ids[path] = canonicalDeviceID(record.device, stablePathsForDevice(record.device, byIDPaths))
 	}
 
 	systemPaths, systemEvidence := classifySystemClosure(records)
@@ -187,7 +187,7 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 			ID:                 deviceID,
 			Kind:               observedDeviceKind(record.device.Type),
 			Path:               devicePath,
-			StablePaths:        sortedUniqueStrings(byIDPaths[devicePath]),
+			StablePaths:        stablePathsForDevice(record.device, byIDPaths),
 			SizeBytes:          int64(record.device.Size),
 			StartBytes:         startBytes,
 			ReadOnly:           bool(record.device.ReadOnly),
@@ -318,6 +318,15 @@ func collectByIDPathsFrom(byIDDir string) (map[string][]string, error) {
 		paths[path] = sortedUniqueStrings(paths[path])
 	}
 	return paths, nil
+}
+
+func stablePathsForDevice(device lsblkDevice, byIDPaths map[string][]string) []string {
+	paths := append([]string(nil), byIDPaths[device.devicePath()]...)
+	kernelPath := filepath.Clean(strings.TrimSpace(device.KName))
+	if filepath.IsAbs(kernelPath) && strings.HasPrefix(kernelPath, "/dev/") {
+		paths = append(paths, byIDPaths[kernelPath]...)
+	}
+	return sortedUniqueStrings(paths)
 }
 
 func isLiveEnvironment() bool {
@@ -929,7 +938,11 @@ func observedMultipathMembers(path string, records map[string]*blockRecord, byID
 	}
 	members := []string{}
 	for parent := range record.parents {
-		stable := byIDPaths[parent]
+		parentRecord := records[parent]
+		stable := []string(nil)
+		if parentRecord != nil {
+			stable = stablePathsForDevice(parentRecord.device, byIDPaths)
+		}
 		added := false
 		for _, candidate := range stable {
 			base := filepath.Base(candidate)

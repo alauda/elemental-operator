@@ -209,6 +209,52 @@ func TestObservedStorageHidesRawMultipathPartitionAliases(t *testing.T) {
 	}
 }
 
+func TestObservedStorageResolvesMultipathStableIDThroughKernelName(t *testing.T) {
+	const (
+		mapPath    = "/dev/mapper/mpatha"
+		kernelPath = "/dev/dm-0"
+		wwid       = "3500000007a02692"
+	)
+
+	mapDevice := map[string]any{
+		"name": mapPath, "path": mapPath, "kname": kernelPath, "type": "mpath", "size": int64(16 << 30),
+		"wwn": nil, "fstype": nil, "uuid": nil, "mountpoints": []any{nil},
+	}
+	lsblk, err := json.Marshal(map[string]any{"blockdevices": []any{mapDevice}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stablePath := "/dev/disk/by-id/dm-uuid-mpath-" + wwid
+	collector := &observedStorageCollector{
+		run: func(name string, _ ...string) ([]byte, error) {
+			if name == "lsblk" {
+				return lsblk, nil
+			}
+			return []byte(`{"signatures":[]}`), nil
+		},
+		byIDPaths: func() (map[string][]string, error) {
+			return map[string][]string{kernelPath: {stablePath}}, nil
+		},
+		liveEnvironment: func() bool { return false },
+		bootID:          func() string { return "boot-mapper-kname" },
+	}
+
+	observed, err := collector.collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observed.Devices) != 1 {
+		t.Fatalf("devices = %#v", observed.Devices)
+	}
+	device := observed.Devices[0]
+	if device.ID != "wwid:"+wwid || device.SystemRole != elementalv1.ObservedStorageSystemRoleData {
+		t.Fatalf("multipath map did not resolve through KNAME: %#v", device)
+	}
+	if !reflect.DeepEqual(device.StablePaths, []string{stablePath}) {
+		t.Fatalf("stable paths = %#v", device.StablePaths)
+	}
+}
+
 func TestObservedStorageReportsLayeredConsumersAndSystemClosure(t *testing.T) {
 	pv := diskFixture("/dev/sdb")
 	pv["wwn"] = "0x5000c50000000009"
