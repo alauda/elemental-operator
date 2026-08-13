@@ -154,6 +154,61 @@ func TestObservedStorageReportsObjectiveTopology(t *testing.T) {
 	}
 }
 
+func TestObservedStorageHidesRawMultipathPartitionAliases(t *testing.T) {
+	const (
+		member       = "/dev/sda"
+		rawPartition = "/dev/sda1"
+		mapPath      = "/dev/mapper/3600508b400105e210000900000490000"
+		mapPartition = "/dev/mapper/3600508b400105e210000900000490000-part1"
+		partUUID     = "153c602f-2f96-4797-8785-fcb1572c19d4"
+	)
+
+	rawPart := partitionFixture(rawPartition, partUUID, "btrfs", "shared-filesystem", nil)
+	mapPart := partitionFixture(mapPartition, partUUID, "btrfs", "shared-filesystem", nil)
+	mapDevice := map[string]any{
+		"name": mapPath, "path": mapPath, "type": "mpath", "size": int64(100 << 30),
+		"wwn": "3600508b400105e210000900000490000", "mountpoints": []any{nil},
+		"children": []any{mapPart},
+	}
+	memberDevice := diskFixture(member)
+	memberDevice["children"] = []any{rawPart, mapDevice}
+	lsblk, err := json.Marshal(map[string]any{"blockdevices": []any{memberDevice}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	collector := &observedStorageCollector{
+		run: func(name string, _ ...string) ([]byte, error) {
+			if name == "lsblk" {
+				return lsblk, nil
+			}
+			return []byte(`{"signatures":[]}`), nil
+		},
+		byIDPaths: func() (map[string][]string, error) {
+			return map[string][]string{
+				member:  {"/dev/disk/by-id/scsi-member"},
+				mapPath: {"/dev/disk/by-id/dm-uuid-mpath-3600508b400105e210000900000490000"},
+			}, nil
+		},
+		liveEnvironment: func() bool { return false },
+		bootID:          func() string { return "boot-multipath-alias" },
+	}
+
+	observed, err := collector.collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := observedDevicesByID(observed.Devices)
+	partition := byID["partuuid:"+partUUID]
+	if partition == nil || partition.Path != mapPartition {
+		t.Fatalf("aggregate partition not preserved: %#v", observed.Devices)
+	}
+	for _, device := range observed.Devices {
+		if device.Path == member || device.Path == rawPartition {
+			t.Fatalf("raw Multipath backing alias was exposed: %#v", device)
+		}
+	}
+}
+
 func TestObservedStorageReportsLayeredConsumersAndSystemClosure(t *testing.T) {
 	pv := diskFixture("/dev/sdb")
 	pv["wwn"] = "0x5000c50000000009"

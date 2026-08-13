@@ -123,7 +123,7 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 	}
 
 	systemPaths, systemEvidence := classifySystemClosure(records)
-	multipathMembers := multipathMemberPaths(records)
+	multipathBacking := multipathBackingPaths(records)
 	health := c.collectMultipathHealth(records, ids)
 	live := c.liveEnvironment != nil && c.liveEnvironment()
 
@@ -138,9 +138,12 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 	observed := &elementalv1.ObservedStorage{BootID: c.bootID()}
 	for _, devicePath := range paths {
 		record := records[devicePath]
-		// Physical paths underneath a Multipath map are reported as memberIDs
-		// on the aggregate map, never as independently selectable DirectDisks.
-		if strings.EqualFold(record.device.Type, "disk") && multipathMembers.Has(devicePath) {
+		// Physical paths underneath a Multipath map, including raw partitions
+		// that lsblk may expose in parallel with the aggregate map partitions,
+		// are aliases of the Multipath topology. Report them only through the
+		// aggregate map/member view so shared filesystem and PARTUUID identities
+		// cannot appear twice in one objective report.
+		if multipathBacking.Has(devicePath) {
 			continue
 		}
 
@@ -864,18 +867,59 @@ func systemSeedEvidence(device lsblkDevice) string {
 	return ""
 }
 
-func multipathMemberPaths(records map[string]*blockRecord) stringSet {
-	members := stringSet{}
+func multipathBackingPaths(records map[string]*blockRecord) stringSet {
+	aggregate := stringSet{}
+	queue := []string{}
 	for path, record := range records {
+		if strings.EqualFold(record.device.Type, "mpath") {
+			aggregate.Add(path)
+			queue = append(queue, path)
+		}
+	}
+	for len(queue) > 0 {
+		path := queue[0]
+		queue = queue[1:]
+		record := records[path]
+		if record == nil {
+			continue
+		}
+		for child := range record.children {
+			if !aggregate.Has(child) {
+				aggregate.Add(child)
+				queue = append(queue, child)
+			}
+		}
+	}
+
+	backing := stringSet{}
+	queue = queue[:0]
+	for _, record := range records {
 		if !strings.EqualFold(record.device.Type, "mpath") {
 			continue
 		}
 		for parent := range record.parents {
-			members.Add(parent)
+			if !aggregate.Has(parent) && !backing.Has(parent) {
+				backing.Add(parent)
+				queue = append(queue, parent)
+			}
 		}
-		_ = path
 	}
-	return members
+	for len(queue) > 0 {
+		path := queue[0]
+		queue = queue[1:]
+		record := records[path]
+		if record == nil {
+			continue
+		}
+		for child := range record.children {
+			if aggregate.Has(child) || backing.Has(child) {
+				continue
+			}
+			backing.Add(child)
+			queue = append(queue, child)
+		}
+	}
+	return backing
 }
 
 func observedMultipathMembers(path string, records map[string]*blockRecord, byIDPaths map[string][]string) []string {
