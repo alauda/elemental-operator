@@ -566,14 +566,18 @@ func canonicalDeviceID(device lsblkDevice, stablePaths []string) string {
 		for _, stable := range stablePaths {
 			base := filepath.Base(stable)
 			if strings.HasPrefix(base, "dm-uuid-mpath-") {
-				return "wwid:" + canonicalHexIdentity(strings.TrimPrefix(base, "dm-uuid-mpath-"))
+				if value := canonicalHexIdentity(strings.TrimPrefix(base, "dm-uuid-mpath-")); value != "" {
+					return "wwid:" + value
+				}
 			}
 		}
 		if value := canonicalHexIdentity(device.WWN); value != "" {
 			return "wwid:" + value
 		}
 		if name := filepath.Base(device.devicePath()); strings.TrimSpace(name) != "" {
-			return "wwid:" + canonicalHexIdentity(name)
+			if value := canonicalHexIdentity(name); value != "" {
+				return "wwid:" + value
+			}
 		}
 		return ""
 	}

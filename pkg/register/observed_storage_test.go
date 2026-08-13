@@ -240,6 +240,7 @@ func TestCanonicalDeviceIdentity(t *testing.T) {
 		{name: "nvme eui", device: lsblkDevice{Type: "disk"}, paths: []string{"/dev/disk/by-id/nvme-eui.00112233"}, want: "nvme-eui:00112233"},
 		{name: "partition", device: lsblkDevice{Type: "part", PartUUID: "CB6A-04B2"}, want: "partuuid:cb6a-04b2"},
 		{name: "multipath", device: lsblkDevice{Type: "mpath"}, paths: []string{"/dev/disk/by-id/dm-uuid-mpath-3600508b400"}, want: "wwid:3600508b400"},
+		{name: "multipath non-hex WWID fails closed", device: lsblkDevice{Type: "mpath", Path: "/dev/mapper/mpatha"}, paths: []string{"/dev/disk/by-id/dm-uuid-mpath-0QEMU_DATA1"}, want: ""},
 		{name: "local serial fallback", device: lsblkDevice{Type: "disk", Transport: "virtio", Model: "Data Disk", Serial: "SER 1"}, want: "serial:data_disk:ser_1"},
 		{name: "shared serial rejected", device: lsblkDevice{Type: "disk", Transport: "iscsi", Model: "LUN", Serial: "SER1"}, want: ""},
 	}
