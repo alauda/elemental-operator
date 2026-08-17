@@ -38,6 +38,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
@@ -335,6 +336,83 @@ func TestMergeInventoryAnnotations(t *testing.T) {
 			assert.Equal(t, ok, true, "annotations: %v\nexpected: %v ", inventory.Annotations, test.expected)
 			assert.Equal(t, v, val, "annotations: %v\nexpected: %v ", inventory.Annotations, test.expected)
 		}
+	}
+}
+
+func TestUpdateInventoryObservedStorage(t *testing.T) {
+	scheme := runtime.NewScheme()
+	assert.NilError(t, elementalv1.AddToScheme(scheme))
+	inventory := &elementalv1.MachineInventory{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "storage-observer-test",
+			Namespace:         "default",
+			UID:               "inventory-uid",
+			ResourceVersion:   "1",
+			CreationTimestamp: metav1.Now(),
+		},
+	}
+	server := &InventoryServer{
+		Context: context.Background(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&elementalv1.MachineInventory{}).
+			WithObjects(inventory.DeepCopy()).Build(),
+	}
+	epoch, err := server.claimStorageObserverEpoch(inventory)
+	assert.NilError(t, err)
+	assert.Equal(t, epoch, int64(1))
+
+	data := []byte(`{
+		"bootID": "boot-1",
+		"reportEpoch": 1,
+		"sequence": 1,
+		"devices": [{
+			"id": "wwn:5000c50000000001",
+			"kind": "DirectDisk",
+			"path": "/dev/sdb",
+			"wwn": "0x5000c50000000001",
+			"serial": "DATA-SERIAL",
+			"model": "ExampleDataDisk",
+			"sizeBytes": 1099511627776,
+			"systemRole": "Data",
+			"filesystem": {
+				"type": "xfs",
+				"uuid": "11111111-2222-3333-4444-555555555555"
+			}
+		}]
+	}`)
+
+	observed := &elementalv1.ObservedStorage{}
+	assert.NilError(t, json.Unmarshal(data, observed))
+	if err := server.patchObservedStorageStatus(inventory, observed); err != nil {
+		t.Fatalf("patchObservedStorageStatus: %v", err)
+	}
+	current := &elementalv1.MachineInventory{}
+	assert.NilError(t, server.Get(context.Background(), client.ObjectKeyFromObject(inventory), current))
+	if current.Status.ObservedStorage == nil || len(current.Status.ObservedStorage.Devices) != 1 {
+		t.Fatalf("unexpected observed storage: %#v", current.Status.ObservedStorage)
+	}
+	device := current.Status.ObservedStorage.Devices[0]
+	assert.Equal(t, device.ID, "wwn:5000c50000000001")
+	assert.Equal(t, device.SizeBytes, int64(1099511627776))
+	assert.Equal(t, device.Filesystem.Type, "xfs")
+	assert.Assert(t, current.Status.ObservedStorage.ObservedAt != nil)
+
+	if err := server.patchObservedStorageStatus(inventory, observed.DeepCopy()); err == nil || !strings.Contains(err.Error(), "stale storage report") {
+		t.Fatalf("stale report error = %v", err)
+	}
+	epoch, err = server.claimStorageObserverEpoch(inventory)
+	assert.NilError(t, err)
+	assert.Equal(t, epoch, int64(2))
+	observed.ReportEpoch = 1
+	observed.Sequence = 2
+	if err := server.patchObservedStorageStatus(inventory, observed); err == nil || !strings.Contains(err.Error(), "stale storage report") {
+		t.Fatalf("old epoch error = %v", err)
+	}
+	observed.ReportEpoch = 2
+	observed.Sequence = 1
+	observed.BootID = ""
+	if err := server.patchObservedStorageStatus(inventory, observed); err == nil || !strings.Contains(err.Error(), "boot ID is required") {
+		t.Fatalf("invalid report error = %v", err)
 	}
 }
 

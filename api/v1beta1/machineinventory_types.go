@@ -61,6 +61,10 @@ type MachineInventorySpec struct {
 	// before install-time network reconfiguration.
 	// +optional
 	ObservedNetwork *ObservedNetwork `json:"observedNetwork,omitempty"`
+	// Storage is the explicit desired state for Inventory-owned data volumes.
+	// Devices omitted from this list remain unmanaged.
+	// +optional
+	Storage *MachineInventoryStorageSpec `json:"storage,omitempty"`
 }
 
 // ObservedNetwork captures a snapshot of the host's actual network state as
@@ -121,6 +125,14 @@ type MachineInventoryStatus struct {
 	// PlanStatus reflect the status of the plan owned by the machine inventory object.
 	// +optional
 	Plan *PlanStatus `json:"plan,omitempty"`
+	// ObservedStorage is objective host state written only by the authenticated
+	// periodic observer channel.
+	// +optional
+	ObservedStorage *ObservedStorage `json:"observedStorage,omitempty"`
+	// Storage is desired-state convergence written only by the baremetal
+	// provider Inventory Storage Reconciler.
+	// +optional
+	Storage *MachineInventoryStorageStatus `json:"storage,omitempty"`
 }
 
 type PlanState string

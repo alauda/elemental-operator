@@ -554,6 +554,34 @@ var _ = Describe("handle finalizer", func() {
 		}, mInventory)).To(Succeed())
 	})
 
+	It("should not overwrite the provider storage release plan while the storage finalizer exists", func() {
+		managed := &elementalv1.MachineInventory{ObjectMeta: metav1.ObjectMeta{
+			Name: "machine-inventory-suite-storage-finalizer", Namespace: "default",
+			Annotations: map[string]string{elementalv1.MachineInventoryResettableAnnotation: "true"},
+			Finalizers:  []string{elementalv1.MachineInventoryFinalizer, elementalv1.MachineInventoryStorageFinalizer},
+		}}
+		managedPlan := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: managed.Name, Namespace: managed.Namespace}}
+		DeferCleanup(func() { Expect(test.CleanupAndWait(ctx, cl, managed, managedPlan)).To(Succeed()) })
+		Expect(cl.Create(ctx, managed)).To(Succeed())
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(managed)})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(cl.Get(ctx, client.ObjectKeyFromObject(managedPlan), managedPlan)).To(Succeed())
+		managedPlan.Annotations = map[string]string{elementalv1.PlanTypeAnnotation: "storage-release"}
+		managedPlan.Data["plan"] = []byte(`{"instructions":[{"name":"storage-release"}]}`)
+		before := append([]byte(nil), managedPlan.Data["plan"]...)
+		Expect(cl.Update(ctx, managedPlan)).To(Succeed())
+		Expect(cl.Delete(ctx, managed)).To(Succeed())
+
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(managed)})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(cl.Get(ctx, client.ObjectKeyFromObject(managedPlan), managedPlan)).To(Succeed())
+		Expect(managedPlan.Annotations[elementalv1.PlanTypeAnnotation]).To(Equal("storage-release"))
+		Expect(managedPlan.Data["plan"]).To(Equal(before))
+		Expect(cl.Get(ctx, client.ObjectKeyFromObject(managed), managed)).To(Succeed())
+		Expect(controllerutil.ContainsFinalizer(managed, elementalv1.MachineInventoryFinalizer)).To(BeTrue())
+		Expect(controllerutil.ContainsFinalizer(managed, elementalv1.MachineInventoryStorageFinalizer)).To(BeTrue())
+	})
+
 	It("should remove finalizer on reset plan applied", func() {
 		// 6. Mark the reset plan as applied
 		Expect(cl.Get(ctx, client.ObjectKey{

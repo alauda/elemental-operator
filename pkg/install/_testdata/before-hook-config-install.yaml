@@ -117,6 +117,46 @@ stages:
               ownerstring: ""
           name: Elemental System Agent Config
         - files:
+            - path: /run/elemental/oem/elemental-storage-observer.yaml
+              permissions: 384
+              owner: 0
+              group: 0
+              content: |
+                name: Elemental Storage Observer
+                stages:
+                    boot:
+                        - commands:
+                            - systemctl daemon-reload
+                            - systemctl enable --now elemental-storage-observer.service
+                          files:
+                            - path: /etc/systemd/system/elemental-storage-observer.service
+                              permissions: 420
+                              owner: 0
+                              group: 0
+                              content: |
+                                [Unit]
+                                Description=Elemental objective storage observer
+                                After=network-online.target
+                                Wants=network-online.target
+
+                                [Service]
+                                Type=simple
+                                ExecStart=/usr/sbin/elemental-register --observe-storage --observe-interval=60s --config-path=/oem/registration/config.yaml --state-path=/oem/registration/state.yaml
+                                Restart=always
+                                RestartSec=15s
+
+                                # The observer is informational and must not stall shutdown or recovery reset.
+                                TimeoutStopSec=10s
+
+                                [Install]
+                                WantedBy=multi-user.target
+                              encoding: ""
+                              ownerstring: ""
+                          name: Install and start objective storage observer
+              encoding: ""
+              ownerstring: ""
+          name: Elemental Storage Observer Config
+        - files:
             - path: /run/elemental/oem/elemental-network.yaml
               permissions: 384
               owner: 0

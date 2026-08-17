@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -31,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
@@ -298,6 +300,18 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 				return fmt.Errorf("failed to parse observed network config: %w", err)
 			}
 			inventory.Spec.ObservedNetwork = observed
+		case register.MsgObserveStorage:
+			if isNewInventory(inventory) || inventory.UID == "" {
+				return errors.New("storage observer requires an existing MachineInventory UID")
+			}
+			epoch, err := i.claimStorageObserverEpoch(inventory)
+			if err != nil {
+				return err
+			}
+			if err := register.WriteMessage(conn, register.MsgObserveStorage, []byte(strconv.FormatInt(epoch, 10))); err != nil {
+				return fmt.Errorf("send storage observer epoch: %w", err)
+			}
+			return i.serveStorageObserver(conn, inventory, epoch)
 		default:
 			return fmt.Errorf("got unexpected message: %s", msgType)
 		}
@@ -305,6 +319,135 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 			return fmt.Errorf("cannot complete %s exchange", msgType)
 		}
 	}
+}
+
+func (i *InventoryServer) serveStorageObserver(conn *websocket.Conn, inventory *elementalv1.MachineInventory, epoch int64) error {
+	lastSequence := int64(0)
+	for {
+		msgType, data, err := register.ReadMessage(conn)
+		if err != nil {
+			return fmt.Errorf("storage observer connection interrupted: %w", err)
+		}
+		if msgType != register.MsgObservedStorageConfig {
+			return fmt.Errorf("storage observer got unexpected message %s", msgType)
+		}
+		observed := &elementalv1.ObservedStorage{}
+		if err := json.Unmarshal(data, observed); err != nil {
+			return fmt.Errorf("parse observed storage report: %w", err)
+		}
+		if observed.ReportEpoch != epoch {
+			return fmt.Errorf("storage report epoch %d does not match session epoch %d", observed.ReportEpoch, epoch)
+		}
+		if observed.Sequence <= lastSequence {
+			return fmt.Errorf("storage report sequence %d is not greater than %d", observed.Sequence, lastSequence)
+		}
+		if err := i.patchObservedStorageStatus(inventory, observed); err != nil {
+			return err
+		}
+		lastSequence = observed.Sequence
+		if err := register.WriteMessage(conn, register.MsgReady, nil); err != nil {
+			return fmt.Errorf("acknowledge observed storage report: %w", err)
+		}
+	}
+}
+
+// claimStorageObserverEpoch atomically advances the server-owned observer
+// epoch. Persisting the empty sequence-zero claim prevents two concurrently
+// authenticated sessions from receiving the same epoch and makes every report
+// from an older connection stale as soon as a replacement session starts.
+func (i *InventoryServer) claimStorageObserverEpoch(inventory *elementalv1.MachineInventory) (int64, error) {
+	if inventory == nil || inventory.UID == "" {
+		return 0, errors.New("cannot claim storage observer epoch without MachineInventory UID")
+	}
+	var claimed int64
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &elementalv1.MachineInventory{}
+		if err := i.Get(i, client.ObjectKeyFromObject(inventory), current); err != nil {
+			return err
+		}
+		if current.UID != inventory.UID {
+			return fmt.Errorf("MachineInventory UID changed from %q to %q", inventory.UID, current.UID)
+		}
+		claimed = 1
+		if current.Status.ObservedStorage != nil {
+			if current.Status.ObservedStorage.ReportEpoch == int64(^uint64(0)>>1) {
+				return errors.New("storage observer epoch exhausted")
+			}
+			claimed = current.Status.ObservedStorage.ReportEpoch + 1
+		}
+		base := current.DeepCopy()
+		current.Status.ObservedStorage = &elementalv1.ObservedStorage{ReportEpoch: claimed}
+		return i.Status().Patch(i, current, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	})
+	if err != nil {
+		return 0, fmt.Errorf("claim storage observer epoch: %w", err)
+	}
+	inventory.Status.ObservedStorage = &elementalv1.ObservedStorage{ReportEpoch: claimed}
+	return claimed, nil
+}
+
+func (i *InventoryServer) patchObservedStorageStatus(inventory *elementalv1.MachineInventory, observed *elementalv1.ObservedStorage) error {
+	if inventory == nil || inventory.UID == "" {
+		return errors.New("cannot update observed storage without MachineInventory UID")
+	}
+	if err := validateObservedStorageReport(observed); err != nil {
+		return err
+	}
+	accepted := observed.DeepCopy()
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &elementalv1.MachineInventory{}
+		if err := i.Get(i, client.ObjectKeyFromObject(inventory), current); err != nil {
+			return err
+		}
+		if current.UID != inventory.UID {
+			return fmt.Errorf("MachineInventory UID changed from %q to %q", inventory.UID, current.UID)
+		}
+		if current.Status.ObservedStorage != nil {
+			previous := current.Status.ObservedStorage
+			if accepted.ReportEpoch < previous.ReportEpoch ||
+				(accepted.ReportEpoch == previous.ReportEpoch && accepted.Sequence <= previous.Sequence) {
+				return fmt.Errorf("stale storage report epoch/sequence %d/%d, current is %d/%d",
+					accepted.ReportEpoch, accepted.Sequence, previous.ReportEpoch, previous.Sequence)
+			}
+		}
+		now := metav1.Now()
+		accepted.ObservedAt = &now
+		base := current.DeepCopy()
+		current.Status.ObservedStorage = accepted
+		return i.Status().Patch(i, current, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	})
+	if err != nil {
+		return fmt.Errorf("patch MachineInventory observed storage status: %w", err)
+	}
+	inventory.Status.ObservedStorage = accepted.DeepCopy()
+	return nil
+}
+
+func validateObservedStorageReport(observed *elementalv1.ObservedStorage) error {
+	if observed == nil {
+		return errors.New("observed storage report is nil")
+	}
+	if observed.ReportEpoch <= 0 || observed.Sequence <= 0 {
+		return fmt.Errorf("storage report epoch and sequence must be positive, got %d/%d", observed.ReportEpoch, observed.Sequence)
+	}
+	if observed.BootID == "" {
+		return errors.New("storage report boot ID is required")
+	}
+	if len(observed.Devices) > elementalv1.MaxObservedStorageDevices {
+		return fmt.Errorf("storage report has %d devices, maximum is %d", len(observed.Devices), elementalv1.MaxObservedStorageDevices)
+	}
+	seen := make(map[string]struct{}, len(observed.Devices))
+	for index := range observed.Devices {
+		id := observed.Devices[index].ID
+		if id == "" {
+			return fmt.Errorf("storage report device %d has no ID", index)
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return fmt.Errorf("storage report contains duplicate device ID %q", id)
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
 }
 
 func (i *InventoryServer) handleUpdate(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory) error {

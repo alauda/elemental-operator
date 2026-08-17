@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -149,6 +150,76 @@ func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *St
 	return data, err
 }
 
+// ObserveStorage establishes an authenticated observer-only session. It never
+// requests MachineRegistration config and cannot mutate MachineInventory spec.
+// The operator allocates a report epoch and accepts strictly increasing
+// sequences until the connection closes.
+func ObserveStorage(reg elementalv1.Registration, caCert []byte, state *State, interval time.Duration) error {
+	if state == nil || !state.IsUpdatable() {
+		return errors.New("storage observer requires an existing registration state")
+	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	auth, err := getAuthenticator(reg, state)
+	if err != nil {
+		return fmt.Errorf("initializing authenticator: %w", err)
+	}
+	conn, err := initWebsocketConn(reg.URL, caCert, auth)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := authenticate(conn, auth); err != nil {
+		return fmt.Errorf("%s authentication failed: %w", auth.GetName(), err)
+	}
+	protoVersion, err := negotiateProtoVersion(conn)
+	if err != nil {
+		return fmt.Errorf("negotiate observer protocol: %w", err)
+	}
+	if protoVersion < MsgObserveStorage {
+		return errors.New("elemental-operator does not support periodic storage observation")
+	}
+	refreshObserverDeadline(conn, interval)
+	if err := WriteMessage(conn, MsgObserveStorage, nil); err != nil {
+		return fmt.Errorf("start storage observer session: %w", err)
+	}
+	msgType, epochData, err := ReadMessage(conn)
+	if err != nil {
+		return fmt.Errorf("read storage observer epoch: %w", err)
+	}
+	if msgType != MsgObserveStorage {
+		return fmt.Errorf("unexpected storage observer epoch message %s", msgType)
+	}
+	epoch, err := strconv.ParseInt(strings.TrimSpace(string(epochData)), 10, 64)
+	if err != nil || epoch <= 0 {
+		return fmt.Errorf("invalid storage observer epoch %q", string(epochData))
+	}
+
+	sequence := int64(0)
+	for {
+		sequence++
+		report, err := newObservedStorageCollector().collect()
+		if err != nil {
+			return fmt.Errorf("collect observed storage: %w", err)
+		}
+		report.ReportEpoch = epoch
+		report.Sequence = sequence
+		refreshObserverDeadline(conn, interval)
+		if err := SendJSONData(conn, MsgObservedStorageConfig, report); err != nil {
+			return fmt.Errorf("send observed storage sequence %d: %w", sequence, err)
+		}
+		timer := time.NewTimer(interval)
+		<-timer.C
+	}
+}
+
+func refreshObserverDeadline(conn *websocket.Conn, interval time.Duration) {
+	deadline := time.Now().Add(interval + 30*time.Second)
+	_ = conn.SetWriteDeadline(deadline)
+	_ = conn.SetReadDeadline(deadline)
+}
+
 func getAuthenticator(reg elementalv1.Registration, state *State) (authClient, error) {
 	var auth authClient
 	switch reg.Auth {
@@ -212,10 +283,15 @@ func initWebsocketConn(url string, caCert []byte, auth authClient) (*websocket.C
 		return nil, err
 	}
 	log.Infof("Local Address: %s", conn.LocalAddr().String())
-	_ = conn.SetWriteDeadline(time.Now().Add(RegistrationDeadlineSeconds * time.Second))
-	_ = conn.SetReadDeadline(time.Now().Add(RegistrationDeadlineSeconds * time.Second))
+	refreshRegistrationDeadline(conn)
 
 	return conn, nil
+}
+
+func refreshRegistrationDeadline(conn *websocket.Conn) {
+	deadline := time.Now().Add(RegistrationDeadlineSeconds * time.Second)
+	_ = conn.SetWriteDeadline(deadline)
+	_ = conn.SetReadDeadline(deadline)
 }
 
 func authenticate(conn *websocket.Conn, auth authClient) error {
