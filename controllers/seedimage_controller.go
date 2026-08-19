@@ -587,6 +587,7 @@ func fillBuildImagePod(seedImg *elementalv1.SeedImage, buildImg string, pullPoli
 		},
 		Spec: corev1.PodSpec{
 			ImagePullSecrets: imagePullSecrets(pullSecrets),
+			Tolerations:      defaultSeedImageTolerations(),
 			InitContainers:   initContainers,
 			Containers: []corev1.Container{
 				{
@@ -647,6 +648,26 @@ func fillBuildImagePod(seedImg *elementalv1.SeedImage, buildImg string, pullPoli
 		},
 	}
 	return pod
+}
+
+func defaultSeedImageTolerations() []corev1.Toleration {
+	return []corev1.Toleration{
+		{
+			Key:      "node-role.kubernetes.io/master",
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoSchedule,
+		},
+		{
+			Key:      "node-role.kubernetes.io/control-plane",
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoSchedule,
+		},
+		{
+			Key:      "node-role.kubernetes.io/cpaas-system",
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoSchedule,
+		},
+	}
 }
 
 func imagePullSecrets(names []string) []corev1.LocalObjectReference {

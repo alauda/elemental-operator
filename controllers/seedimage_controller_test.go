@@ -846,4 +846,28 @@ var _ = Describe("fillBuildImagePod", func() {
 			{Name: "mirror-secret"},
 		}))
 	})
+
+	It("should tolerate control-plane taints", func() {
+		seedImg := &elementalv1.SeedImage{}
+
+		pod := fillBuildImagePod(seedImg, "default-builder:latest", corev1.PullNever, nil, false)
+
+		Expect(pod.Spec.Tolerations).To(Equal([]corev1.Toleration{
+			{
+				Key:      "node-role.kubernetes.io/master",
+				Operator: corev1.TolerationOpExists,
+				Effect:   corev1.TaintEffectNoSchedule,
+			},
+			{
+				Key:      "node-role.kubernetes.io/control-plane",
+				Operator: corev1.TolerationOpExists,
+				Effect:   corev1.TaintEffectNoSchedule,
+			},
+			{
+				Key:      "node-role.kubernetes.io/cpaas-system",
+				Operator: corev1.TolerationOpExists,
+				Effect:   corev1.TaintEffectNoSchedule,
+			},
+		}))
+	})
 })
