@@ -66,6 +66,7 @@ type observedStorageCollector struct {
 	byIDPaths       func() (map[string][]string, error)
 	mountOptions    func() (map[string][]string, error)
 	partitionStart  func(lsblkDevice) int64
+	busProbe        func(lsblkDevice) busProbe
 	liveEnvironment func() bool
 	bootID          func() string
 }
@@ -75,6 +76,7 @@ func newObservedStorageCollector() *observedStorageCollector {
 		run:             runStorageCommand,
 		byIDPaths:       collectByIDPaths,
 		partitionStart:  partitionStartBytesFromSysfs,
+		busProbe:        probeBusFromSysfs,
 		liveEnvironment: isLiveEnvironment,
 		bootID:          currentBootID,
 	}
@@ -118,8 +120,15 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 
 	records := flattenBlockTopology(topology.BlockDevices)
 	ids := make(map[string]string, len(records))
+	buses := make(map[string]string, len(records))
+	probes := make(map[string]busProbe, len(records))
 	for path, record := range records {
-		ids[path] = canonicalDeviceID(record.device, stablePathsForDevice(record.device, byIDPaths))
+		stable := stablePathsForDevice(record.device, byIDPaths)
+		if c.busProbe != nil {
+			probes[path] = c.busProbe(record.device)
+		}
+		buses[path] = localBus(record.device, stable, probes[path])
+		ids[path] = canonicalDeviceID(record.device, stable, buses[path])
 	}
 
 	systemPaths, systemEvidence := classifySystemClosure(records)
@@ -134,6 +143,25 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 		}
 	}
 	sort.Strings(paths)
+
+	// An identity two reported devices share identifies neither. Provider
+	// admission indexes observed devices by ID, so a collision would silently
+	// resolve to whichever record sorted last. Count only what this report
+	// actually carries: multipath backing paths are aliases of the aggregate map
+	// and legitimately repeat its PARTUUIDs, but they are dropped below.
+	idCounts := map[string]int{}
+	for _, devicePath := range paths {
+		if id := ids[devicePath]; id != "" && !multipathBacking.Has(devicePath) {
+			idCounts[id]++
+		}
+	}
+	collided := stringSet{}
+	for _, devicePath := range paths {
+		if id := ids[devicePath]; id != "" && idCounts[id] > 1 {
+			ids[devicePath] = ""
+			collided.Add(devicePath)
+		}
+	}
 
 	observed := &elementalv1.ObservedStorage{BootID: c.bootID()}
 	for _, devicePath := range paths {
@@ -164,7 +192,11 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 				evidence = append(evidence, "live environment cannot prove the installation target")
 			}
 			if strings.HasPrefix(deviceID, "unidentified:") {
-				evidence = append(evidence, "no supported stable device identity")
+				reason := unidentifiedReason(record.device, buses[devicePath], probes[devicePath])
+				if collided.Has(devicePath) {
+					reason = "identity is shared with another device on this host"
+				}
+				evidence = append(evidence, "no supported stable device identity: "+reason)
 			}
 			if record.topologyAmbiguous {
 				evidence = append(evidence, "block topology is ambiguous")
@@ -567,7 +599,10 @@ func observedDeviceKind(deviceType string) elementalv1.ObservedStorageDeviceKind
 	}
 }
 
-func canonicalDeviceID(device lsblkDevice, stablePaths []string) string {
+// canonicalDeviceID derives the management identity for one logical block
+// device. bus is the proven-local bus name from localBus, or "" when nothing
+// proves the bus is local; it gates the serial tier only.
+func canonicalDeviceID(device lsblkDevice, stablePaths []string, bus string) string {
 	if strings.EqualFold(device.Type, "part") {
 		if value := canonicalPartUUID(device.PartUUID); value != "" {
 			return "partuuid:" + value
@@ -594,26 +629,67 @@ func canonicalDeviceID(device lsblkDevice, stablePaths []string) string {
 		return ""
 	}
 
+	virtioSerial := ""
 	for _, stable := range stablePaths {
 		base := filepath.Base(stable)
+		// A malformed alias must fall through to the next candidate instead of
+		// returning a prefix with an empty payload. "wwn:" is not "unidentified",
+		// so it would be reported as a provably Data device. udev builds
+		// wwn-0x<WWID minus its first character>, so any WWID lacking a
+		// designator-type digit produces exactly such an alias.
 		switch {
 		case strings.HasPrefix(base, "wwn-"):
-			return "wwn:" + canonicalHexIdentity(strings.TrimPrefix(base, "wwn-"))
+			if value := canonicalHexIdentity(strings.TrimPrefix(base, "wwn-")); value != "" {
+				return "wwn:" + value
+			}
 		case strings.HasPrefix(base, "nvme-eui."):
-			return "nvme-eui:" + canonicalHexIdentity(strings.TrimPrefix(base, "nvme-eui."))
+			if value := canonicalHexIdentity(strings.TrimPrefix(base, "nvme-eui.")); value != "" {
+				return "nvme-eui:" + value
+			}
 		case strings.HasPrefix(base, "nvme-eui-"):
-			return "nvme-eui:" + canonicalHexIdentity(strings.TrimPrefix(base, "nvme-eui-"))
+			if value := canonicalHexIdentity(strings.TrimPrefix(base, "nvme-eui-")); value != "" {
+				return "nvme-eui:" + value
+			}
 		case strings.HasPrefix(base, "nvme-uuid."):
-			return "nvme-nguid:" + canonicalHexIdentity(strings.TrimPrefix(base, "nvme-uuid."))
+			if value := canonicalHexIdentity(strings.TrimPrefix(base, "nvme-uuid.")); value != "" {
+				return "nvme-nguid:" + value
+			}
 		case strings.HasPrefix(base, "nvme-uuid-"):
-			return "nvme-nguid:" + canonicalHexIdentity(strings.TrimPrefix(base, "nvme-uuid-"))
+			if value := canonicalHexIdentity(strings.TrimPrefix(base, "nvme-uuid-")); value != "" {
+				return "nvme-nguid:" + value
+			}
+		case strings.HasPrefix(base, "virtio-"):
+			// Recorded, not returned: a wwn-/nvme- alias further along the
+			// slice still outranks a virtio serial alias.
+			if virtioSerial == "" {
+				virtioSerial = canonicalSerialPart(strings.TrimPrefix(base, "virtio-"))
+			}
 		}
 	}
 	if value := canonicalHexIdentity(device.WWN); value != "" {
 		return "wwn:" + value
 	}
-	if localTransport(device.Transport) && strings.TrimSpace(device.Serial) != "" && strings.TrimSpace(device.Model) != "" {
-		return "serial:" + canonicalSerialPart(device.Model) + ":" + canonicalSerialPart(device.Serial)
+	// virtio-blk reports neither an lsblk TRAN nor a model. The
+	// by-id/virtio-<serial> alias udev builds from the kernel-exposed virtio
+	// serial is the same class of stable alias as wwn-/nvme-eui-, so consume it
+	// directly; the sysfs bus probe would reach the same identity through the
+	// serial fallback below, but the alias is the more direct fact. A virtio
+	// disk with no serial gets no alias and therefore still gets no identity.
+	if virtioSerial != "" {
+		return "serial:virtio:" + virtioSerial
+	}
+	if bus != "" && strings.TrimSpace(device.Serial) != "" {
+		// A disk without a usable model, which virtio-blk never has, is scoped
+		// by the bus name instead so the identity keeps the two-segment shape
+		// provider admission validates.
+		model := canonicalSerialPart(device.Model)
+		if model == "" {
+			model = canonicalSerialPart(bus)
+		}
+		serial := canonicalSerialPart(device.Serial)
+		if model != "" && serial != "" {
+			return "serial:" + model + ":" + serial
+		}
 	}
 	return ""
 }
@@ -663,13 +739,163 @@ func canonicalSerialPart(value string) string {
 	return strings.Trim(b.String(), "_")
 }
 
+// localTransport reports whether lsblk classified the device onto a bus that
+// cannot be a shared fabric. It is one of the facts localBus accepts; see there
+// for why it cannot be the only one.
+//
+// spi is SCSI Parallel Interface, a short local cable, not a fabric. QEMU puts
+// disks behind an emulated SPI controller.
 func localTransport(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "ata", "sata", "nvme", "virtio", "mmc":
+	case "ata", "sata", "spi", "nvme", "virtio", "mmc":
 		return true
 	default:
 		return false
 	}
+}
+
+// busProbe carries the sysfs facts that decide whether a disk's bus is local.
+// lsblk's TRAN column is a convenience heuristic derived from the same sysfs
+// tree: it is empty for every paravirtualised SCSI controller (virtio-scsi,
+// vmw_pvscsi, storvsc) and, on the util-linux shipped in the OS image, for
+// virtio-blk as well. The collector therefore reads the tree directly.
+type busProbe struct {
+	// bus names a bus device found among the block device's sysfs ancestors:
+	// "virtio" for virtio-blk and virtio-scsi, "ata" for a libata port.
+	bus string
+	// driver is the SCSI host driver (scsi_host/hostN/proc_name) when the
+	// device sits under a SCSI host, whether or not that driver is local.
+	driver string
+}
+
+// localSCSIDriver lists SCSI host drivers that only ever drive a controller
+// inside this machine: paravirtualised controllers, libata and parallel SCSI.
+// SAS, FC and iSCSI HBAs are deliberately absent. Devices behind them may be
+// attached to other hosts too, and they publish a WWN, which is the identity
+// tier that does not depend on this question.
+func localSCSIDriver(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "virtio_scsi", "vmw_pvscsi", "storvsc_host_t", "ahci", "ata_piix", "sym53c8xx", "mptspi":
+		return true
+	default:
+		return false
+	}
+}
+
+func probeBusFromSysfs(device lsblkDevice) busProbe {
+	return probeBusFromSysfsRoot(device, "/sys/class/block")
+}
+
+// probeBusFromSysfsRoot resolves <sysfsRoot>/<kname>/device, which points at
+// the SCSI logical unit (…/virtio4/host2/target2:0:0/2:0:0:0) or, for
+// virtio-blk, at the virtio device itself (…/0000:00:0c.0/virtio3), and reads
+// the bus evidence off that path. Anything missing simply yields no evidence.
+func probeBusFromSysfsRoot(device lsblkDevice, sysfsRoot string) busProbe {
+	kernelName := sysfsKernelName(device)
+	if kernelName == "" {
+		return busProbe{}
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Join(sysfsRoot, kernelName, "device"))
+	if err != nil {
+		return busProbe{}
+	}
+	probe := busProbe{}
+	components := strings.Split(filepath.ToSlash(resolved), "/")
+	hostIndex := -1
+	for i, component := range components {
+		switch {
+		case hasNumericSuffix(component, "virtio"):
+			probe.bus = "virtio"
+		case hasNumericSuffix(component, "ata"):
+			probe.bus = "ata"
+		case hasNumericSuffix(component, "host"):
+			hostIndex = i
+		}
+	}
+	if hostIndex >= 0 {
+		hostDir := strings.Join(components[:hostIndex+1], "/")
+		if data, err := os.ReadFile(filepath.Join(hostDir, "scsi_host", components[hostIndex], "proc_name")); err == nil {
+			probe.driver = strings.TrimSpace(string(data))
+		}
+	}
+	return probe
+}
+
+func hasNumericSuffix(value, prefix string) bool {
+	rest, found := strings.CutPrefix(value, prefix)
+	if !found || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// localBus returns the name of the bus a disk is proven to hang off, or "" when
+// nothing proves the bus is local. The serial identity tier is only admissible
+// with such proof: a serial identifies a device, but cannot show the device is
+// not also attached to another host, which on FC, iSCSI or shared SAS it may
+// be. Fabric devices publish a WWN under the SCSI standard, so a device that
+// reaches this question without one is either local or broken, and only
+// proven-local is accepted. Absent evidence is not evidence of absence.
+//
+// Accepted proof, any one of: lsblk's TRAN, a virtio or libata ancestor in
+// sysfs, a local SCSI host driver, or a by-id alias udev only builds for a
+// local bus (ata-, mmc-; virtio- is consumed as an identity of its own).
+func localBus(device lsblkDevice, stablePaths []string, probe busProbe) string {
+	if transport := strings.ToLower(strings.TrimSpace(device.Transport)); localTransport(transport) {
+		return transport
+	}
+	switch probe.bus {
+	case "virtio", "ata":
+		return probe.bus
+	}
+	if localSCSIDriver(probe.driver) {
+		return strings.ToLower(strings.TrimSpace(probe.driver))
+	}
+	for _, stable := range stablePaths {
+		switch base := filepath.Base(stable); {
+		case strings.HasPrefix(base, "ata-"):
+			return "ata"
+		case strings.HasPrefix(base, "mmc-"):
+			return "mmc"
+		}
+	}
+	return ""
+}
+
+// unidentifiedReason names the fact that is missing for a device that produced
+// no canonical identity, so the evidence tells an operator what to change
+// rather than only that something is wrong.
+func unidentifiedReason(device lsblkDevice, bus string, probe busProbe) string {
+	switch {
+	case strings.EqualFold(device.Type, "part"):
+		return "partition has no PARTUUID"
+	case strings.EqualFold(device.Type, "mpath"):
+		return "multipath WWID is not hexadecimal; the map carries no NAA or EUI designator"
+	case strings.TrimSpace(device.Serial) == "":
+		return "no WWN or EUI and no serial; assign the disk a WWN or a unique serial"
+	case bus == "":
+		return fmt.Sprintf("no WWN or EUI and bus not proven local (transport=%q, driver=%q); set a WWN on the disk or attach it through virtio, SATA or NVMe",
+			strings.TrimSpace(device.Transport), probe.driver)
+	default:
+		return "no WWN or EUI and neither model nor bus name usable for a serial identity"
+	}
+}
+
+// sysfsKernelName returns the bare kernel name (sda, vdb, dm-0) for looking the
+// device up under /sys/class/block, or "" when KName is missing or would
+// escape that directory.
+func sysfsKernelName(device lsblkDevice) string {
+	kernelPath := strings.TrimSpace(device.KName)
+	kernelName := strings.TrimPrefix(kernelPath, "/dev/")
+	if kernelName == kernelPath || kernelName == "" || kernelName == "." || strings.ContainsAny(kernelName, `/\\`) {
+		return ""
+	}
+	return kernelName
 }
 
 func canonicalParentID(record *blockRecord, records map[string]*blockRecord, ids map[string]string) string {
@@ -704,9 +930,8 @@ func partitionStartBytesFromSysfsRoot(device lsblkDevice, sysfsRoot string) int6
 	if !strings.EqualFold(strings.TrimSpace(device.Type), "part") {
 		return 0
 	}
-	kernelPath := strings.TrimSpace(device.KName)
-	kernelName := strings.TrimPrefix(kernelPath, "/dev/")
-	if kernelName == kernelPath || kernelName == "" || kernelName == "." || strings.ContainsAny(kernelName, `/\\`) {
+	kernelName := sysfsKernelName(device)
+	if kernelName == "" {
 		return 0
 	}
 	data, err := os.ReadFile(filepath.Join(sysfsRoot, kernelName, "start"))
