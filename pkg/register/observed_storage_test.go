@@ -901,3 +901,157 @@ func TestProbeBusFromSysfsRoot(t *testing.T) {
 		})
 	}
 }
+
+// TestObservedStorageMeasuredQEMUBusEvidence replays facts measured on a real
+// QEMU/KVM guest booted from this image, one data disk per bus class, none of
+// them publishing a WWN. Every string below — lsblk transport, by-id alias,
+// sysfs device path, SCSI host driver — is copied from that guest rather than
+// assumed, so the bus evidence is exercised against shapes the kernel really
+// produces.
+//
+// The guest also confirmed the premise: multipathd was active and created no
+// map at all for these four single-path SCSI disks. Under find_multipaths no
+// every one of them would have become mpatha..mpathd with a WWID the observer
+// cannot use.
+func TestObservedStorageMeasuredQEMUBusEvidence(t *testing.T) {
+	sysfsRoot := t.TempDir()
+	mkdir := func(rel string) string {
+		dir := filepath.Join(sysfsRoot, rel)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	linkDevice := func(kname, deviceRel string) {
+		if err := os.Symlink(mkdir(deviceRel), filepath.Join(mkdir(kname), "device")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scsiHost := func(hostRel, procName string) {
+		dir := mkdir(filepath.Join(hostRel, "scsi_host", filepath.Base(hostRel)))
+		if err := os.WriteFile(filepath.Join(dir, "proc_name"), []byte(procName+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Measured: readlink -f /sys/block/<name>/device, and
+	// grep . /sys/class/scsi_host/host*/proc_name
+	const (
+		megasasHost  = "devices/pci0000:00/0000:00:02.0/0000:01:00.0/0000:02:02.0/host0"
+		virtioSCSIHt = "devices/pci0000:00/0000:00:02.2/0000:04:00.0/virtio2/host1"
+		spiHost      = "devices/pci0000:00/0000:00:02.0/0000:01:00.0/0000:02:01.0/host2"
+		ahciHost     = "devices/pci0000:00/0000:00:1f.2/ata4/host6"
+	)
+	scsiHost(megasasHost, "megaraid_sas")
+	scsiHost(virtioSCSIHt, "virtio_scsi")
+	scsiHost(spiHost, "sym53c8xx")
+	scsiHost(ahciHost, "ahci")
+
+	linkDevice("vda", "devices/pci0000:00/0000:00:02.4/0000:06:00.0/virtio3")
+	linkDevice("vdb", "devices/pci0000:00/0000:00:02.5/0000:07:00.0/virtio4")
+	linkDevice("sda", megasasHost+"/target0:2:0/0:2:0:0")
+	linkDevice("sdb", virtioSCSIHt+"/target1:0:0/1:0:0:0")
+	linkDevice("sdc", spiHost+"/target2:0:0/2:0:0:0")
+	linkDevice("sdd", ahciHost+"/target6:0:0/6:0:0:0")
+
+	// Measured: lsblk -o NAME,MODEL,SERIAL,WWN,TRAN. Every WWN is empty, and
+	// only the SPI and AHCI disks get a transport at all.
+	disks := []struct{ kname, model, serial, transport string }{
+		{"vda", "", "5000c500142b3c4d", ""},
+		{"vdb", "", "90a775711a809a8a75e5", ""},
+		{"sda", "QEMU HARDDISK", "6001405deadbeef00001", ""},
+		{"sdb", "QEMU HARDDISK", "50014ee01a2b3c4d", ""},
+		{"sdc", "QEMU HARDDISK", "07a8489045cc024d75ee", "spi"},
+		{"sdd", "QEMU HARDDISK", "c2793cff25c3aba3d4b7", "sata"},
+	}
+	// Measured: ls /dev/disk/by-id. The AHCI disk alone gets an ata- alias; the
+	// three other SCSI disks get only scsi- forms, which prove nothing about
+	// whether the bus is shared.
+	byIDPaths := map[string][]string{
+		"/dev/vda": {"/dev/disk/by-id/virtio-5000c500142b3c4d"},
+		"/dev/vdb": {"/dev/disk/by-id/virtio-90a775711a809a8a75e5"},
+		"/dev/sda": {
+			"/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_6001405deadbeef00001",
+			"/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_6001405deadbeef00001",
+		},
+		"/dev/sdb": {
+			"/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_50014ee01a2b3c4d",
+			"/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_50014ee01a2b3c4d",
+		},
+		"/dev/sdc": {
+			"/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_07a8489045cc024d75ee",
+			"/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_07a8489045cc024d75ee",
+		},
+		"/dev/sdd": {
+			"/dev/disk/by-id/ata-QEMU_HARDDISK_c2793cff25c3aba3d4b7",
+			"/dev/disk/by-id/scsi-0ATA_QEMU_HARDDISK_c2793cff25c3aba3d4b7",
+			"/dev/disk/by-id/scsi-1ATA_QEMU_HARDDISK_c2793cff25c3aba3d4b7",
+			"/dev/disk/by-id/scsi-SATA_QEMU_HARDDISK_c2793cff25c3aba3d4b7",
+		},
+	}
+
+	blockdevices := []any{}
+	for _, d := range disks {
+		path := "/dev/" + d.kname
+		blockdevices = append(blockdevices, map[string]any{
+			"name": path, "path": path, "kname": path, "type": "disk",
+			"size": int64(2 << 30), "start": 0, "log-sec": 512,
+			"ro": false, "rota": true, "rm": false,
+			"model": d.model, "serial": d.serial, "wwn": nil, "tran": d.transport,
+			"mountpoints": []any{nil}, "options": []any{nil},
+		})
+	}
+	lsblk, err := json.Marshal(map[string]any{"blockdevices": blockdevices})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	collector := &observedStorageCollector{
+		run: func(name string, _ ...string) ([]byte, error) {
+			if name == "lsblk" {
+				return lsblk, nil
+			}
+			return []byte(`{"signatures":[]}`), nil
+		},
+		byIDPaths:       func() (map[string][]string, error) { return byIDPaths, nil },
+		busProbe:        func(d lsblkDevice) busProbe { return probeBusFromSysfsRoot(d, sysfsRoot) },
+		liveEnvironment: func() bool { return false },
+		bootID:          func() string { return "boot-measured-qemu" },
+	}
+
+	observed, err := collector.collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := observedDevicesByID(observed.Devices)
+
+	for _, want := range []struct{ id, path, note string }{
+		{"serial:virtio:5000c500142b3c4d", "/dev/vda", "virtio-blk via its by-id serial alias"},
+		{"serial:virtio:90a775711a809a8a75e5", "/dev/vdb", "virtio-blk via its by-id serial alias"},
+		{"serial:qemu_harddisk:50014ee01a2b3c4d", "/dev/sdb", "virtio-scsi: no transport, proven by the sysfs virtio ancestor"},
+		{"serial:qemu_harddisk:07a8489045cc024d75ee", "/dev/sdc", "SPI: proven by lsblk transport"},
+		{"serial:qemu_harddisk:c2793cff25c3aba3d4b7", "/dev/sdd", "AHCI: proven by transport, ata ancestor and ata- alias alike"},
+	} {
+		device := byID[want.id]
+		if device == nil || device.Path != want.path {
+			t.Fatalf("%s (%s) was not identified as %s: %#v", want.path, want.note, want.id, observed.Devices)
+		}
+		if device.SystemRole != elementalv1.ObservedStorageSystemRoleData {
+			t.Fatalf("%s role = %q, want Data", want.path, device.SystemRole)
+		}
+	}
+
+	// The MegaRAID SAS disk is the control. Its serial is just as good, but a
+	// SAS HBA may front storage another host can also reach, so nothing here
+	// proves the bus is local and the disk must stay unmanageable.
+	sda := byID["unidentified:dev_sda"]
+	if sda == nil || sda.Path != "/dev/sda" {
+		t.Fatalf("the SAS-fronted disk was expected to fail closed: %#v", observed.Devices)
+	}
+	if sda.SystemRole != elementalv1.ObservedStorageSystemRoleUnknown {
+		t.Fatalf("sda role = %q, want Unknown", sda.SystemRole)
+	}
+	if !containsText(sda.SystemEvidence, `bus not proven local (transport="", driver="megaraid_sas")`) {
+		t.Fatalf("sda evidence must name the driver that failed the check: %v", sda.SystemEvidence)
+	}
+}
