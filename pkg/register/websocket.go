@@ -26,6 +26,14 @@ import (
 
 const RegistrationDeadlineSeconds = 10
 
+// StorageObserverDeadlineSeconds bounds a single read on an established
+// storage observer session. Unlike registration, that session is long lived:
+// the agent reports once per --observe-interval (60s by default) and the
+// server must survive the idle gap between two reports. The value has to
+// exceed the client side refresh budget (interval + 30s) while still
+// reclaiming sessions whose host disappeared.
+const StorageObserverDeadlineSeconds = 300
+
 type MessageType byte
 
 const (
