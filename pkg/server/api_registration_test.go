@@ -28,6 +28,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/jaypipes/ghw/pkg/memory"
@@ -413,6 +414,98 @@ func TestUpdateInventoryObservedStorage(t *testing.T) {
 	observed.BootID = ""
 	if err := server.patchObservedStorageStatus(inventory, observed); err == nil || !strings.Contains(err.Error(), "boot ID is required") {
 		t.Fatalf("invalid report error = %v", err)
+	}
+}
+
+// TestServeStorageObserverRefreshesReadDeadline pins the fix for observer
+// sessions that died shortly after the handshake. The deadline installed when
+// the connection is accepted is sized for registration, and serveStorageObserver
+// used to inherit it for the whole long lived session, so the agent only ever
+// delivered the single report it sends before its first interval sleep and
+// every later report cost a full reconnect. A short stale deadline stands in
+// for the registration one so the regression surfaces in milliseconds.
+func TestServeStorageObserverRefreshesReadDeadline(t *testing.T) {
+	const staleDeadline = 150 * time.Millisecond
+	const reportGap = 400 * time.Millisecond
+
+	scheme := runtime.NewScheme()
+	assert.NilError(t, elementalv1.AddToScheme(scheme))
+	inventory := &elementalv1.MachineInventory{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "storage-observer-deadline",
+			Namespace:         "default",
+			UID:               "inventory-uid",
+			ResourceVersion:   "1",
+			CreationTimestamp: metav1.Now(),
+		},
+	}
+	server := &InventoryServer{
+		Context: context.Background(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&elementalv1.MachineInventory{}).
+			WithObjects(inventory.DeepCopy()).Build(),
+	}
+	epoch, err := server.claimStorageObserverEpoch(inventory)
+	assert.NilError(t, err)
+
+	served := make(chan error, 1)
+	upgrader := websocket.Upgrader{}
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			served <- err
+			return
+		}
+		defer conn.Close()
+		// Stand in for the registration deadline the real server installs on accept.
+		if err := conn.SetReadDeadline(time.Now().Add(staleDeadline)); err != nil {
+			served <- err
+			return
+		}
+		served <- server.serveStorageObserver(conn, inventory, epoch)
+	}))
+	defer wsServer.Close()
+
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(wsServer.URL, "http"), nil)
+	assert.NilError(t, err)
+	defer ws.Close()
+
+	for sequence := int64(1); sequence <= 2; sequence++ {
+		// Idle past the stale deadline, the way a real agent idles between reports.
+		time.Sleep(reportGap)
+
+		report, err := json.Marshal(&elementalv1.ObservedStorage{
+			BootID:      "boot-1",
+			ReportEpoch: epoch,
+			Sequence:    sequence,
+			Devices: []elementalv1.ObservedStorageDevice{{
+				ID:         "wwn:5000c50000000001",
+				Kind:       elementalv1.ObservedStorageDeviceDirectDisk,
+				SystemRole: elementalv1.ObservedStorageSystemRoleData,
+			}},
+		})
+		assert.NilError(t, err)
+		assert.NilError(t, register.WriteMessage(ws, register.MsgObservedStorageConfig, report))
+
+		assert.NilError(t, ws.SetReadDeadline(time.Now().Add(10*time.Second)))
+		msgType, _, err := register.ReadMessage(ws)
+		assert.NilError(t, err)
+		assert.Equal(t, register.MsgReady, msgType)
+	}
+
+	current := &elementalv1.MachineInventory{}
+	assert.NilError(t, server.Get(context.Background(), client.ObjectKeyFromObject(inventory), current))
+	assert.Assert(t, current.Status.ObservedStorage != nil)
+	assert.Equal(t, current.Status.ObservedStorage.Sequence, int64(2))
+	assert.Equal(t, current.Status.ObservedStorage.ReportEpoch, epoch)
+
+	// Disconnecting must end the loop rather than leave the session parked.
+	assert.NilError(t, ws.Close())
+	select {
+	case err := <-served:
+		assert.Assert(t, err != nil)
+	case <-time.After(10 * time.Second):
+		t.Fatal("serveStorageObserver did not return after the client disconnected")
 	}
 }
 

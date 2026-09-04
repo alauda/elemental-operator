@@ -324,6 +324,15 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 func (i *InventoryServer) serveStorageObserver(conn *websocket.Conn, inventory *elementalv1.MachineInventory, epoch int64) error {
 	lastSequence := int64(0)
 	for {
+		// The deadline installed when the connection was accepted covers the
+		// registration handshake only. Refresh it before every read, otherwise
+		// the session dies 10s after the handshake and the agent only ever
+		// delivers the single report it sends before its first interval sleep.
+		deadline := time.Now().Add(register.StorageObserverDeadlineSeconds * time.Second)
+		_ = conn.SetWriteDeadline(deadline)
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			return fmt.Errorf("setting storage observer read deadline: %w", err)
+		}
 		msgType, data, err := register.ReadMessage(conn)
 		if err != nil {
 			return fmt.Errorf("storage observer connection interrupted: %w", err)
