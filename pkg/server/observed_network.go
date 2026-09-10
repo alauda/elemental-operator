@@ -23,15 +23,73 @@ import (
 	"strings"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
+	"github.com/rancher/elemental-operator/pkg/log"
 	"github.com/rancher/elemental-operator/pkg/network"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// observedNetworkConfig decides what network configuration to hand back to
+// elemental-register, in three tiers:
+//
+//  1. An explicit spec.network always wins.
+//  2. Otherwise the host's own NetworkManager keyfiles, captured verbatim at
+//     registration, are handed straight back. Capture format and install format
+//     are the same, so a bond, VLAN or bridge round-trips without being
+//     modelled.
+//  3. Otherwise the address snapshot is rendered into ethernet keyfiles — but
+//     only when every interface really is a plain physical link. A host with an
+//     aggregated link gets nothing rather than a rendering that would tear the
+//     aggregate apart, because the snapshot records no membership.
 func observedNetworkConfig(inventory *elementalv1.MachineInventory) elementalv1.NetworkConfig {
 	if inventory == nil || !isEmptyNetworkConfig(inventory.Spec.Network) {
 		return inventory.Spec.Network
 	}
-	return observedNetworkToNMConnections(inventory.Spec.ObservedNetwork)
+
+	observed := inventory.Spec.ObservedNetwork
+	if config, ok := observedConnectionsConfig(observed); ok {
+		return config
+	}
+
+	if link, found := firstNonPhysicalLink(observed); found {
+		log.Warningf("not deriving a network config for %s: %q is a non-physical link and the address snapshot records no membership; configure the host from the live ISO so its NetworkManager profiles are captured instead", inventory.Name, link)
+		return elementalv1.NetworkConfig{}
+	}
+
+	return observedNetworkToNMConnections(observed)
+}
+
+// observedConnectionsConfig hands the captured NetworkManager keyfiles back
+// unchanged. The nmconnections configurator writes each map entry to
+// <system-connections>/<key>.nmconnection, which is exactly where they were
+// read from, so the round trip is lossless.
+func observedConnectionsConfig(obs *elementalv1.ObservedNetwork) (elementalv1.NetworkConfig, bool) {
+	if obs == nil || len(obs.Connections) == 0 {
+		return elementalv1.NetworkConfig{}, false
+	}
+
+	config := make(map[string]runtime.RawExtension, len(obs.Connections))
+	for name, content := range obs.Connections {
+		config[name] = runtime.RawExtension{Raw: []byte(strconv.Quote(content))}
+	}
+	return elementalv1.NetworkConfig{
+		Configurator: network.ConfiguratorNmconnections,
+		Config:       config,
+	}, true
+}
+
+// firstNonPhysicalLink reports an interface that is either an aggregate itself
+// or enslaved to one. Older elemental-register builds report neither field, in
+// which case this finds nothing and the legacy rendering path is kept.
+func firstNonPhysicalLink(obs *elementalv1.ObservedNetwork) (string, bool) {
+	if obs == nil {
+		return "", false
+	}
+	for _, iface := range obs.Interfaces {
+		if iface.Kind != "" || iface.Master != "" {
+			return iface.Name, true
+		}
+	}
+	return "", false
 }
 
 func isEmptyNetworkConfig(netConf elementalv1.NetworkConfig) bool {

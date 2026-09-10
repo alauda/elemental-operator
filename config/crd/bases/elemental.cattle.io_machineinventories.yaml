@@ -150,6 +150,20 @@ spec:
                   baremetal providers can read this to know what the host looked like
                   before install-time network reconfiguration.
                 properties:
+                  connections:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Connections holds the host's persisted NetworkManager keyfiles verbatim,
+                      keyed by the connection file's base name (without the .nmconnection
+                      suffix). Anything present here was created by an operator: NetworkManager
+                      keeps its own auto-default connections in memory, with no file on disk.
+
+                      The install and reset paths feed these back to the host unchanged, which
+                      is how a bond, VLAN or bridge configured from the live ISO survives into
+                      the installed system. Every other registration reports them and discards
+                      them, so editing this field has no effect on the host.
+                    type: object
                   dnsServers:
                     description: DNSServers observed (typically from /etc/resolv.conf).
                     items:
@@ -168,8 +182,20 @@ spec:
                           items:
                             type: string
                           type: array
+                        kind:
+                          description: |-
+                            Kind is the link type read from /sys/class/net/<name>/uevent DEVTYPE.
+                            It is empty for a plain physical ethernet device, and otherwise carries
+                            the kernel's own name for the link type: bond, vlan, bridge, ...
+                          type: string
                         mac:
                           description: MAC is the hardware address.
+                          type: string
+                        master:
+                          description: |-
+                            Master is the name of the aggregating link this interface is enslaved to,
+                            resolved from the /sys/class/net/<name>/master symlink. It is empty for
+                            an interface that stands on its own.
                           type: string
                         mtu:
                           description: MTU in bytes.
