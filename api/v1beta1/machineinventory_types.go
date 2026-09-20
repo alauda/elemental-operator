@@ -84,6 +84,17 @@ type ObservedNetwork struct {
 	// SearchDomains observed.
 	// +optional
 	SearchDomains []string `json:"searchDomains,omitempty"`
+	// Connections holds the host's persisted NetworkManager keyfiles verbatim,
+	// keyed by the connection file's base name (without the .nmconnection
+	// suffix). Anything present here was created by an operator: NetworkManager
+	// keeps its own auto-default connections in memory, with no file on disk.
+	//
+	// The install and reset paths feed these back to the host unchanged, which
+	// is how a bond, VLAN or bridge configured from the live ISO survives into
+	// the installed system. Every other registration reports them and discards
+	// them, so editing this field has no effect on the host.
+	// +optional
+	Connections map[string]string `json:"connections,omitempty"`
 }
 
 // ObservedInterface describes a single network interface on the host.
@@ -100,6 +111,16 @@ type ObservedInterface struct {
 	// fe80::1/64). Both IPv4 and IPv6 may appear.
 	// +optional
 	Addresses []string `json:"addresses,omitempty"`
+	// Kind is the link type read from /sys/class/net/<name>/uevent DEVTYPE.
+	// It is empty for a plain physical ethernet device, and otherwise carries
+	// the kernel's own name for the link type: bond, vlan, bridge, ...
+	// +optional
+	Kind string `json:"kind,omitempty"`
+	// Master is the name of the aggregating link this interface is enslaved to,
+	// resolved from the /sys/class/net/<name>/master symlink. It is empty for
+	// an interface that stands on its own.
+	// +optional
+	Master string `json:"master,omitempty"`
 }
 
 // ObservedRoute describes a single routing table entry.

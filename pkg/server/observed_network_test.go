@@ -110,3 +110,73 @@ func mustContain(t *testing.T, s, substr string) {
 		t.Fatalf("expected %q to contain %q", s, substr)
 	}
 }
+
+func TestObservedNetworkConfigPrefersCapturedConnections(t *testing.T) {
+	bond := "[connection]\nid=bond0\ntype=bond\n\n[bond]\nmode=active-backup\n"
+	slave := "[connection]\nid=eth0\ntype=ethernet\nmaster=bond0\nslave-type=bond\n"
+
+	observed := observedNetworkFixture()
+	observed.Connections = map[string]string{"bond0": bond, "eth0": slave}
+
+	inventory := &elementalv1.MachineInventory{}
+	inventory.Spec.ObservedNetwork = observed
+
+	got := observedNetworkConfig(inventory)
+
+	assert.Equal(t, network.ConfiguratorNmconnections, got.Configurator)
+	assert.Equal(t, 2, len(got.Config))
+	// The keys are the keyfile base names, so the applicator writes each one
+	// back to the very path it was read from.
+	for name, want := range map[string]string{"bond0": bond, "eth0": slave} {
+		raw, found := got.Config[name]
+		assert.Assert(t, found, "connection %q is missing", name)
+		unquoted, err := strconv.Unquote(string(raw.Raw))
+		assert.NilError(t, err)
+		assert.Equal(t, want, unquoted)
+	}
+}
+
+func TestObservedNetworkConfigRefusesToGuessForAggregatedLinks(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		iface elementalv1.ObservedInterface
+	}{
+		{
+			name:  "the aggregate itself",
+			iface: elementalv1.ObservedInterface{Name: "bond0", MAC: "02:00:00:00:00:03", Kind: "bond", Addresses: []string{"10.0.0.5/24"}},
+		},
+		{
+			name:  "a member of one",
+			iface: elementalv1.ObservedInterface{Name: "eth1", MAC: "02:00:00:00:00:04", Master: "bond0"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observed := observedNetworkFixture()
+			observed.Interfaces = append(observed.Interfaces, tc.iface)
+
+			inventory := &elementalv1.MachineInventory{}
+			inventory.Spec.ObservedNetwork = observed
+
+			// Rendering the address snapshot would flatten the aggregate into
+			// an ethernet profile bound to a member's MAC, so nothing is sent.
+			assert.DeepEqual(t, elementalv1.NetworkConfig{}, observedNetworkConfig(inventory))
+		})
+	}
+}
+
+func TestObservedNetworkConfigStillRendersPlainLinks(t *testing.T) {
+	// An older elemental-register reports neither Kind nor Master; the guard
+	// must not fire and turn a working host into an unconfigured one.
+	inventory := &elementalv1.MachineInventory{}
+	inventory.Spec.ObservedNetwork = observedNetworkFixture()
+
+	got := observedNetworkConfig(inventory)
+
+	assert.Equal(t, network.ConfiguratorNmconnections, got.Configurator)
+	assert.Equal(t, 1, len(got.Config))
+	raw, found := got.Config["ens3"]
+	assert.Assert(t, found)
+	unquoted, err := strconv.Unquote(string(raw.Raw))
+	assert.NilError(t, err)
+	assert.Assert(t, strings.Contains(unquoted, "type=ethernet"))
+}

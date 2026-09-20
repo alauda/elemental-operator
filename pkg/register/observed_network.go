@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -36,6 +38,39 @@ var resolveConfPath = "/etc/resolv.conf"
 
 // procNetRoutePath is the default IPv4 route table in proc. Overridable in tests.
 var procNetRoutePath = "/proc/net/route"
+
+// sysClassNetPath is where the kernel exposes per-link attributes. Overridable
+// in tests.
+var sysClassNetPath = "/sys/class/net"
+
+// nmSystemConnectionsPath is NetworkManager's keyfile directory. Overridable in
+// tests.
+var nmSystemConnectionsPath = "/etc/NetworkManager/system-connections"
+
+const (
+	// nmConnectionSuffix is the extension NetworkManager gives its keyfiles.
+	nmConnectionSuffix = ".nmconnection"
+	// maxConnectionFileBytes bounds a single keyfile. A real one is well under
+	// a kilobyte; anything larger is not a keyfile worth carrying.
+	maxConnectionFileBytes = 64 * 1024
+	// maxConnectionsTotalBytes bounds the whole set, so a host cannot inflate
+	// its MachineInventory without limit.
+	maxConnectionsTotalBytes = 256 * 1024
+)
+
+// secretMarkers are substrings that mark a connection profile as carrying a
+// secret. Such profiles are skipped rather than sanitised: a wired baremetal
+// host has no business shipping credentials into its MachineInventory, and
+// stripping the keys would hand back a profile that no longer works.
+var secretMarkers = []string{
+	"[wifi-security]",
+	"[802-1x]",
+	"psk=",
+	"password=",
+	"password-raw=",
+	"preshared-key=",
+	"wep-key",
+}
 
 // sendObservedNetwork collects a snapshot of the host's current network state
 // (interfaces, routes, DNS) and sends it to the operator via the Alauda-fork
@@ -68,6 +103,8 @@ func collectObservedNetwork() *elementalv1.ObservedNetwork {
 		observed.SearchDomains = search
 	}
 
+	observed.Connections = collectObservedConnections()
+
 	return observed
 }
 
@@ -83,9 +120,11 @@ func collectInterfaces() ([]elementalv1.ObservedInterface, error) {
 			continue
 		}
 		oi := elementalv1.ObservedInterface{
-			Name: ni.Name,
-			MAC:  ni.HardwareAddr.String(),
-			MTU:  ni.MTU,
+			Name:   ni.Name,
+			MAC:    ni.HardwareAddr.String(),
+			MTU:    ni.MTU,
+			Kind:   linkKind(ni.Name),
+			Master: linkMaster(ni.Name),
 		}
 		addrs, err := ni.Addrs()
 		if err != nil {
@@ -200,4 +239,104 @@ func collectResolvConf(path string) (nameservers []string, search []string, err 
 		return nil, nil, err
 	}
 	return nameservers, search, nil
+}
+
+// collectObservedConnections reads the host's persisted NetworkManager
+// keyfiles. NetworkManager keeps its own auto-default connections in memory,
+// with no file on disk, so every file found here was written by an operator —
+// which is what makes this an exact record of intent rather than a guess
+// reconstructed from addresses.
+//
+// Collection is best-effort: a missing directory, an unreadable file or a
+// profile carrying a secret is skipped with a warning, never fatal.
+func collectObservedConnections() map[string]string {
+	entries, err := os.ReadDir(nmSystemConnectionsPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Warningf("failed to read %s: %v", nmSystemConnectionsPath, err)
+		}
+		return nil
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), nmConnectionSuffix) {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	// Sort so that hitting the total cap truncates the same set every time.
+	sort.Strings(names)
+
+	connections := map[string]string{}
+	total := 0
+	for _, name := range names {
+		path := filepath.Join(nmSystemConnectionsPath, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			log.Warningf("failed to stat %s: %v", path, err)
+			continue
+		}
+		if info.Size() > maxConnectionFileBytes {
+			log.Warningf("skipping %s: %d bytes exceeds the %d byte limit for a connection profile", path, info.Size(), maxConnectionFileBytes)
+			continue
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			log.Warningf("failed to read %s: %v", path, err)
+			continue
+		}
+		if marker, found := findSecretMarker(string(content)); found {
+			log.Warningf("skipping %s: it carries a secret (%s)", path, marker)
+			continue
+		}
+		if total+len(content) > maxConnectionsTotalBytes {
+			log.Warningf("stopping at %s: the collected connection profiles would exceed %d bytes", path, maxConnectionsTotalBytes)
+			break
+		}
+		total += len(content)
+		connections[strings.TrimSuffix(name, nmConnectionSuffix)] = string(content)
+	}
+
+	if len(connections) == 0 {
+		return nil
+	}
+	return connections
+}
+
+func findSecretMarker(content string) (string, bool) {
+	lowered := strings.ToLower(content)
+	for _, marker := range secretMarkers {
+		if strings.Contains(lowered, marker) {
+			return marker, true
+		}
+	}
+	return "", false
+}
+
+// linkKind returns the kernel's DEVTYPE for a link: empty for a plain physical
+// ethernet device, and the link type otherwise (bond, vlan, bridge, ...). A
+// link whose uevent cannot be read reports no kind rather than failing
+// collection.
+func linkKind(name string) string {
+	content, err := os.ReadFile(filepath.Join(sysClassNetPath, name, "uevent"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		if value, found := strings.CutPrefix(strings.TrimSpace(line), "DEVTYPE="); found {
+			return value
+		}
+	}
+	return ""
+}
+
+// linkMaster returns the name of the aggregating link this interface is
+// enslaved to, or the empty string when it stands on its own.
+func linkMaster(name string) string {
+	target, err := os.Readlink(filepath.Join(sysClassNetPath, name, "master"))
+	if err != nil {
+		return ""
+	}
+	return filepath.Base(target)
 }
