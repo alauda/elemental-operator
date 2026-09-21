@@ -73,6 +73,9 @@ type Installer interface {
 	ResetElemental(config elementalv1.Config, state register.State, networkConfig elementalv1.NetworkConfig) error
 	ResetElementalNetwork() error
 	InstallElemental(config elementalv1.Config, state register.State, networkConfig elementalv1.NetworkConfig) error
+	// InstallKubeOS writes KubeOS with kbimg instead of the elemental toolkit.
+	// See kubeos.go.
+	InstallKubeOS(config elementalv1.Config, state register.State, networkConfig elementalv1.NetworkConfig) error
 	WriteLocalSystemAgentConfig(config elementalv1.Elemental) error
 }
 
@@ -82,6 +85,7 @@ func NewInstaller(fs vfs.FS, disks []*block.Disk, networkConfigurator network.Co
 		disks:               disks,
 		runner:              elementalcli.NewRunner(),
 		networkConfigurator: networkConfigurator,
+		kubeos:              defaultKubeOSOptions(),
 	}
 }
 
@@ -92,6 +96,7 @@ type installer struct {
 	disks               []*block.Disk
 	runner              elementalcli.Runner
 	networkConfigurator network.Configurator
+	kubeos              kubeosOptions
 }
 
 func (i *installer) InstallElemental(config elementalv1.Config, state register.State, networkConfig elementalv1.NetworkConfig) error {

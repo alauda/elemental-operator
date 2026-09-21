@@ -32,6 +32,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
+	"github.com/rancher/elemental-operator/pkg/install"
 	imocks "github.com/rancher/elemental-operator/pkg/install/mocks"
 	"github.com/rancher/elemental-operator/pkg/register"
 	rmocks "github.com/rancher/elemental-operator/pkg/register/mocks"
@@ -374,3 +375,49 @@ func marshalToBytes(input any) []byte {
 	Expect(err).ToNot(HaveOccurred())
 	return bytes
 }
+
+var _ = Describe("elemental-register --install --installer kubeos", Label("registration", "cli", "install-kubeos"), func() {
+	var fs vfs.FS
+	var err error
+	var fsCleanup func()
+	var cmd *cobra.Command
+	var mockCtrl *gomock.Controller
+	var client *rmocks.MockClient
+	var installer *imocks.MockInstaller
+	var stateHandler *rmocks.MockStateHandler
+	BeforeEach(func() {
+		fs, fsCleanup, err = vfst.NewTestFS(map[string]interface{}{})
+		Expect(err).ToNot(HaveOccurred())
+		mockCtrl = gomock.NewController(GinkgoT())
+		installer = imocks.NewMockInstaller(mockCtrl)
+		stateHandler = rmocks.NewMockStateHandler(mockCtrl)
+		client = rmocks.NewMockClient(mockCtrl)
+		cmd = newCommand(fs, client, stateHandler, installer)
+		DeferCleanup(fsCleanup)
+		// The package-level flag variable persists across Describe blocks.
+		DeferCleanup(func() { osInstaller = install.ToolkitInstaller })
+	})
+	When("using existing live config", func() {
+		BeforeEach(func() {
+			// Same live paths as the toolkit installer: registration is identical.
+			marshalIntoFile(fs, baseConfigFixture, defaultLiveConfigPath)
+			stateHandler.EXPECT().Init(defaultLiveStatePath).Return(nil)
+			stateHandler.EXPECT().Load().Return(stateFixture, nil)
+			stateHandler.EXPECT().Save(stateFixture).Return(nil)
+		})
+		It("dispatches to the kubeos backend after registering", func() {
+			cmd.SetArgs([]string{"--install", "--installer", "kubeos"})
+			installer.EXPECT().InstallKubeOS(alternateConfigFixture, stateFixture, networkConfigFixture).Return(nil)
+			client.EXPECT().
+				Register(baseConfigFixture.Elemental.Registration, []byte(baseConfigFixture.Elemental.Registration.CACert), &stateFixture).
+				Return(append(marshalToBytes(alternateConfigFixture), marshalToBytes(networkConfigFixture)...), nil)
+			Expect(cmd.Execute()).ToNot(HaveOccurred())
+		})
+	})
+	It("rejects an unknown installer before reading any config", func() {
+		cmd.SetArgs([]string{"--install", "--installer", "cloud"})
+		err := cmd.Execute()
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(`--installer must be "toolkit" or "kubeos"`))
+	})
+})
