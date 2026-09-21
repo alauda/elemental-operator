@@ -72,6 +72,20 @@ func (mr *MockInstallerMockRecorder) InstallElemental(arg0, arg1, arg2 any) *gom
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InstallElemental", reflect.TypeOf((*MockInstaller)(nil).InstallElemental), arg0, arg1, arg2)
 }
 
+// InstallKubeOS mocks base method.
+func (m *MockInstaller) InstallKubeOS(arg0 v1beta1.Config, arg1 register.State, arg2 v1beta1.NetworkConfig) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "InstallKubeOS", arg0, arg1, arg2)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// InstallKubeOS indicates an expected call of InstallKubeOS.
+func (mr *MockInstallerMockRecorder) InstallKubeOS(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InstallKubeOS", reflect.TypeOf((*MockInstaller)(nil).InstallKubeOS), arg0, arg1, arg2)
+}
+
 // ResetElemental mocks base method.
 func (m *MockInstaller) ResetElemental(arg0 v1beta1.Config, arg1 register.State, arg2 v1beta1.NetworkConfig) error {
 	m.ctrl.T.Helper()
