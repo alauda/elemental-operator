@@ -324,6 +324,7 @@ func ExtractLabelsLegacy(systemData HostInfo) map[string]interface{} {
 	runtime := map[string]interface{}{}
 	if systemData.Runtime != nil {
 		runtime["Hostname"] = systemData.Runtime.Hostname
+		runtime["Architecture"] = systemData.Runtime.Architecture
 	}
 
 	labels := map[string]interface{}{}
