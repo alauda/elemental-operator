@@ -62,12 +62,15 @@ const (
 	kubeosLiveRegistriesDir   = "/etc/containers/registries.conf.d"
 	kubeosLiveAuthFile        = "/run/containers/0/auth.json"
 
-	// Target-side paths. /etc and /var are overlays whose upperdirs live on
-	// PERSIST, shared by both A/B slots, so these survive kbosctl upgrade.
+	// Target-side paths. /etc, /var and /root are overlays whose upperdirs
+	// live on PERSIST, shared by both A/B slots. kbimg writes install.configs
+	// into ROOT-A only (the lower layer), so persistKubeOSFiles copies them up
+	// afterwards; otherwise the first kbosctl upgrade boots without them.
 	kubeosRegistrationDir    = "/etc/elemental/registration"
 	kubeosRegistrationConfig = kubeosRegistrationDir + "/config.yaml"
 	kubeosRegistrationState  = kubeosRegistrationDir + "/state.yaml"
 	kubeosDatasourceCfgPath  = "/etc/cloud/cloud.cfg.d/99-baremetal-datasource.cfg"
+	kubeosNoNetworkCfgPath   = "/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
 	kubeosTargetAuthFile     = "/root/.config/containers/auth.json"
 
 	// kubeosDatasourceCfg pins cloud-init to NoCloud. The image does not ship a
@@ -77,8 +80,22 @@ const (
 	// contract uses.
 	kubeosDatasourceCfg = "datasource_list: [ NoCloud ]\n"
 
+	// kubeosNoNetworkCfg keeps cloud-init away from networking once the host
+	// has its own NetworkManager profiles. Left on, first boot writes a DHCP
+	// profile per NIC (autoconnect-priority 120, may-fail=false) that outranks
+	// the static one; on a segment without DHCP the host then drops off the
+	// network. Same file name and meaning as the one the provider's
+	// reprovision plan writes.
+	kubeosNoNetworkCfg = "# Written by elemental-register (kubeos installer): the NetworkManager\n" +
+		"# profiles staged at install own the network.\n" +
+		"network: {config: disabled}\n"
+
 	kubeosInstallSuccess = "KubeOS installed successfully"
 )
+
+// kubeosPersistedTrees are the target directories whose overlay upperdir on
+// PERSIST has the same name as the directory itself (/etc -> PERSIST/etc).
+var kubeosPersistedTrees = []string{"/etc/", "/var/", "/root/"}
 
 // kubeosRequiredPartitions must all appear on the target disk after
 // `kbimg install disk`. kbimg's own exit status is not trustworthy — internal
@@ -200,6 +217,9 @@ func (i *installer) InstallKubeOS(config elementalv1.Config, state register.Stat
 	if err := i.verifyKubeOSInstall(device, out); err != nil {
 		return err
 	}
+	if err := i.persistKubeOSFiles(device, staged); err != nil {
+		return err
+	}
 	log.Info("KubeOS install completed")
 
 	// 6. Finish the way elemental install would.
@@ -305,6 +325,8 @@ func (i *installer) stageKubeOSFiles(filesDir string, config elementalv1.Config,
 		}
 		if n == 0 {
 			log.Warning("network config produced no NetworkManager profiles; the installed system will fall back to DHCP")
+		} else if err := add("99-disable-network-config.cfg", kubeosNoNetworkCfgPath, []byte(kubeosNoNetworkCfg), 0o644); err != nil {
+			return nil, err
 		}
 	}
 
@@ -432,6 +454,69 @@ func (i *installer) verifyKubeOSInstall(device string, installOutput []byte) err
 	}
 	return nil
 }
+
+// persistKubeOSFiles copies every staged file that belongs to an overlaid tree
+// into its upperdir on PERSIST. kbimg only mounts ROOT-A while it runs
+// install.configs and creates PERSIST afterwards, so without this the files
+// exist in slot A alone and vanish at the first A/B switch: static network
+// profiles, the cloud-init datasource pin and the registry credentials that
+// kbosctl upgrade itself needs. Copies in ROOT-A stay; the upper copy shadows
+// them on either slot.
+func (i *installer) persistKubeOSFiles(device string, staged []kubeosStagedFile) error {
+	args := []string{"-c", kubeosPersistScript, "persist", device}
+	for _, f := range staged {
+		for _, tree := range kubeosPersistedTrees {
+			if strings.HasPrefix(f.dst, tree) {
+				args = append(args, f.src, strings.TrimPrefix(f.dst, "/"))
+				break
+			}
+		}
+	}
+	if len(args) == 4 {
+		return nil
+	}
+	out, err := i.kubeos.runner.Output("sh", args...)
+	if err != nil {
+		return fmt.Errorf("copying first-boot files to PERSIST on %s: %w\n%s", device, err, strings.TrimSpace(string(out)))
+	}
+	log.Infof("first-boot files copied to PERSIST:\n%s", strings.TrimSpace(string(out)))
+	return nil
+}
+
+// kubeosPersistScript mounts PERSIST read-write and ROOT-A read-only, then
+// copies each (src, path) pair to PERSIST/path. $1 is the disk. A merged
+// overlay directory takes its mode and owner from the upper copy, so missing
+// parents are created with the attributes of their ROOT-A counterpart rather
+// than the umask's: a new PERSIST/root must stay as closed as /root.
+const kubeosPersistScript = `set -e
+disk=$1; shift
+part() { lsblk -rno PATH,LABEL "$disk" | awk -v l="$1" '$2==l{print $1; exit}'; }
+persist=$(part PERSIST); slot=$(part ROOT-A)
+[ -n "$persist" ] && [ -n "$slot" ] || { echo "PERSIST or ROOT-A not found on $disk" >&2; exit 1; }
+pm=$(mktemp -d); sm=$(mktemp -d); created=$(mktemp)
+trap 'rc=$?; umount "$pm" 2>/dev/null; umount "$sm" 2>/dev/null; rmdir "$pm" "$sm" 2>/dev/null; rm -f "$created"; exit $rc' EXIT
+mount "$persist" "$pm"
+mount -o ro "$slot" "$sm"
+ensure_dir() {
+  [ -d "$pm/$1" ] && return 0
+  ensure_dir "$(dirname "$1")"
+  mkdir "$pm/$1"
+  echo "$1" >> "$created"
+}
+while [ $# -ge 2 ]; do
+  ensure_dir "$(dirname "$2")"
+  cp -p "$1" "$pm/$2"
+  echo "/$2"
+  shift 2
+done
+# Attributes last and deepest first, so a closed parent never blocks its own
+# children being created.
+sort -r "$created" | while read -r d; do
+  [ -d "$sm/$d" ] || continue
+  chown "$(stat -c %u:%g "$sm/$d")" "$pm/$d"
+  chmod "$(stat -c %a "$sm/$d")" "$pm/$d"
+done
+sync`
 
 // kubeosGrubCheckScript mounts the BOOT partition read-only, prints every
 // root= it finds in the EFI grub.cfg files, and unmounts. $1 is the disk.

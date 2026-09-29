@@ -19,6 +19,9 @@ package install
 import (
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/jaypipes/ghw/pkg/block"
@@ -54,6 +57,8 @@ func (f *fakeKubeOSRunner) answer(name string, args []string) ([]byte, error) {
 		switch {
 		case strings.Contains(args[1], "kbimg install disk"):
 			key = "kbimg"
+		case strings.Contains(args[1], "PERSIST or ROOT-A"):
+			key = "persist"
 		case strings.Contains(args[1], "root="):
 			key = "grubcheck"
 		}
@@ -104,6 +109,7 @@ func healthyResults() map[string]fakeResult {
 		"kbimg":     {out: "pulling rootfs...\nKubeOS installed successfully\n"},
 		"lsblk":     {out: "\nBOOT\nROOT-A\nROOT-B\nPERSIST\n"},
 		"grubcheck": {out: "root=PARTUUID=1111-2222\n"},
+		"persist":   {out: "/etc/elemental/registration/state.yaml\n"},
 		"eject":     {out: ""},
 		"systemctl": {out: ""},
 	}
@@ -189,12 +195,13 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 			"/etc/NetworkManager/system-connections/eth0.nmconnection",
 			"/etc/containers/registries.conf.d/99-kubeos.conf",
 			"/root/.config/containers/auth.json",
+			"/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg",
 		} {
 			Expect(toml).To(ContainSubstring(fmt.Sprintf("dst = %q\n", dst)), dst)
 		}
 		Expect(toml).NotTo(ContainSubstring("file://"))
 		Expect(toml).NotTo(ContainSubstring("README"))
-		Expect(strings.Count(toml, "[[install.configs]]")).To(Equal(10))
+		Expect(strings.Count(toml, "[[install.configs]]")).To(Equal(11))
 	})
 
 	It("stages first-boot files with the modes the target needs", func() {
@@ -209,13 +216,14 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 		Expect(readFile("/tmp/elemental/kubeos/files/nm-01-bond0.nmconnection")).To(Equal("[connection]\nid=bond0\n"))
 
 		for name, mode := range map[string]string{
-			"elemental_connection.json":   "-rw-------",
-			"nm-01-bond0.nmconnection":    "-rw-------",
-			"nm-02-eth0.nmconnection":     "-rw-------",
-			"registration-state.yaml":     "-rw-------",
-			"99-baremetal-datasource.cfg": "-rw-r--r--",
-			"registries-99-kubeos.conf":   "-rw-r--r--",
-			"containers-auth.json":        "-rw-------",
+			"elemental_connection.json":     "-rw-------",
+			"nm-01-bond0.nmconnection":      "-rw-------",
+			"nm-02-eth0.nmconnection":       "-rw-------",
+			"registration-state.yaml":       "-rw-------",
+			"99-baremetal-datasource.cfg":   "-rw-r--r--",
+			"99-disable-network-config.cfg": "-rw-r--r--",
+			"registries-99-kubeos.conf":     "-rw-r--r--",
+			"containers-auth.json":          "-rw-------",
 		} {
 			info, err := fs.Stat("/tmp/elemental/kubeos/files/" + name)
 			Expect(err).ToNot(HaveOccurred(), name)
@@ -228,21 +236,24 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 		names := make([]string, 0, len(runner.calls))
 		for _, c := range runner.calls {
 			if c[0] == "sh" {
-				if strings.Contains(c[2], "kbimg") {
+				switch {
+				case strings.Contains(c[2], "kbimg"):
 					names = append(names, "kbimg")
-				} else {
+				case strings.Contains(c[2], "PERSIST"):
+					names = append(names, "persist")
+				default:
 					names = append(names, "grubcheck")
 				}
 				continue
 			}
 			names = append(names, c[0])
 		}
-		Expect(names).To(Equal([]string{"skopeo", "kbimg", "lsblk", "grubcheck", "eject", "systemctl"}))
+		Expect(names).To(Equal([]string{"skopeo", "kbimg", "lsblk", "grubcheck", "persist", "eject", "systemctl"}))
 		Expect(runner.calls[0]).To(Equal([]string{"skopeo", "inspect", "--raw", "docker://reg.internal/tkestack/kubeos-rootfs:alaudaos-44.ku.1-0.x86_64"}))
 		Expect(runner.calls[1][2]).To(ContainSubstring("yes | kbimg install disk"))
 		Expect(runner.calls[1]).To(ContainElement("/tmp/elemental/kubeos/kbimg.toml"))
 		Expect(runner.calls[2]).To(Equal([]string{"lsblk", "-rno", "LABEL", "/dev/sda"}))
-		Expect(runner.calls[5]).To(Equal([]string{"systemctl", "reboot"}))
+		Expect(runner.calls[6]).To(Equal([]string{"systemctl", "reboot"}))
 	})
 
 	It("fails before touching the disk when the image is unreachable", func() {
@@ -310,7 +321,42 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 		toml := readFile("/tmp/elemental/kubeos/kbimg.toml")
 		Expect(toml).NotTo(ContainSubstring("registries.conf.d"))
 		Expect(toml).NotTo(ContainSubstring("auth.json"))
-		Expect(strings.Count(toml, "[[install.configs]]")).To(Equal(8))
+		Expect(strings.Count(toml, "[[install.configs]]")).To(Equal(9))
+	})
+
+	It("copies every first-boot file into PERSIST so the other slot boots with it", func() {
+		Expect(inst.InstallKubeOS(config, stateFixture, networkConfigFixture)).To(Succeed())
+		var call []string
+		for _, c := range runner.calls {
+			if c[0] == "sh" && strings.Contains(c[2], "PERSIST") {
+				call = c
+			}
+		}
+		Expect(call).NotTo(BeNil())
+		Expect(call[3:5]).To(Equal([]string{"persist", "/dev/sda"}))
+		pairs := map[string]string{}
+		for j := 5; j+1 < len(call); j += 2 {
+			pairs[call[j+1]] = call[j]
+		}
+		Expect(pairs).To(HaveLen(11))
+		Expect(pairs).To(HaveKeyWithValue("etc/NetworkManager/system-connections/bond0.nmconnection", "/tmp/elemental/kubeos/files/nm-01-bond0.nmconnection"))
+		Expect(pairs).To(HaveKeyWithValue("etc/cloud/cloud.cfg.d/99-disable-network-config.cfg", "/tmp/elemental/kubeos/files/99-disable-network-config.cfg"))
+		Expect(pairs).To(HaveKeyWithValue("var/lib/elemental/agent/elemental_connection.json", "/tmp/elemental/kubeos/files/elemental_connection.json"))
+		Expect(pairs).To(HaveKeyWithValue("root/.config/containers/auth.json", "/tmp/elemental/kubeos/files/containers-auth.json"))
+	})
+
+	It("does not reboot when PERSIST cannot take the first-boot files", func() {
+		runner.results["persist"] = fakeResult{out: "PERSIST or ROOT-A not found on /dev/sda", err: errors.New("exit 1")}
+		err := inst.InstallKubeOS(config, stateFixture, networkConfigFixture)
+		Expect(err).To(MatchError(ContainSubstring("PERSIST")))
+		Expect(runner.called("systemctl")).To(BeFalse())
+	})
+
+	It("leaves cloud-init networking alone when no profiles were staged", func() {
+		Expect(inst.InstallKubeOS(config, stateFixture, elementalv1.NetworkConfig{})).To(Succeed())
+		toml := readFile("/tmp/elemental/kubeos/kbimg.toml")
+		Expect(toml).NotTo(ContainSubstring("99-disable-network-config.cfg"))
+		Expect(toml).NotTo(ContainSubstring("nmconnection"))
 	})
 
 	It("fails loudly on a template without the expected keys", func() {
@@ -345,3 +391,85 @@ var _ = Describe("rewriteKubeOSToml", func() {
 
 // Keep the vfs import used even if the FS helpers above change shape.
 var _ = vfs.OSFS
+
+// The persist script runs for real against scratch directories. lsblk and
+// mount are shims: "mounting" swaps the empty mountpoint for a symlink to the
+// directory standing in for the partition.
+var _ = Describe("kubeos persist script", Label("kubeos"), func() {
+	var dir, persist, slot, staged string
+	run := func(pairs ...string) (string, error) {
+		args := append([]string{"-c", kubeosPersistScript, "persist", "/dev/sda"}, pairs...)
+		cmd := exec.Command("sh", args...)
+		cmd.Env = append(os.Environ(), "PATH="+filepath.Join(dir, "bin")+":"+os.Getenv("PATH"))
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	BeforeEach(func() {
+		dir = GinkgoT().TempDir()
+		// The script closes directories the way ROOT-A has them; reopen them
+		// so the temp dir can be removed without root.
+		DeferCleanup(func() {
+			_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+				if err == nil && info.IsDir() {
+					_ = os.Chmod(p, 0o755)
+				}
+				return nil
+			})
+		})
+		persist, slot, staged = filepath.Join(dir, "persist"), filepath.Join(dir, "slot"), filepath.Join(dir, "staged")
+		for _, d := range []string{"bin", "persist/etc", "persist/var", "slot/etc/NetworkManager/system-connections", "slot/root", "staged"} {
+			Expect(os.MkdirAll(filepath.Join(dir, d), 0o755)).To(Succeed())
+		}
+		Expect(os.Chmod(filepath.Join(slot, "root"), 0o550)).To(Succeed())
+		Expect(os.Chmod(filepath.Join(slot, "etc/NetworkManager/system-connections"), 0o700)).To(Succeed())
+		shims := map[string]string{
+			"lsblk":  "#!/bin/sh\nprintf '/dev/sda1 BOOT\\n/dev/sda2 ROOT-A\\n/dev/sda3 ROOT-B\\n/dev/sda4 PERSIST\\n'\n",
+			"mount":  fmt.Sprintf("#!/bin/sh\n[ \"$1\" = -o ] && shift 2\ncase $1 in /dev/sda4) src=%s ;; /dev/sda2) src=%s ;; *) exit 1 ;; esac\nrmdir \"$2\" && ln -s \"$src\" \"$2\"\n", persist, slot),
+			"umount": "#!/bin/sh\n[ -L \"$1\" ] && rm \"$1\" && mkdir \"$1\"\n",
+		}
+		for name, body := range shims {
+			Expect(os.WriteFile(filepath.Join(dir, "bin", name), []byte(body), 0o755)).To(Succeed())
+		}
+		Expect(os.WriteFile(filepath.Join(staged, "nm"), []byte("[connection]\nid=eth0\n"), 0o600)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(staged, "auth"), []byte("{}"), 0o600)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(staged, "cfg"), []byte("network: {config: disabled}\n"), 0o644)).To(Succeed())
+	})
+
+	It("lands each file in the upperdir with its mode, and parents take ROOT-A's", func() {
+		out, err := run(
+			filepath.Join(staged, "nm"), "etc/NetworkManager/system-connections/eth0.nmconnection",
+			filepath.Join(staged, "cfg"), "etc/cloud/cloud.cfg.d/99-disable-network-config.cfg",
+			filepath.Join(staged, "auth"), "root/.config/containers/auth.json",
+		)
+		Expect(err).NotTo(HaveOccurred(), out)
+		Expect(out).To(ContainSubstring("/etc/NetworkManager/system-connections/eth0.nmconnection\n"))
+
+		mode := func(rel string) string {
+			info, err := os.Stat(filepath.Join(persist, rel))
+			ExpectWithOffset(1, err).NotTo(HaveOccurred(), rel)
+			return info.Mode().Perm().String()
+		}
+		Expect(mode("etc/NetworkManager/system-connections/eth0.nmconnection")).To(Equal("-rw-------"))
+		Expect(mode("etc/cloud/cloud.cfg.d/99-disable-network-config.cfg")).To(Equal("-rw-r--r--"))
+		Expect(mode("root/.config/containers/auth.json")).To(Equal("-rw-------"))
+		// Copied from ROOT-A where it exists there...
+		Expect(mode("etc/NetworkManager/system-connections")).To(Equal("-rwx------"))
+		Expect(mode("root")).To(Equal("-r-xr-x---"))
+		// ...and left to the umask where it does not.
+		Expect(filepath.Join(persist, "etc/cloud/cloud.cfg.d")).To(BeADirectory())
+		// Both mountpoints are unmounted and removed again.
+		Expect(out).NotTo(ContainSubstring("rmdir"))
+	})
+
+	It("fails when the disk has no PERSIST partition", func() {
+		Expect(os.WriteFile(filepath.Join(dir, "bin", "lsblk"), []byte("#!/bin/sh\necho '/dev/sda2 ROOT-A'\n"), 0o755)).To(Succeed())
+		out, err := run(filepath.Join(staged, "nm"), "etc/x.nmconnection")
+		Expect(err).To(HaveOccurred())
+		Expect(out).To(ContainSubstring("PERSIST or ROOT-A not found"))
+	})
+
+	It("fails when a copy fails instead of reporting success", func() {
+		out, err := run(filepath.Join(staged, "missing"), "etc/x.nmconnection")
+		Expect(err).To(HaveOccurred(), out)
+	})
+})
