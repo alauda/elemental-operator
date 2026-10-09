@@ -17,26 +17,16 @@ limitations under the License.
 package runtime
 
 import (
-	"os"
 	goruntime "runtime"
+	"testing"
 )
 
-type Info struct {
-	Hostname string `json:"hostname"`
-	// Architecture is the GOARCH the register binary was built for. The
-	// binary runs natively on the host, so this is the host architecture in
-	// Go/Kubernetes naming (amd64, arm64), not the uname -m spelling.
-	Architecture string `json:"architecture"`
-}
-
-func New() (*Info, error) {
-	name, err := os.Hostname()
+func TestNewReportsBinaryArchitecture(t *testing.T) {
+	info, err := New()
 	if err != nil {
-		return nil, err
+		t.Fatalf("New() error: %v", err)
 	}
-
-	return &Info{
-		Hostname:     name,
-		Architecture: goruntime.GOARCH,
-	}, nil
+	if info.Architecture != goruntime.GOARCH {
+		t.Fatalf("Architecture = %q, want GOARCH %q", info.Architecture, goruntime.GOARCH)
+	}
 }

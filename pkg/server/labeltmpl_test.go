@@ -39,6 +39,7 @@ var (
 		Spec: elementalv1.MachineRegistrationSpec{
 			MachineInventoryLabels: map[string]string{
 				"elemental.cattle.io/Hostname":               "${System Data/Runtime/Hostname}",
+				"elemental.cattle.io/Architecture":           "${System Data/Runtime/Architecture}",
 				"elemental.cattle.io/TotalMemory":            "${System Data/Memory/Total Physical Bytes}",
 				"elemental.cattle.io/AvailableMemory":        "${System Data/Memory/Total Usable Bytes}",
 				"elemental.cattle.io/CpuTotalCores":          "${System Data/CPU/Total Cores}",
@@ -62,6 +63,7 @@ var (
 		Spec: elementalv1.MachineRegistrationSpec{
 			MachineInventoryLabels: map[string]string{
 				"elemental.cattle.io/Hostname":               "${Runtime/Hostname}",
+				"elemental.cattle.io/Architecture":           "${Runtime/Architecture}",
 				"elemental.cattle.io/TotalMemory":            "${Memory/TotalPhysicalBytes}",
 				"elemental.cattle.io/AvailableMemory":        "${Memory/TotalUsableBytes}",
 				"elemental.cattle.io/CpuTotalCores":          "${CPU/TotalCores}",
@@ -126,7 +128,8 @@ var (
 			},
 		},
 		Runtime: &elementalruntime.Info{
-			Hostname: "machine-1",
+			Hostname:     "machine-1",
+			Architecture: "arm64",
 		},
 	}
 )
@@ -186,6 +189,7 @@ func TestUpdateInventoryFromHostinfoData(t *testing.T) {
 func assertSystemDataLabels(t *testing.T, inventory *elementalv1.MachineInventory) {
 	t.Helper()
 	assert.Equal(t, inventory.Labels["elemental.cattle.io/Hostname"], "machine-1")
+	assert.Equal(t, inventory.Labels["elemental.cattle.io/Architecture"], "arm64")
 	assert.Equal(t, inventory.Labels["elemental.cattle.io/TotalMemory"], "100")
 	assert.Equal(t, inventory.Labels["elemental.cattle.io/TotalMemory"], "100")
 	assert.Equal(t, inventory.Labels["elemental.cattle.io/CpuTotalCores"], "300")

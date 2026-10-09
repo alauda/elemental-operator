@@ -57,6 +57,9 @@ var (
 	observeInterval  time.Duration
 	configPath       string
 	statePath        string
+	// osInstaller selects the install backend: "toolkit" (elemental install)
+	// or "kubeos" (kbimg install disk). Registration is identical for both.
+	osInstaller string
 )
 
 var (
@@ -145,6 +148,11 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 					if err := installer.WriteLocalSystemAgentConfig(cfg.Elemental); err != nil {
 						return fmt.Errorf("installing local agent config %w", err)
 					}
+				} else if osInstaller == install.KubeOSInstaller {
+					log.Info("Installing KubeOS")
+					if err := installer.InstallKubeOS(cfg, registrationState, netCfg); err != nil {
+						return fmt.Errorf("installing kubeos: %w", err)
+					}
 				} else {
 					log.Info("Installing elemental")
 					if err := installer.InstallElemental(cfg, registrationState, netCfg); err != nil {
@@ -161,6 +169,8 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 			if reset {
 				if cfg.Elemental.Registration.NoToolkit {
 					log.Warning("Reset not supported for no-toolkit hosts")
+				} else if osInstaller == install.KubeOSInstaller {
+					log.Warning("Reset not supported for kubeos hosts; use kbosctl rollback or reinstall from the live ISO")
 				} else {
 					log.Info("Resetting Elemental")
 					if err := installer.ResetElemental(cfg, registrationState, netCfg); err != nil {
@@ -195,6 +205,7 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 	cmd.Flags().BoolVar(&resetNetwork, "reset-network", false, "Reset the machine network to the first boot state")
 	cmd.Flags().BoolVar(&installation, "install", false, "Install a new machine")
 	cmd.Flags().BoolVar(&cfg.Elemental.Registration.NoToolkit, "no-toolkit", false, "No OS management via elemental-toolkit, only Install agent config files to local filesystem (for pre-installed hosts)")
+	cmd.Flags().StringVar(&osInstaller, "installer", install.ToolkitInstaller, "Install backend: toolkit (elemental install) or kubeos (kbimg install disk)")
 	cmd.Flags().BoolVar(&disableBootEntry, "disable-boot-entry", false, "Don't create an EFI entry for the system during install/reset")
 	cmd.Flags().BoolVar(&observeStorage, "observe-storage", false, "Continuously report objective block-device state without updating MachineInventory spec")
 	cmd.Flags().DurationVar(&observeInterval, "observe-interval", time.Minute, "Storage observation interval")
@@ -217,6 +228,11 @@ func initConfig(fs vfs.FS) error {
 	log.Infof("Register version %s, commit %s, commit date %s", version.Version, version.Commit, version.CommitDate)
 	if installation && reset {
 		return errors.New("--install and --reset flags are mutually exclusive")
+	}
+	switch osInstaller {
+	case install.ToolkitInstaller, install.KubeOSInstaller:
+	default:
+		return fmt.Errorf("--installer must be %q or %q, got %q", install.ToolkitInstaller, install.KubeOSInstaller, osInstaller)
 	}
 	if debug {
 		log.EnableDebugLogging()
