@@ -173,6 +173,36 @@ var _ = Describe("installer install elemental", Label("installer", "install"), f
 		_, statErr := fs.Stat(filepath.Join(elementalcli.TempCloudInitDir, elementalBeforeHook))
 		Expect(statErr).To(MatchError(os.ErrNotExist))
 	})
+	Context("in a live environment with a stale system disk", func() {
+		BeforeEach(func() {
+			host.live = true
+			host.disk("sda").elementalLayout()
+		})
+		It("wipes the stale disk and the target before elemental install runs", func() {
+			config := configFixture
+			config.Elemental.Install.Device = "/dev/elemental-install-target"
+			config.Elemental.Install.NoFormat = false
+			want := config.Elemental.Install
+			want.Device = "/dev/sdb"
+			cliRunner.EXPECT().Install(want).DoAndReturn(func(elementalv1.Install) error {
+				commands := destructive(host.calls)
+				Expect(commands).To(ContainElements("blockdev --rereadpt /dev/sda", "blockdev --rereadpt /dev/sdb"))
+				Expect(commands[len(commands)-1]).To(Equal("udevadm settle"))
+				return nil
+			})
+			networkConfigurator.EXPECT().GetNetworkConfigApplicator(networkConfigFixture).Return(networkConfigApplicatorFixture, nil)
+			Expect(install.InstallElemental(config, stateFixture, networkConfigFixture)).To(Succeed())
+		})
+		It("installs nothing when the stale disk cannot be wiped", func() {
+			host.disk("sda").part("xfs", "DATA", "")
+			config := configFixture
+			config.Elemental.Install.Device = "/dev/sdb"
+			err := install.InstallElemental(config, stateFixture, networkConfigFixture)
+			Expect(err).To(MatchError(ContainSubstring("Blocked: stale system disks cannot be wiped safely")))
+			Expect(err).To(MatchError(ContainSubstring("partition /dev/sda6 (xfs, label DATA)")))
+			Expect(destructive(host.calls)).To(BeEmpty())
+		})
+	})
 })
 
 var _ = Describe("installer reset elemental", Label("installer", "reset"), func() {

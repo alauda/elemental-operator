@@ -38,9 +38,9 @@ import (
 // Before either backend writes anything, register turns what the
 // configuration names — a disk ID the operator released, a device path
 // (symlinks included), a device-selector, or nothing — into exactly one whole
-// disk, checks that it is safe to overwrite and hands the backend the disk's
-// kernel path (/dev/sdb). The toolkit CLI would resolve a symlink on its own;
-// kbimg would not: it matches
+// disk, checks that it is safe to overwrite, cleans stale system disks (see
+// stale.go) and hands the backend the disk's kernel path (/dev/sdb). The
+// toolkit CLI would resolve a symlink on its own; kbimg would not: it matches
 // the literal path against parted's output and derives partition nodes by
 // appending numbers to it. Disk facts come from the storage observer's lsblk
 // collector, so a disk has the same ID here, in the observer and on the
@@ -67,20 +67,24 @@ const (
 )
 
 // Reasons the pre-install step stops. They are named after the conditions
-// the operator will report (InstallTargetReady); TargetAmbiguous has no
-// condition counterpart yet.
+// the operator will report (InstallTargetReady and StaleSystemDisks);
+// TargetAmbiguous has no condition counterpart yet.
 const (
 	reasonTargetNotObserved = "TargetNotObserved"
 	reasonTargetIneligible  = "TargetIneligible"
 	reasonTargetAmbiguous   = "TargetAmbiguous"
 	reasonTargetMismatch    = "TargetMismatch"
+	reasonBlocked           = "Blocked"
+	reasonWipeFailed        = "WipeFailed"
 )
 
-// installDiskError is a failure of the pre-install step. No disk has been
-// written when it is returned.
+// installDiskError is a failure of the pre-install step. Unless Reason is
+// WipeFailed, no disk has been written when it is returned.
 type installDiskError struct {
 	Reason  string
 	Message string
+	// Stale is the stale system disk report when the failure concerns them.
+	Stale *staleDiskReport
 }
 
 func (e *installDiskError) Error() string {
@@ -925,11 +929,14 @@ func containsString(values []string, want string) bool {
 type diskPlan struct {
 	request installRequest
 	target  *installTarget
+	survey  *diskSurvey
+	// wipeTarget is set when the target is wiped along with the stale disks.
+	wipeTarget bool
 }
 
-// prepareInstallDisks resolves the install target and applies the gates,
-// without writing anything. On success config.Elemental.Install.Device is the
-// target's kernel path.
+// prepareInstallDisks resolves the install target, applies the gates and
+// decides which disks get wiped, without writing anything. On success
+// config.Elemental.Install.Device is the target's kernel path.
 func (i *installer) prepareInstallDisks(config *elementalv1.Config, backend string) (*diskPlan, error) {
 	request := newInstallRequest(*config)
 	request.warnConflicts()
@@ -946,18 +953,49 @@ func (i *installer) prepareInstallDisks(config *elementalv1.Config, backend stri
 			return nil, diskErrorf(reasonTargetIneligible, "%s", problem)
 		}
 	}
+	survey := i.inspectInstallDisks(inv, target.disk.path, request.wipeIDs())
+	logDiskSurvey(survey)
+	plan := &diskPlan{request: request, target: target, survey: survey}
+	if survey.Cleanup {
+		if blocked := survey.Stale.withAction(staleDiskBlocked); len(blocked) > 0 {
+			lines := make([]string, 0, len(blocked))
+			for _, disk := range blocked {
+				lines = append(lines, fmt.Sprintf("%s (%s): %s", disk.ID, disk.Path, disk.Reason))
+			}
+			return nil, &installDiskError{
+				Reason:  reasonBlocked,
+				Message: "stale system disks cannot be wiped safely; clean them by hand or remove them, then restart the install: " + strings.Join(lines, "; "),
+				Stale:   survey.Stale,
+			}
+		}
+		plan.wipeTarget = !config.Elemental.Install.NoFormat
+	}
 	config.Elemental.Install.Device = target.disk.path
 	log.Infof("install target: requested=%s chain=%s id=%s size=%d", target.requested, strings.Join(target.chain, "->"), target.disk.displayID(), target.disk.sizeBytes)
-	return &diskPlan{request: request, target: target}, nil
+	return plan, nil
 }
 
-// finalizeInstallDisks runs right before the backend writes the target: it
-// resolves the target again and refuses to go on if it is no longer the same
-// disk.
+// finalizeInstallDisks runs right before the backend writes the target. In a
+// live environment it wipes the stale system disks and the target and checks
+// the wipe took; in any case it resolves the target again and refuses to go
+// on if it is no longer the same disk.
 func (i *installer) finalizeInstallDisks(plan *diskPlan) error {
-	inv, err := i.collectDiskInventory()
+	wiped, err := i.wipeInstallDisks(plan)
 	if err != nil {
 		return err
+	}
+	inv, err := i.collectDiskInventory()
+	if err != nil {
+		if len(wiped) > 0 {
+			return &installDiskError{Reason: reasonWipeFailed, Message: err.Error(), Stale: plan.survey.Stale}
+		}
+		return err
+	}
+	if len(wiped) > 0 {
+		if err := verifyWipe(inv, plan.target.disk.path, wiped); err != nil {
+			err.Stale = plan.survey.Stale
+			return err
+		}
 	}
 	again, err := i.resolveInstallTarget(inv, plan.request)
 	if err != nil {

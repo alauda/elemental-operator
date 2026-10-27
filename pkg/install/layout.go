@@ -29,8 +29,9 @@ import (
 //
 // A disk that once held Elemental or KubeOS carries that layout's filesystem
 // labels and GPT partition names; whatever else is on a disk is someone's
-// data. Automatic target selection skips disks with data; an old layout is
-// not data.
+// data. Automatic target selection skips disks with data (an old layout is
+// not data), and the stale disk cleanup (stale.go) only wipes disks that hold
+// nothing but an old layout.
 
 // elementalLabelPattern matches the filesystem labels elemental-toolkit gives
 // its partitions, and the OLD_ prefix the manual procedure used to rename

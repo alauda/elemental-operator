@@ -436,6 +436,51 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 		Expect(err).To(MatchError(ContainSubstring("resolved to /dev/sda (8:0, wwn:5000c500000000a1) and now to /dev/nvme0n1")))
 		Expect(runner.called("kbimg")).To(BeFalse())
 	})
+
+	Context("in a live environment with a stale system disk", func() {
+		BeforeEach(func() {
+			host.live = true
+			host.disk("nvme0n1").kubeosLayout()
+			Expect(vfst.NewBuilder().Build(fs, host.files())).To(Succeed())
+		})
+
+		It("wipes only after the image preflight and before kbimg", func() {
+			Expect(inst.InstallKubeOS(config, stateFixture, networkConfigFixture)).To(Succeed())
+			var order []string
+			for _, c := range backendCalls(runner.calls) {
+				switch {
+				case c[0] == "sh" && strings.Contains(c[2], "kbimg install"):
+					order = append(order, "kbimg")
+				case c[0] == "skopeo":
+					order = append(order, "skopeo")
+				case c[0] == "udevadm", c[0] == "blockdev":
+					order = append(order, strings.Join(c, " "))
+				}
+			}
+			Expect(order).To(Equal([]string{
+				"skopeo", "blockdev --rereadpt /dev/nvme0n1", "blockdev --rereadpt /dev/sda",
+				"udevadm trigger --subsystem-match=block", "udevadm settle", "kbimg",
+			}))
+			Expect(destructive(runner.calls)).To(ContainElements(
+				"wipefs --all --force /dev/nvme0n1p1", "wipefs --all --force /dev/nvme0n1p4",
+				"blockdev --rereadpt /dev/nvme0n1", "blockdev --rereadpt /dev/sda"))
+		})
+
+		It("wipes nothing when the image is unreachable", func() {
+			runner.results["skopeo"] = fakeResult{out: "unauthorized", err: errors.New("exit 1")}
+			err := inst.InstallKubeOS(config, stateFixture, networkConfigFixture)
+			Expect(err).To(MatchError(ContainSubstring("not reachable")))
+			Expect(destructive(runner.calls)).To(BeEmpty())
+		})
+
+		It("installs nothing when a stale disk is in use", func() {
+			host.disk("nvme0n1").partitions[3].mounts = []string{"/persist"}
+			err := inst.InstallKubeOS(config, stateFixture, networkConfigFixture)
+			Expect(err).To(MatchError(ContainSubstring("Blocked")))
+			Expect(err).To(MatchError(ContainSubstring("/dev/nvme0n1p4 is mounted on /persist")))
+			Expect(backendCalls(runner.calls)).To(BeEmpty())
+		})
+	})
 })
 
 var _ = Describe("kubeos image reference", func() {
