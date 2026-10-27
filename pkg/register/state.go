@@ -44,6 +44,27 @@ type State struct {
 	// EmulatedTPMSeedSalt is the salt the v2 seed was derived with; absent
 	// means 0.
 	EmulatedTPMSeedSalt uint32 `yaml:"emulatedTPMSeedSalt,omitempty"`
+	// TPMMode is the TPM the identity is bound to, "hardware" or "emulated".
+	// It is resolved once, at the first registration, and from then on
+	// neither probed again nor taken from the config. EmulatedTPM keeps
+	// mirroring it for older elemental-register binaries.
+	TPMMode string `yaml:"tpmMode,omitempty"`
+	// TPMModeSource tells where TPMMode came from: one of the
+	// TPMModeSource* constants.
+	TPMModeSource string `yaml:"tpmModeSource,omitempty"`
+	// TPMProbe is the hardware TPM check that decided TPMMode, when there
+	// was one.
+	TPMProbe *TPMProbe `yaml:"tpmProbe,omitempty"`
+}
+
+// TPMProbe records the hardware TPM check of the first registration.
+type TPMProbe struct {
+	// Result is TPMProbePassed or TPMProbeFailed.
+	Result string `yaml:"result,omitempty"`
+	// Reason says why the hardware TPM was not usable.
+	Reason string `yaml:"reason,omitempty"`
+	// At is when the check ran.
+	At time.Time `yaml:"at,omitempty"`
 }
 
 func (s *State) IsUpdatable() bool {

@@ -65,7 +65,7 @@ func NewClient() Client {
 // Register attempts to register the machine with the elemental-operator.
 // Registration updates will fetch and apply new labels, and update Machine annotations such as the IP address.
 func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *State) ([]byte, error) {
-	auth, err := getAuthenticator(reg, state)
+	auth, tpmID, err := newAuthenticator(reg, state)
 	if err != nil {
 		return nil, fmt.Errorf("initializing authenticator: %w", err)
 	}
@@ -114,7 +114,7 @@ func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *St
 
 	if protoVersion >= MsgAnnotations {
 		log.Info("Send elemental annotations")
-		if err := sendAnnotations(conn, reg); err != nil {
+		if err := sendAnnotations(conn, reg, state, tpmID); err != nil {
 			return nil, fmt.Errorf("failed to send dynamic data: %w", err)
 		}
 	}
@@ -221,34 +221,38 @@ func refreshObserverDeadline(conn *websocket.Conn, interval time.Duration) {
 }
 
 func getAuthenticator(reg elementalv1.Registration, state *State) (authClient, error) {
+	auth, _, err := newAuthenticator(reg, state)
+	return auth, err
+}
+
+// newAuthenticator also returns, for auth "tpm", how the TPM identity was
+// resolved; the TPM mode is recorded in the state.
+func newAuthenticator(reg elementalv1.Registration, state *State) (authClient, *tpmIdentity, error) {
 	var auth authClient
+	var tpmID *tpmIdentity
 	switch reg.Auth {
 	case "tpm":
-		if reg.EmulateTPM {
-			seed, err := tpm.GetTPMSeed(reg, state.EmulatedTPM, state.EmulatedTPMSeed, state.EmulatedTPMSeedSalt)
-			if err != nil {
-				return nil, fmt.Errorf("choosing the emulated TPM seed: %w", err)
-			}
-			state.EmulatedTPMSeed = seed.Value
-			if seed.Version != 0 {
-				state.EmulatedTPMSeedVersion = seed.Version
-				state.EmulatedTPMSeedSalt = seed.Salt
-			}
+		id, err := resolveTPMIdentity(reg, state)
+		if err != nil {
+			return nil, nil, err
 		}
-		state.EmulatedTPM = reg.EmulateTPM
+		tpmID = &id
+		// The resolved mode, not the config, decides about emulation.
+		reg.EmulateTPM = id.mode == elementalv1.TPMModeEmulated
 		auth = tpm.NewAuthClient(state.EmulatedTPMSeed)
-	case "mac":
-		auth = &plainauth.AuthClient{}
-	case "sys-uuid":
+	case "mac", "sys-uuid":
+		if reg.TPMMode != "" {
+			log.Warningf("Ignoring tpm-mode %q: it only applies to auth tpm, not %s", reg.TPMMode, reg.Auth)
+		}
 		auth = &plainauth.AuthClient{}
 	default:
-		return nil, fmt.Errorf("unsupported authentication: %s", reg.Auth)
+		return nil, nil, fmt.Errorf("unsupported authentication: %s", reg.Auth)
 	}
 
 	if err := auth.Init(reg); err != nil {
-		return nil, fmt.Errorf("init %s authentication: %w", auth.GetName(), err)
+		return nil, nil, fmt.Errorf("init %s authentication: %w", auth.GetName(), err)
 	}
-	return auth, nil
+	return auth, tpmID, nil
 }
 
 func initWebsocketConn(url string, caCert []byte, auth authClient) (*websocket.Conn, error) {
@@ -389,16 +393,9 @@ func sendSystemData(conn *websocket.Conn, protoVersion MessageType) error {
 	return nil
 }
 
-func sendAnnotations(conn *websocket.Conn, reg elementalv1.Registration) error {
-	data := map[string]string{
-		"reg-version": version.Version,
-	}
-
-	if reg.EmulateTPM {
-		data["auth"] = "emulated-tpm"
-	} else {
-		data["auth"] = reg.Auth
-	}
+func sendAnnotations(conn *websocket.Conn, reg elementalv1.Registration, state *State, tpmID *tpmIdentity) error {
+	data := registrationAnnotations(reg, state, tpmID)
+	data["reg-version"] = version.Version
 	if reg.NoToolkit {
 		data["os.unmanaged"] = "true"
 	}

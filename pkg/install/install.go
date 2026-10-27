@@ -255,8 +255,8 @@ func (i *installer) writeHookConfigurator(stage string, oemMount string, config 
 		stage: {},
 	}
 
-	// Registration
-	registrationYipBytes, err := i.registrationConfigYip(config.Elemental.Registration)
+	// Registration, with the TPM mode this host resolved
+	registrationYipBytes, err := i.registrationConfigYip(register.InstalledRegistration(config.Elemental.Registration, state))
 	if err != nil {
 		return fmt.Errorf("getting registration config yip: %w", err)
 	}

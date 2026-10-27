@@ -195,6 +195,8 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 	// registered already keep the seed recorded in their state.
 	cmd.Flags().Int64Var(&cfg.Elemental.Registration.EmulatedTPMSeed, "emulated-tpm-seed", elementalv1.TPMRandomSeedValue, "Seed for /dev/tpm emulation (-1: derive from the hardware identity)")
 	_ = viper.BindPFlag("elemental.registration.emulated-tpm-seed", cmd.Flags().Lookup("emulated-tpm-seed"))
+	cmd.Flags().StringVar(&cfg.Elemental.Registration.TPMMode, "tpm-mode", "", "TPM for --auth tpm: hardware, emulated or auto (probe once, then keep the result); empty follows --emulate-tpm")
+	_ = viper.BindPFlag("elemental.registration.tpm-mode", cmd.Flags().Lookup("tpm-mode"))
 	cmd.Flags().BoolVar(&cfg.Elemental.Registration.NoSMBIOS, "no-smbios", false, "Disable the use of dmidecode to get SMBIOS")
 	_ = viper.BindPFlag("elemental.registration.no-smbios", cmd.Flags().Lookup("no-smbios"))
 	cmd.Flags().StringVar(&cfg.Elemental.Registration.Auth, "auth", "tpm", "Registration authentication method")
