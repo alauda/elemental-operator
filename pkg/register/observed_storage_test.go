@@ -439,7 +439,7 @@ func TestObservedStorageLSBLKArgsRemainUtilLinux237Compatible(t *testing.T) {
 			}
 		}
 	}
-	for _, required := range []string{"KNAME", "PARTUUID", "PKNAME", "LOG-SEC"} {
+	for _, required := range []string{"KNAME", "PARTUUID", "PARTLABEL", "PKNAME", "LOG-SEC"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("lsblk columns do not include %s: %s", required, joined)
 		}
