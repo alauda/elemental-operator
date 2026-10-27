@@ -93,6 +93,11 @@ type Reset struct {
 	DisableBootEntry bool `json:"disable-boot-entry,omitempty" yaml:"disable-boot-entry,omitempty"`
 }
 
+// Registration is the registration section of a MachineRegistration. A
+// tpm-mode that contradicts emulate-tpm is rejected at admission; the
+// MachineRegistration controller reports InvalidTPMConfig as well for
+// objects that bypassed it.
+// +kubebuilder:validation:XValidation:rule="!(has(self.tpm__dash__mode) && self.tpm__dash__mode in ['hardware', 'auto'] && has(self.emulate__dash__tpm) && self.emulate__dash__tpm && (!has(self.auth) || self.auth == 'tpm'))",message="tpm-mode hardware or auto cannot be combined with emulate-tpm: true"
 type Registration struct {
 	// +optional
 	URL string `json:"url,omitempty" yaml:"url,omitempty" mapstructure:"url"`
