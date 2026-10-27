@@ -224,7 +224,17 @@ func getAuthenticator(reg elementalv1.Registration, state *State) (authClient, e
 	var auth authClient
 	switch reg.Auth {
 	case "tpm":
-		state.EmulatedTPMSeed = tpm.GetTPMSeed(reg, state.EmulatedTPM, state.EmulatedTPMSeed)
+		if reg.EmulateTPM {
+			seed, err := tpm.GetTPMSeed(reg, state.EmulatedTPM, state.EmulatedTPMSeed, state.EmulatedTPMSeedSalt)
+			if err != nil {
+				return nil, fmt.Errorf("choosing the emulated TPM seed: %w", err)
+			}
+			state.EmulatedTPMSeed = seed.Value
+			if seed.Version != 0 {
+				state.EmulatedTPMSeedVersion = seed.Version
+				state.EmulatedTPMSeedSalt = seed.Salt
+			}
+		}
 		state.EmulatedTPM = reg.EmulateTPM
 		auth = tpm.NewAuthClient(state.EmulatedTPMSeed)
 	case "mac":

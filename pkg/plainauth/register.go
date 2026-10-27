@@ -101,6 +101,13 @@ func (auth *AuthClient) Authenticate(_ *websocket.Conn) error {
 	return nil
 }
 
+// HostMACAddress returns the MAC address auth "mac" identifies the host by:
+// the lowest MAC among the physical NICs. The emulated TPM seed falls back to
+// the same value when the SMBIOS identifiers are unusable.
+func HostMACAddress() (string, error) {
+	return getHostMacAddr()
+}
+
 func getHostMacAddr() (string, error) {
 	netInfo, err := ghw.Network(ghw.WithDisableWarnings())
 	if err != nil {
