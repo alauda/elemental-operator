@@ -572,6 +572,11 @@ func (i *installer) resolveInstallTarget(inv *diskInventory, req installRequest)
 	if len(target.disk.problems) > 0 {
 		return nil, diskErrorf(reasonTargetIneligible, "%s cannot be the install target: %s", target.disk.describe(), strings.Join(target.disk.problems, "; "))
 	}
+	// Automatic selection never picks a disk with data, so this is a disk a
+	// person or the operator named explicitly: allowed, but on the record.
+	if len(target.disk.data) > 0 {
+		log.Warningf("install target %s carries %s; it was named explicitly and will be overwritten", target.disk.path, strings.Join(target.disk.data, ", "))
+	}
 	return target, nil
 }
 
@@ -620,8 +625,7 @@ func sameWWN(a, b string) bool {
 	return register.NormalizeDeviceID("wwn:"+a) == register.NormalizeDeviceID("wwn:"+b)
 }
 
-// targetByPath resolves install.device. Any device a person names explicitly
-// may carry data; it is logged and overwritten.
+// targetByPath resolves install.device.
 func (i *installer) targetByPath(inv *diskInventory, device string) (*installTarget, error) {
 	resolved, chain, err := resolveLinks(i.fs, device)
 	if err != nil {
@@ -649,9 +653,6 @@ func (i *installer) targetByPath(inv *diskInventory, device string) (*installTar
 	}
 	if majMin := node.String(); d.majMin != "" && d.majMin != majMin {
 		return nil, diskErrorf(reasonTargetMismatch, "install.device %s: the device node is %s but sysfs says %s is %s", strings.Join(chain, " -> "), majMin, kname, d.majMin)
-	}
-	if len(d.data) > 0 && len(d.problems) == 0 {
-		log.Warningf("install target %s carries %s; it was named explicitly and will be overwritten", d.path, strings.Join(d.data, ", "))
 	}
 	return &installTarget{requested: device, chain: chain, disk: d}, nil
 }
