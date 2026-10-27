@@ -288,6 +288,7 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 				return err
 			}
 			sess.applyIdentityAnnotations(inventory)
+			setRegistrationIPLabel(inventory)
 			return i.handleGet(conn, protoVersion, inventory, registration, sess.afterCommit)
 		case register.MsgUpdate:
 			err = i.handleUpdate(conn, protoVersion, inventory)
