@@ -52,9 +52,12 @@ const (
 	IdentityConflictAnnotation = "elemental.cattle.io/identity-conflict"
 	// AllowIdentityRebindAnnotation, set to "true" by an operator, lets the
 	// next registration of this inventory's hardware move the identity: a
-	// hardware TPM inventory may then be rebound to a new TPM hash, and a
-	// fingerprint mismatch (for example after a mainboard swap) is accepted.
-	// The server removes the annotation once it has been used.
+	// hardware TPM inventory (or one in identity conflict) may then be
+	// rebound to a new hash, and a fingerprint mismatch on the current hash
+	// (for example after a mainboard swap) is accepted. Either way the
+	// identity-conflict annotation is cleared. The server removes this
+	// annotation once it has been used; a registration that needs no rebind
+	// leaves it in place.
 	AllowIdentityRebindAnnotation = "elemental.cattle.io/allow-identity-rebind"
 	// MachineInventoryAuthAnnotation is the authentication elemental-register
 	// reports it used: tpm, emulated-tpm, sys-uuid or mac.
