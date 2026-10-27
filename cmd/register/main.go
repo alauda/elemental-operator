@@ -117,8 +117,16 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 			if observeStorage {
 				return register.ObserveStorage(cfg.Elemental.Registration, caCert, &registrationState, observeInterval)
 			}
-			// Register (and fetch the remote MachineRegistration)
-			data, err := client.Register(cfg.Elemental.Registration, caCert, &registrationState)
+			// Register (and fetch the remote MachineRegistration). Installing
+			// from the live ISO waits until the operator releases the host.
+			var data []byte
+			var live *liveInstall
+			if installation && !cfg.Elemental.Registration.NoToolkit {
+				live = newLiveInstall(fs, client, cfg.Elemental.Registration, caCert)
+				data, err = live.registerUntilReleased(stateHandler, installer, &registrationState)
+			} else {
+				data, err = client.Register(cfg.Elemental.Registration, caCert, &registrationState)
+			}
 			if err != nil {
 				return fmt.Errorf("registering machine: %w", err)
 			}
@@ -145,11 +153,13 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 				} else if osInstaller == install.KubeOSInstaller {
 					log.Info("Installing KubeOS")
 					if err := installer.InstallKubeOS(cfg, registrationState, netCfg); err != nil {
+						live.reportFailure(&registrationState, cfg.Elemental.InstallTarget, err)
 						return fmt.Errorf("installing kubeos: %w", err)
 					}
 				} else {
 					log.Info("Installing elemental")
 					if err := installer.InstallElemental(cfg, registrationState, netCfg); err != nil {
+						live.reportFailure(&registrationState, cfg.Elemental.InstallTarget, err)
 						return fmt.Errorf("installing elemental: %w", err)
 					}
 				}
