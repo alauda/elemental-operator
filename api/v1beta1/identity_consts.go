@@ -50,14 +50,17 @@ const (
 	// The value describes the conflict. The MachineInventory controller keeps
 	// the inventory Ready=False/IdentityConflict until an operator removes it.
 	IdentityConflictAnnotation = "elemental.cattle.io/identity-conflict"
-	// AllowIdentityRebindAnnotation, set to "true" by an operator, lets the
-	// next registration of this inventory's hardware move the identity: a
-	// hardware TPM inventory (or one in identity conflict) may then be
-	// rebound to a new hash, and a fingerprint mismatch on the current hash
-	// (for example after a mainboard swap) is accepted. Either way the
-	// identity-conflict annotation is cleared. The server removes this
-	// annotation once it has been used; a registration that needs no rebind
-	// leaves it in place.
+	// AllowIdentityRebindAnnotation, set by an operator, lets a registration
+	// move this inventory's identity: a hardware TPM inventory (or one in
+	// identity conflict) may then be rebound to a new hash, and a fingerprint
+	// mismatch on the current hash (for example after a mainboard swap) is
+	// accepted; either way the identity-conflict annotation is cleared. The
+	// value "true" allows whichever hardware registers next; a system UUID,
+	// serial number or hardware fingerprint allows only that hardware, which
+	// settles which of two colliding hosts keeps the inventory. A host
+	// registering a freshly derived emulated identity never uses it. The
+	// server removes the annotation once it has been used; a registration
+	// that needs no rebind leaves it in place.
 	AllowIdentityRebindAnnotation = "elemental.cattle.io/allow-identity-rebind"
 	// MachineInventoryAuthAnnotation is the authentication elemental-register
 	// reports it used: tpm, emulated-tpm, sys-uuid or mac.
