@@ -62,14 +62,74 @@ func NewClient() Client {
 	return &client{}
 }
 
+// MaxSeedSaltRetries bounds how often a new emulated TPM identity is derived
+// again with the next salt after the server reported an identity conflict.
+const MaxSeedSaltRetries = 8
+
+// RegistrationError is an error the registration server reported in a
+// MsgError reply.
+type RegistrationError struct {
+	// Code is one of the ErrorCode constants, empty from older servers.
+	Code    string
+	Message string
+}
+
+func (e *RegistrationError) Error() string {
+	return e.Message
+}
+
 // Register attempts to register the machine with the elemental-operator.
 // Registration updates will fetch and apply new labels, and update Machine annotations such as the IP address.
 func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *State) ([]byte, error) {
+	return registerWithSaltRetries(state, func() ([]byte, *tpmIdentity, error) {
+		return r.register(reg, caCert, state)
+	})
+}
+
+// registerWithSaltRetries answers an identity conflict on the first
+// registration of an emulated TPM identity derived with seed v2 by deriving
+// the seed again with the next salt, at most MaxSeedSaltRetries times. The
+// state the caller saves after a success keeps the salt that worked. Static
+// seeds, inherited seeds, hardware TPMs and registered hosts never retry:
+// their identity is what it is, the server marks the conflict for an
+// operator.
+func registerWithSaltRetries(state *State, attempt func() ([]byte, *tpmIdentity, error)) ([]byte, error) {
+	loaded := *state
+	for retry := 0; ; retry++ {
+		data, tpmID, err := attempt()
+		if err == nil {
+			return data, nil
+		}
+		var regErr *RegistrationError
+		if !errors.As(err, &regErr) || regErr.Code != ErrorCodeIdentityConflict || tpmID == nil || !tpmID.saltRetry {
+			return nil, err
+		}
+		if retry == MaxSeedSaltRetries {
+			return nil, fmt.Errorf("identity still in conflict after %d seed salts, giving up: %w", retry+1, err)
+		}
+		// Start again from the state as loaded, keeping only the TPM mode
+		// decision (no second probe) and moving to the next salt.
+		next := loaded
+		next.TPMMode, next.TPMModeSource, next.TPMProbe = state.TPMMode, state.TPMModeSource, state.TPMProbe
+		next.EmulatedTPMSeedSalt = state.EmulatedTPMSeedSalt + 1
+		log.Warningf("Identity conflict with emulated TPM seed salt %d: %v; deriving the seed again with salt %d",
+			state.EmulatedTPMSeedSalt, err, next.EmulatedTPMSeedSalt)
+		*state = next
+	}
+}
+
+// register is one registration attempt. It also returns how the TPM
+// identity was resolved, which decides about retrying.
+func (r *client) register(reg elementalv1.Registration, caCert []byte, state *State) ([]byte, *tpmIdentity, error) {
 	auth, tpmID, err := newAuthenticator(reg, state)
 	if err != nil {
-		return nil, fmt.Errorf("initializing authenticator: %w", err)
+		return nil, nil, fmt.Errorf("initializing authenticator: %w", err)
 	}
+	data, err := r.registerWith(reg, caCert, state, auth, tpmID)
+	return data, tpmID, err
+}
 
+func (r *client) registerWith(reg elementalv1.Registration, caCert []byte, state *State, auth authClient, tpmID *tpmIdentity) ([]byte, error) {
 	log.Infof("Connect to %s", reg.URL)
 
 	conn, err := initWebsocketConn(reg.URL, caCert, auth)
@@ -504,7 +564,7 @@ func getConfig(conn *websocket.Conn) ([]byte, error) {
 		if err = yaml.Unmarshal(data, &msg); err != nil {
 			return nil, fmt.Errorf("unmarshalling error message: %w", err)
 		}
-		return nil, errors.New(msg.Message)
+		return nil, &RegistrationError{Code: msg.Code, Message: msg.Message}
 	case MsgConfig:
 		return data, nil
 	default:
