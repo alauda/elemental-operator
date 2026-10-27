@@ -136,6 +136,45 @@ type Elemental struct {
 	Registration Registration `json:"registration,omitempty" yaml:"registration,omitempty"`
 	// +optional
 	SystemAgent SystemAgent `json:"system-agent,omitempty" yaml:"system-agent,omitempty"`
+	// InstallTarget pins the disk of one install. The operator sets it in the
+	// configuration it returns to a host it released for installation; it is
+	// not taken from MachineRegistration.
+	// +optional
+	InstallTarget *InstallTarget `json:"install-target,omitempty" yaml:"install-target,omitempty"`
+}
+
+// InstallTarget names the disk an install must use by its canonical ID, as
+// elemental-register reports it, and the stale system disks the operator
+// approved for wiping.
+type InstallTarget struct {
+	// DeviceID is the canonical ID of the target disk: wwn:…, nvme-eui:…,
+	// nvme-nguid:… or serial:…. It takes precedence over install.device and
+	// install.device-selector.
+	// +optional
+	DeviceID string `json:"device-id,omitempty" yaml:"device-id,omitempty"`
+	// Expect lists properties the target must still have; empty fields are
+	// not checked.
+	// +optional
+	Expect InstallTargetExpect `json:"expect,omitempty" yaml:"expect,omitempty"`
+	// WipeDeviceIDs lists the stale system disks the operator approved for
+	// wiping. Unset (null) keeps the default of wiping every stale system disk
+	// found. Set, even to an empty list, only the listed disks are wiped and
+	// any other stale system disk stops the install. It is a pointer so an
+	// empty list survives the YAML round trip to the host.
+	// +optional
+	WipeDeviceIDs *[]string `json:"wipe-device-ids,omitempty" yaml:"wipe-device-ids,omitempty"`
+}
+
+// InstallTargetExpect are the properties the operator saw on the target disk.
+type InstallTargetExpect struct {
+	// +optional
+	SizeBytes int64 `json:"size-bytes,omitempty" yaml:"size-bytes,omitempty"`
+	// +optional
+	WWN string `json:"wwn,omitempty" yaml:"wwn,omitempty"`
+	// +optional
+	Serial string `json:"serial,omitempty" yaml:"serial,omitempty"`
+	// +optional
+	Model string `json:"model,omitempty" yaml:"model,omitempty"`
 }
 
 type Config struct {
@@ -151,10 +190,14 @@ type Config struct {
 
 type DeviceSelector []DeviceSelectorRequirement
 
+// DeviceSelectorRequirement narrows the install candidates. All requirements
+// of a selector must hold, and exactly one disk must remain. Name, ID, WWN,
+// Serial, Model and Transport take In or NotIn; Rotational takes In with
+// "true" or "false"; Size takes Gt or Lt with a quantity.
 type DeviceSelectorRequirement struct {
 	// +required
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=Name;Size
+	// +kubebuilder:validation:Enum=Name;Size;ID;WWN;Serial;Model;Transport;Rotational
 	Key DeviceSelectorKey `json:"key"`
 	// +required
 	// +kubebuilder:validation:Required
@@ -175,6 +218,18 @@ const (
 
 	DeviceSelectorKeyName DeviceSelectorKey = "Name"
 	DeviceSelectorKeySize DeviceSelectorKey = "Size"
+	// DeviceSelectorKeyID matches the canonical device ID (wwn:…, nvme-eui:…).
+	DeviceSelectorKeyID DeviceSelectorKey = "ID"
+	// DeviceSelectorKeyWWN matches the WWN lsblk reports, with or without 0x.
+	DeviceSelectorKeyWWN DeviceSelectorKey = "WWN"
+	// DeviceSelectorKeySerial matches the serial number lsblk reports.
+	DeviceSelectorKeySerial DeviceSelectorKey = "Serial"
+	// DeviceSelectorKeyModel matches the model lsblk reports, ignoring case.
+	DeviceSelectorKeyModel DeviceSelectorKey = "Model"
+	// DeviceSelectorKeyTransport matches the lsblk transport: sata, sas, nvme, usb, ...
+	DeviceSelectorKeyTransport DeviceSelectorKey = "Transport"
+	// DeviceSelectorKeyRotational matches "true" for spinning disks, "false" otherwise.
+	DeviceSelectorKeyRotational DeviceSelectorKey = "Rotational"
 )
 
 // NetworkTemplate contains a map of IPAddressPools and a schemaless network config template.

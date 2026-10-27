@@ -59,11 +59,22 @@ spec:
                             type: string
                           device-selector:
                             items:
+                              description: |-
+                                DeviceSelectorRequirement narrows the install candidates. All requirements
+                                of a selector must hold, and exactly one disk must remain. Name, ID, WWN,
+                                Serial, Model and Transport take In or NotIn; Rotational takes In with
+                                "true" or "false"; Size takes Gt or Lt with a quantity.
                               properties:
                                 key:
                                   enum:
                                   - Name
                                   - Size
+                                  - ID
+                                  - WWN
+                                  - Serial
+                                  - Model
+                                  - Transport
+                                  - Rotational
                                   type: string
                                 operator:
                                   enum:
@@ -117,6 +128,44 @@ spec:
                             type: string
                           tty:
                             type: string
+                        type: object
+                      install-target:
+                        description: |-
+                          InstallTarget pins the disk of one install. The operator sets it in the
+                          configuration it returns to a host it released for installation; it is
+                          not taken from MachineRegistration.
+                        properties:
+                          device-id:
+                            description: |-
+                              DeviceID is the canonical ID of the target disk: wwn:…, nvme-eui:…,
+                              nvme-nguid:… or serial:…. It takes precedence over install.device and
+                              install.device-selector.
+                            type: string
+                          expect:
+                            description: |-
+                              Expect lists properties the target must still have; empty fields are
+                              not checked.
+                            properties:
+                              model:
+                                type: string
+                              serial:
+                                type: string
+                              size-bytes:
+                                format: int64
+                                type: integer
+                              wwn:
+                                type: string
+                            type: object
+                          wipe-device-ids:
+                            description: |-
+                              WipeDeviceIDs lists the stale system disks the operator approved for
+                              wiping. Unset (null) keeps the default of wiping every stale system disk
+                              found. Set, even to an empty list, only the listed disks are wiped and
+                              any other stale system disk stops the install. It is a pointer so an
+                              empty list survives the YAML round trip to the host.
+                            items:
+                              type: string
+                            type: array
                         type: object
                       registration:
                         properties:
