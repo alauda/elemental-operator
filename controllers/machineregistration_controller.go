@@ -161,6 +161,19 @@ func (r *MachineRegistrationReconciler) reconcile(ctx context.Context, mRegistra
 		return ctrl.Result{}, nil
 	}
 
+	// Checked before the ready short-cut: a spec edit on a ready registration
+	// must not reach the next ISO or registering host.
+	if err := validateRegistrationTPMConfig(ctx, mRegistration); err != nil {
+		meta.SetStatusCondition(&mRegistration.Status.Conditions, metav1.Condition{
+			Type:    elementalv1.ReadyCondition,
+			Status:  metav1.ConditionFalse,
+			Reason:  elementalv1.InvalidTPMConfigReason,
+			Message: err.Error(),
+		})
+		// Nothing to retry: the next spec change triggers a new reconcile.
+		return ctrl.Result{}, nil
+	}
+
 	if !r.sharedAuthEnabled() && r.isReady(ctx, mRegistration) {
 		logger.Info("Machine registration is ready, no need to reconcile it")
 		return ctrl.Result{}, nil
@@ -193,6 +206,22 @@ func (r *MachineRegistrationReconciler) reconcile(ctx context.Context, mRegistra
 	})
 
 	return ctrl.Result{}, nil
+}
+
+// validateRegistrationTPMConfig rejects a tpm-mode that elemental-register
+// would refuse. tpm-mode only applies to auth "tpm" (the default when auth is
+// empty); with any other auth method it is ignored with a warning.
+func validateRegistrationTPMConfig(ctx context.Context, mRegistration *elementalv1.MachineRegistration) error {
+	reg := mRegistration.Spec.Config.Elemental.Registration
+	if reg.TPMMode == "" {
+		return nil
+	}
+	if reg.Auth != "" && reg.Auth != "tpm" {
+		ctrl.LoggerFrom(ctx).Info("Warning: ignoring tpm-mode, it only applies to auth tpm",
+			"auth", reg.Auth, "tpm-mode", reg.TPMMode)
+		return nil
+	}
+	return reg.ValidateTPMMode()
 }
 
 func (r *MachineRegistrationReconciler) isReady(ctx context.Context, mRegistration *elementalv1.MachineRegistration) bool {

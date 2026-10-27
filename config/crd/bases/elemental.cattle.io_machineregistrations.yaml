@@ -134,6 +134,20 @@ spec:
                             type: boolean
                           no-toolkit:
                             type: boolean
+                          tpm-mode:
+                            description: |-
+                              TPMMode selects the TPM behind auth "tpm". "hardware" requires a usable
+                              TPM 2.0 device, "emulated" uses the software TPM seeded by
+                              emulated-tpm-seed, and "auto" probes the host once at its first
+                              registration and keeps the result. The resolved mode is recorded in the
+                              registration state and never changes afterwards. Empty keeps the
+                              emulate-tpm behaviour. "hardware" and "auto" cannot be combined with
+                              emulate-tpm: true. Ignored for other auth methods.
+                            enum:
+                            - hardware
+                            - emulated
+                            - auto
+                            type: string
                           url:
                             type: string
                         type: object
