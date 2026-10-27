@@ -79,6 +79,10 @@ type InventoryServer struct {
 	SystemAgentEndpointMode     string
 	SystemAgentSplitAuthEnabled bool
 	EventRecorder               record.EventRecorder
+	// clock is the time of install session decisions; nil is time.Now.
+	clock func() time.Time
+	// liveBoots tells two hosts sharing an identity in the live ISO apart.
+	liveBoots liveBootTracker
 }
 
 func New(ctx context.Context, cl client.Client, serverURL ...string) *InventoryServer {
