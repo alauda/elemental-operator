@@ -141,7 +141,7 @@ type diskCandidate struct {
 }
 
 // diskSurvey is what the host can tell about its disks without touching
-// any. A later change sends it to the operator to show before a person
+// any. SurveyInstallDisks hands it to the operator to show before a person
 // releases the host for installation.
 type diskSurvey struct {
 	Candidates []diskCandidate

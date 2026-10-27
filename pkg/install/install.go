@@ -74,6 +74,9 @@ type Installer interface {
 	// See kubeos.go.
 	InstallKubeOS(config elementalv1.Config, state register.State, networkConfig elementalv1.NetworkConfig) error
 	WriteLocalSystemAgentConfig(config elementalv1.Elemental) error
+	// SurveyInstallDisks lists the disks for the operator without touching
+	// any. See survey.go.
+	SurveyInstallDisks() ([]elementalv1.InstallCandidate, []elementalv1.StaleSystemDisk, error)
 }
 
 func NewInstaller(fs vfs.FS, networkConfigurator network.Configurator) Installer {
