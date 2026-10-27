@@ -24,7 +24,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jaypipes/ghw/pkg/block"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/rancher/yip/pkg/schema"
@@ -37,19 +36,26 @@ import (
 )
 
 // fakeKubeOSRunner records every command and answers from a script of
-// canned results keyed by the executable name.
+// canned results keyed by the executable name. Disk inspection and wipe
+// commands go to the fake host, so calls holds the whole sequence.
 type fakeKubeOSRunner struct {
 	calls   [][]string
 	results map[string]fakeResult
+	host    *fakeHost
 }
 
 type fakeResult struct {
 	out string
 	err error
+	// do runs when the command is answered.
+	do func()
 }
 
 func (f *fakeKubeOSRunner) answer(name string, args []string) ([]byte, error) {
 	f.calls = append(f.calls, append([]string{name}, args...))
+	if f.host != nil && f.host.handles(name, args) {
+		return f.host.Output(name, args...)
+	}
 	key := name
 	// The grub check and the install both go through sh -c; tell them apart by
 	// the script's first line.
@@ -67,7 +73,31 @@ func (f *fakeKubeOSRunner) answer(name string, args []string) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("fake runner: no result scripted for %s", key)
 	}
+	if r.do != nil {
+		r.do()
+	}
 	return []byte(r.out), r.err
+}
+
+// backendCalls drops the read-only disk inspection from calls.
+func backendCalls(calls [][]string) [][]string {
+	var out [][]string
+	for _, c := range calls {
+		if (c[0] == "lsblk" && containsString(c, "--json")) || (c[0] == "wipefs" && containsString(c, "--no-act")) {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// kubeosHost has the disks the KubeOS specs install to.
+func kubeosHost() *fakeHost {
+	nvme := &fakeDisk{
+		name: "nvme0n1", major: 259, size: 500 * gib, model: "Example NVMe", serial: "NVME-1", tran: "nvme",
+		byID: []string{"nvme-eui.00000000000000aa"},
+	}
+	return &fakeHost{disks: []*fakeDisk{sataDisk("sda", 0, 500, "5000c500000000a1"), nvme}}
 }
 
 func (f *fakeKubeOSRunner) Output(name string, args ...string) ([]byte, error) {
@@ -122,20 +152,24 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 	var networkConfigurator *networkmocks.MockConfigurator
 	var inst *installer
 	var config elementalv1.Config
+	var host *fakeHost
 
 	BeforeEach(func() {
 		var err error
-		fs, fsCleanup, err = vfst.NewTestFS(map[string]interface{}{
+		host = kubeosHost()
+		fs, fsCleanup, err = vfst.NewTestFS(merge(host.files(), map[string]interface{}{
 			"/root/kbimg.toml": kbimgTemplateFixture,
 			"/etc/containers/registries.conf.d/99-kubeos.conf": "[[registry]]\nlocation = \"reg.internal\"\ninsecure = true\n",
 			"/etc/containers/registries.conf.d/README":         "not a conf",
 			"/run/containers/0/auth.json":                      `{"auths":{"reg.internal":{"auth":"dXNlcjpwYXNz"}}}`,
-		})
+		}))
 		Expect(err).ToNot(HaveOccurred())
 		DeferCleanup(fsCleanup)
 		mockCtrl := gomock.NewController(GinkgoT())
 		networkConfigurator = networkmocks.NewMockConfigurator(mockCtrl)
-		runner = &fakeKubeOSRunner{results: healthyResults()}
+		runner = &fakeKubeOSRunner{results: healthyResults(), host: host}
+		disk := host.diskOptions()
+		disk.runner, disk.inspect = runner, runner.Output
 		inst = &installer{
 			fs:                  fs,
 			networkConfigurator: networkConfigurator,
@@ -146,6 +180,7 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 				liveRegistriesDir: "/etc/containers/registries.conf.d",
 				liveAuthFile:      "/run/containers/0/auth.json",
 			},
+			disk: disk,
 		}
 		config = configFixture
 		config.Elemental.Install = elementalv1.Install{
@@ -233,8 +268,9 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 
 	It("runs preflight, install, verification and the requested power action in order", func() {
 		Expect(inst.InstallKubeOS(config, stateFixture, networkConfigFixture)).To(Succeed())
-		names := make([]string, 0, len(runner.calls))
-		for _, c := range runner.calls {
+		calls := backendCalls(runner.calls)
+		names := make([]string, 0, len(calls))
+		for _, c := range calls {
 			if c[0] == "sh" {
 				switch {
 				case strings.Contains(c[2], "kbimg"):
@@ -249,11 +285,11 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 			names = append(names, c[0])
 		}
 		Expect(names).To(Equal([]string{"skopeo", "kbimg", "lsblk", "grubcheck", "persist", "eject", "systemctl"}))
-		Expect(runner.calls[0]).To(Equal([]string{"skopeo", "inspect", "--raw", "docker://reg.internal/tkestack/kubeos-rootfs:alaudaos-44.ku.1-0.x86_64"}))
-		Expect(runner.calls[1][2]).To(ContainSubstring("yes | kbimg install disk"))
-		Expect(runner.calls[1]).To(ContainElement("/tmp/elemental/kubeos/kbimg.toml"))
-		Expect(runner.calls[2]).To(Equal([]string{"lsblk", "-rno", "LABEL", "/dev/sda"}))
-		Expect(runner.calls[6]).To(Equal([]string{"systemctl", "reboot"}))
+		Expect(calls[0]).To(Equal([]string{"skopeo", "inspect", "--raw", "docker://reg.internal/tkestack/kubeos-rootfs:alaudaos-44.ku.1-0.x86_64"}))
+		Expect(calls[1][2]).To(ContainSubstring("yes | kbimg install disk"))
+		Expect(calls[1]).To(ContainElement("/tmp/elemental/kubeos/kbimg.toml"))
+		Expect(calls[2]).To(Equal([]string{"lsblk", "-rno", "LABEL", "/dev/sda"}))
+		Expect(calls[6]).To(Equal([]string{"systemctl", "reboot"}))
 	})
 
 	It("fails before touching the disk when the image is unreachable", func() {
@@ -295,7 +331,6 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 		config.Elemental.Install.DeviceSelector = elementalv1.DeviceSelector{{
 			Key: elementalv1.DeviceSelectorKeyName, Operator: elementalv1.DeviceSelectorOpIn, Values: []string{"/dev/nvme0n1"},
 		}}
-		inst.disks = []*block.Disk{{Name: "nvme0n1", SizeBytes: 500 * 1024 * 1024 * 1024}}
 		Expect(inst.InstallKubeOS(config, stateFixture, networkConfigFixture)).To(Succeed())
 		Expect(readFile("/tmp/elemental/kubeos/kbimg.toml")).To(ContainSubstring(`target_disk = "/dev/nvme0n1"`))
 	})
@@ -363,7 +398,43 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 		Expect(fs.WriteFile("/root/kbimg.toml", []byte("[install]\nsomething = 1\n"), 0o600)).To(Succeed())
 		err := inst.InstallKubeOS(config, stateFixture, networkConfigFixture)
 		Expect(err).To(MatchError(ContainSubstring("target_disk or oci_image")))
-		Expect(runner.calls).To(BeEmpty())
+		Expect(backendCalls(runner.calls)).To(BeEmpty())
+	})
+
+	It("hands kbimg, the checks and the PERSIST copy the kernel name behind a symlink", func() {
+		config.Elemental.Install.Device = "/dev/disk/by-id/nvme-eui.00000000000000aa"
+		Expect(inst.InstallKubeOS(config, stateFixture, networkConfigFixture)).To(Succeed())
+		Expect(readFile("/tmp/elemental/kubeos/kbimg.toml")).To(ContainSubstring(`target_disk = "/dev/nvme0n1"` + "\n"))
+		calls := backendCalls(runner.calls)
+		Expect(calls).To(ContainElement([]string{"lsblk", "-rno", "LABEL", "/dev/nvme0n1"}))
+		for _, c := range calls {
+			if c[0] == "sh" && !strings.Contains(c[2], "kbimg install") {
+				Expect(c[4]).To(Equal("/dev/nvme0n1"))
+			}
+		}
+	})
+
+	It("refuses a target kbimg cannot partition before doing anything", func() {
+		md := &fakeDisk{name: "md126", major: 9, minor: 126, typ: "raid1", size: 400 * gib}
+		host.disk("sda").holders, host.disk("sda").users = []string{"md126"}, []*fakeDisk{md}
+		Expect(vfst.NewBuilder().Build(fs, host.files())).To(Succeed())
+		config.Elemental.Install.Device = "/dev/md126"
+		err := inst.InstallKubeOS(config, stateFixture, networkConfigFixture)
+		Expect(err).To(MatchError(ContainSubstring("kbimg cannot partition /dev/md126")))
+		Expect(backendCalls(runner.calls)).To(BeEmpty())
+	})
+
+	It("does not run kbimg when the target changed since it was resolved", func() {
+		config.Elemental.Install.Device = "/dev/elemental-install-target"
+		Expect(fs.Symlink("disk/by-id/wwn-0x5000c500000000a1", "/dev/elemental-install-target")).To(Succeed())
+		runner.results["skopeo"] = fakeResult{out: "{}", do: func() {
+			Expect(fs.Remove("/dev/elemental-install-target")).To(Succeed())
+			Expect(fs.Symlink("disk/by-id/nvme-eui.00000000000000aa", "/dev/elemental-install-target")).To(Succeed())
+		}}
+		err := inst.InstallKubeOS(config, stateFixture, networkConfigFixture)
+		Expect(err).To(MatchError(ContainSubstring("TargetMismatch")))
+		Expect(err).To(MatchError(ContainSubstring("resolved to /dev/sda (8:0, wwn:5000c500000000a1) and now to /dev/nvme0n1")))
+		Expect(runner.called("kbimg")).To(BeFalse())
 	})
 })
 

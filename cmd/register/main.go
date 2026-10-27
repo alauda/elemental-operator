@@ -23,7 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jaypipes/ghw"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/twpayne/go-vfs"
@@ -68,13 +67,8 @@ var (
 
 func main() {
 	fs := vfs.OSFS
-	blockInfo, err := ghw.Block(ghw.WithDisableWarnings())
-	if err != nil {
-		log.Warningf("error probing disks: %s", err)
-	}
-
 	networkConfigurator := network.NewConfigurator(fs)
-	installer := install.NewInstaller(fs, blockInfo.Disks, networkConfigurator)
+	installer := install.NewInstaller(fs, networkConfigurator)
 	stateHandler := register.NewFileStateHandler(fs)
 	client := register.NewClient()
 	cmd := newCommand(fs, client, stateHandler, installer)

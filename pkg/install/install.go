@@ -23,12 +23,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/jaypipes/ghw"
-	"github.com/jaypipes/ghw/pkg/block"
 	"github.com/rancher/yip/pkg/schema"
 	"github.com/twpayne/go-vfs"
 	"gopkg.in/yaml.v3"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
@@ -79,13 +76,13 @@ type Installer interface {
 	WriteLocalSystemAgentConfig(config elementalv1.Elemental) error
 }
 
-func NewInstaller(fs vfs.FS, disks []*block.Disk, networkConfigurator network.Configurator) Installer {
+func NewInstaller(fs vfs.FS, networkConfigurator network.Configurator) Installer {
 	return &installer{
 		fs:                  fs,
-		disks:               disks,
 		runner:              elementalcli.NewRunner(),
 		networkConfigurator: networkConfigurator,
 		kubeos:              defaultKubeOSOptions(),
+		disk:                defaultDiskOptions(),
 	}
 }
 
@@ -93,10 +90,11 @@ var _ Installer = (*installer)(nil)
 
 type installer struct {
 	fs                  vfs.FS
-	disks               []*block.Disk
 	runner              elementalcli.Runner
 	networkConfigurator network.Configurator
 	kubeos              kubeosOptions
+	// disk drives the pre-install step both backends share (target.go).
+	disk diskOptions
 }
 
 func (i *installer) InstallElemental(config elementalv1.Config, state register.State, networkConfig elementalv1.NetworkConfig) error {
@@ -104,19 +102,20 @@ func (i *installer) InstallElemental(config elementalv1.Config, state register.S
 		config.Elemental.Install.ConfigURLs = []string{}
 	}
 
-	if config.Elemental.Install.Device == "" {
-		deviceName, err := i.findInstallationDevice(config.Elemental.Install.DeviceSelector)
-		if err != nil {
-			return fmt.Errorf("failed picking installation device: %w", err)
-		}
-
-		config.Elemental.Install.Device = deviceName
-	} else if len(config.Elemental.Install.DeviceSelector) > 0 {
-		log.Warningf("Both device and device-selector set, using device-field '%s'", config.Elemental.Install.Device)
+	// Resolve the target to its kernel path and check every disk before
+	// anything is written. The CLI still receives it as
+	// ELEMENTAL_INSTALL_TARGET; its own symlink resolution is then a no-op.
+	plan, err := i.prepareInstallDisks(&config, ToolkitInstaller)
+	if err != nil {
+		return fmt.Errorf("failed picking installation device: %w", err)
 	}
 
 	if err := i.writeHookConfigurator(beforeInstallStage, installOEMMount, config, state, networkConfig); err != nil {
 		return fmt.Errorf("writing %s configurator: %w", beforeInstallStage, err)
+	}
+
+	if err := i.finalizeInstallDisks(plan); err != nil {
+		return fmt.Errorf("preparing install disks: %w", err)
 	}
 
 	if err := i.runner.Install(config.Elemental.Install); err != nil {
@@ -153,99 +152,6 @@ func (i *installer) ResetElementalNetwork() error {
 		return fmt.Errorf("resetting network config: %w", err)
 	}
 	return nil
-}
-
-func (i *installer) findInstallationDevice(selector elementalv1.DeviceSelector) (string, error) {
-	devices := map[string]*ghw.Disk{}
-
-	for _, disk := range i.disks {
-		devices[disk.Name] = disk
-	}
-
-	for _, disk := range i.disks {
-		for _, sel := range selector {
-			matches, err := matches(disk, sel)
-			if err != nil {
-				return "", err
-			}
-
-			if !matches {
-				log.Debugf("%s does not match selector %s", disk.Name, sel.Key)
-				delete(devices, disk.Name)
-				break
-			}
-		}
-	}
-
-	log.Debugf("%d disks matching selector", len(devices))
-
-	for _, dev := range devices {
-		return fmt.Sprintf("/dev/%s", dev.Name), nil
-	}
-
-	return "", fmt.Errorf("no device found matching selector")
-}
-
-func matches(disk *block.Disk, req elementalv1.DeviceSelectorRequirement) (bool, error) {
-	switch req.Operator {
-	case elementalv1.DeviceSelectorOpIn:
-		return matchesIn(disk, req)
-	case elementalv1.DeviceSelectorOpNotIn:
-		return matchesNotIn(disk, req)
-	case elementalv1.DeviceSelectorOpLt:
-		return matchesLt(disk, req)
-	case elementalv1.DeviceSelectorOpGt:
-		return matchesGt(disk, req)
-	default:
-		return false, fmt.Errorf("unknown operator: %s", req.Operator)
-	}
-}
-
-func matchesIn(disk *block.Disk, req elementalv1.DeviceSelectorRequirement) (bool, error) {
-	if req.Key != elementalv1.DeviceSelectorKeyName {
-		return false, fmt.Errorf("cannot use In operator on numerical values %s", req.Key)
-	}
-
-	for _, val := range req.Values {
-		if val == disk.Name || val == fmt.Sprintf("/dev/%s", disk.Name) {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-func matchesNotIn(disk *block.Disk, req elementalv1.DeviceSelectorRequirement) (bool, error) {
-	matches, err := matchesIn(disk, req)
-	return !matches, err
-}
-func matchesLt(disk *block.Disk, req elementalv1.DeviceSelectorRequirement) (bool, error) {
-	if req.Key != elementalv1.DeviceSelectorKeySize {
-		return false, fmt.Errorf("cannot use Lt operator on string values %s", req.Key)
-
-	}
-
-	keySize, err := resource.ParseQuantity(req.Values[0])
-	if err != nil {
-		return false, fmt.Errorf("failed to parse quantity %s", req.Values[0])
-	}
-
-	diskSize := resource.NewQuantity(int64(disk.SizeBytes), resource.BinarySI)
-
-	return diskSize.Cmp(keySize) == -1, nil
-}
-func matchesGt(disk *block.Disk, req elementalv1.DeviceSelectorRequirement) (bool, error) {
-	if req.Key != elementalv1.DeviceSelectorKeySize {
-		return false, fmt.Errorf("cannot use Gt operator on string values %s", req.Key)
-	}
-
-	keySize, err := resource.ParseQuantity(req.Values[0])
-	if err != nil {
-		return false, fmt.Errorf("failed to parse quantity %s", req.Values[0])
-	}
-
-	diskSize := resource.NewQuantity(int64(disk.SizeBytes), resource.BinarySI)
-
-	return diskSize.Cmp(keySize) == 1, nil
 }
 
 func (i *installer) writeHookConfigurator(stage string, oemMount string, config elementalv1.Config, state register.State, networkConfig elementalv1.NetworkConfig) error {

@@ -160,24 +160,21 @@ type kubeosStagedFile struct {
 // InstallKubeOS registers nothing (that already happened) and writes KubeOS
 // to the selected disk with everything the first boot needs.
 func (i *installer) InstallKubeOS(config elementalv1.Config, state register.State, networkConfig elementalv1.NetworkConfig) error {
-	install := config.Elemental.Install
-
-	// 1. Target disk: an explicit device wins, otherwise the selector.
-	device := install.Device
-	if device == "" {
-		selected, err := i.findInstallationDevice(install.DeviceSelector)
-		if err != nil {
-			return fmt.Errorf("failed picking installation device: %w", err)
-		}
-		device = selected
-	} else if len(install.DeviceSelector) > 0 {
-		log.Warningf("Both device and device-selector set, using device-field '%s'", device)
-	}
-
-	// 2. The rootfs reference. kbimg pulls it itself; there is no local fallback.
-	if install.SystemURI == "" {
+	// 1. The rootfs reference. kbimg pulls it itself; there is no local fallback.
+	if config.Elemental.Install.SystemURI == "" {
 		return errors.New("kubeos install requires elemental.install.system-uri (the kubeos-rootfs image reference)")
 	}
+
+	// 2. Target disk, resolved to its kernel path and checked before anything
+	// is written (target.go). kbimg matches the literal target_disk against
+	// parted's output and appends partition numbers to it, so it only works
+	// with a kernel name: a symlink such as /dev/disk/by-id/wwn-… never did.
+	plan, err := i.prepareInstallDisks(&config, KubeOSInstaller)
+	if err != nil {
+		return fmt.Errorf("failed picking installation device: %w", err)
+	}
+	install := config.Elemental.Install
+	device := install.Device
 	systemURI := kubeosImageReference(install.SystemURI)
 
 	warnIgnoredKubeOSInstallFields(install)
@@ -202,14 +199,22 @@ func (i *installer) InstallKubeOS(config elementalv1.Config, state register.Stat
 		return err
 	}
 
-	// 4. Fail before partitioning if the image cannot be reached: kbimg
-	// otherwise discovers that several gigabytes in, on a disk it already wiped.
+	// 4. Fail before any disk is wiped or partitioned if the image cannot be
+	// reached: kbimg otherwise discovers that several gigabytes in, on a disk
+	// it already wiped.
 	if out, err := i.kubeos.runner.Output("skopeo", "inspect", "--raw", systemURI); err != nil {
 		return fmt.Errorf("kubeos rootfs image %s is not reachable from the live environment (check registries.conf.d and skopeo login): %w\n%s", systemURI, err, strings.TrimSpace(string(out)))
 	}
 
-	// 5. Install. `yes |` is not optional: kbimg's final format_rootb runs
+	// 5. Wipe stale system disks and the target, then resolve the target once
+	// more: kbimg must not run if the disk changed identity in between.
+	if err := i.finalizeInstallDisks(plan); err != nil {
+		return fmt.Errorf("preparing install disks: %w", err)
+	}
+
+	// 6. Install. `yes |` is not optional: kbimg's final format_rootb runs
 	// mkfs.ext4 without -F and waits for confirmation forever otherwise.
+	// verifyKubeOSInstall then finds ROOT-A, ROOT-B and PERSIST on this disk.
 	out, runErr := i.kubeos.runner.Stream("sh", "-c", `yes | kbimg install disk -f "$1"`, "kbimg", tomlPath)
 	if runErr != nil {
 		return fmt.Errorf("kbimg install disk failed: %w", runErr)
@@ -222,7 +227,7 @@ func (i *installer) InstallKubeOS(config elementalv1.Config, state register.Stat
 	}
 	log.Info("KubeOS install completed")
 
-	// 6. Finish the way elemental install would.
+	// 7. Finish the way elemental install would.
 	if install.EjectCD {
 		if out, err := i.kubeos.runner.Output("eject", "-r"); err != nil {
 			log.Warningf("eject-cd failed (continuing): %v\n%s", err, strings.TrimSpace(string(out)))
