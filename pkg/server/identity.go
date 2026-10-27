@@ -82,6 +82,10 @@ type registrationSession struct {
 	// update is true when the host sent MsgUpdate, i.e. it registered
 	// before (an installed host).
 	update bool
+	// nameEvidence is true when the MachineRegistration renders the system
+	// UUID into inventory names, so a UUID in a name says which hardware
+	// created the inventory.
+	nameEvidence bool
 
 	// fingerprint is recorded on the inventory at commit.
 	fingerprint *identity.Fingerprint
@@ -93,12 +97,23 @@ type registrationSession struct {
 	committed []func(*elementalv1.MachineInventory)
 }
 
-func newRegistrationSession(inventory *elementalv1.MachineInventory) *registrationSession {
-	s := &registrationSession{}
+func newRegistrationSession(inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration) *registrationSession {
+	s := &registrationSession{nameEvidence: nameCarriesSystemUUID(registration)}
 	if !isNewInventory(inventory) {
 		s.stored = inventory.DeepCopy()
 	}
 	return s
+}
+
+// nameCarriesSystemUUID tells whether the registration renders the SMBIOS
+// system UUID into inventory names. Only then is a UUID found in a name
+// evidence about the hardware: ${Random/UUID} renders UUIDs as well.
+func nameCarriesSystemUUID(registration *elementalv1.MachineRegistration) bool {
+	if registration == nil {
+		return false
+	}
+	name := registration.Spec.MachineName
+	return strings.Contains(name, "${System Information/UUID}") && !strings.Contains(name, "${Random/")
 }
 
 func (s *registrationSession) setAnnotations(data []byte) {
@@ -151,8 +166,12 @@ func (s *registrationSession) applyIdentityAnnotations(inventory *elementalv1.Ma
 		}
 	}
 	if s.fingerprint != nil {
+		strength := elementalv1.HardwareFingerprintWeak
+		if s.fingerprint.Strong {
+			strength = elementalv1.HardwareFingerprintStrong
+		}
 		inventory.Annotations[elementalv1.HardwareFingerprintAnnotation] = s.fingerprint.Value
-		inventory.Annotations[elementalv1.HardwareFingerprintStrengthAnnotation] = s.fingerprint.Strength()
+		inventory.Annotations[elementalv1.HardwareFingerprintStrengthAnnotation] = strength
 	}
 	if s.consumeRebind {
 		delete(inventory.Annotations, elementalv1.AllowIdentityRebindAnnotation)
@@ -175,6 +194,11 @@ func (s *registrationSession) afterCommit(inventory *elementalv1.MachineInventor
 // inventory to commit, or an error once the client has been told why not.
 func (i *InventoryServer) checkHardwareIdentity(conn *websocket.Conn, protoVersion register.MessageType, sess *registrationSession, inventory *elementalv1.MachineInventory) (*elementalv1.MachineInventory, error) {
 	if sess.smbios == nil {
+		if sess.stored != nil && sess.stored.Annotations[elementalv1.HardwareFingerprintAnnotation] != "" {
+			// The inventory was fingerprinted, so the host used to send it.
+			i.recordEvent(sess.stored, corev1.EventTypeWarning, EventReasonIdentityConflict,
+				"registration without SMBIOS data (no-smbios): the hardware fingerprint cannot be checked")
+		}
 		log.Debugf("No SMBIOS data from the registering host: hardware fingerprint not checked")
 		return inventory, nil
 	}
@@ -195,20 +219,27 @@ func (i *InventoryServer) checkKnownIdentity(conn *websocket.Conn, protoVersion 
 	case recorded == fingerprint.Value:
 		sess.fingerprint = &fingerprint
 		return inventory, nil
+	case recorded != "" && !identity.IsCurrentFingerprint(recorded):
+		// Written by another release (e.g. before a downgrade): this server
+		// cannot recompute it, so it neither compares nor replaces it.
+		log.Warningf("MachineInventory %s/%s records hardware fingerprint %q of a version this server does not know; not checking it", stored.Namespace, stored.Name, recorded)
+		return inventory, nil
 	case recorded != "":
 		mismatch = fmt.Sprintf("the registering host has fingerprint %s, the inventory records %s", fingerprint.Value, recorded)
 	default:
 		// Inventories from before fingerprints: check what they recorded
 		// about the hardware first, then backfill.
-		mismatch = oldEvidenceContradiction(stored, identity.RawUUIDFromSMBIOS(sess.smbios))
+		mismatch = oldEvidenceContradiction(stored, identity.RawUUIDFromSMBIOS(sess.smbios), sess.nameEvidence)
 		if mismatch == "" {
 			log.Infof("Recording hardware fingerprint %s (%s) on MachineInventory %s/%s", fingerprint.Value, fingerprint.Strength(), stored.Namespace, stored.Name)
 			sess.fingerprint = &fingerprint
 			return inventory, nil
 		}
 	}
-	if rebindAllowed(stored) {
-		// An operator vouched for new hardware, e.g. after a mainboard swap.
+	// An operator can vouch for new hardware, e.g. after a mainboard swap. A
+	// host that derived this identity for its first registration is not that
+	// hardware: it collided and picks another identity instead.
+	if !sess.selfHealing() && rebindAllowedFor(stored, fields, fingerprint) {
 		sess.fingerprint = &fingerprint
 		sess.consumeRebind = true
 		sess.clearConflict = true
@@ -268,7 +299,7 @@ func (i *InventoryServer) checkNewIdentity(conn *websocket.Conn, protoVersion re
 		// Every host with placeholder identifiers shares a weak fingerprint.
 		return inventory, nil
 	}
-	candidate, err := i.findInventoryForHardware(fingerprint, fields, identity.RawUUIDFromSMBIOS(sess.smbios))
+	candidate, err := i.findInventoryForHardware(fingerprint, fields, identity.RawUUIDFromSMBIOS(sess.smbios), sess.nameEvidence)
 	if err != nil {
 		if writeErr := writeError(conn, protoVersion, register.NewErrorMessage(err)); writeErr != nil {
 			log.Errorf("Error reporting back error to client: %v", writeErr)
@@ -279,16 +310,18 @@ func (i *InventoryServer) checkNewIdentity(conn *websocket.Conn, protoVersion re
 		return inventory, nil
 	}
 	var refusal string
+	allowed := rebindAllowedFor(candidate, fields, fingerprint)
 	switch {
-	case rebindAllowed(candidate):
-		return i.rebindIdentity(sess, inventory, candidate), nil
+	case allowed:
+		return i.rebindIdentity(sess, inventory, candidate, true), nil
 	case hasIdentityConflict(candidate):
-		refusal = fmt.Sprintf("it is marked %s; resolve the conflict, or annotate it with %s=true to move its identity to this host",
+		refusal = fmt.Sprintf("it is marked %s; resolve the conflict, or annotate it with %s set to this host's system UUID (or true) to move its identity here",
 			elementalv1.IdentityConflictAnnotation, elementalv1.AllowIdentityRebindAnnotation)
 	case weakIdentity(candidate):
-		return i.rebindIdentity(sess, inventory, candidate), nil
+		return i.rebindIdentity(sess, inventory, candidate, false), nil
 	default:
-		refusal = fmt.Sprintf("it is bound to a hardware TPM; annotate it with %s=true to move its identity", elementalv1.AllowIdentityRebindAnnotation)
+		refusal = fmt.Sprintf("it is bound to a hardware TPM; annotate it with %s set to this host's system UUID (or true) to move its identity",
+			elementalv1.AllowIdentityRebindAnnotation)
 	}
 	message := fmt.Sprintf("the registering hardware (%s, %s) matches MachineInventory %s/%s, but %s", fields.Describe(), sess.describeClient(), candidate.Namespace, candidate.Name, refusal)
 	i.recordEvent(candidate, corev1.EventTypeWarning, EventReasonIdentityRebindRequired, message)
@@ -302,13 +335,21 @@ func (i *InventoryServer) checkNewIdentity(conn *websocket.Conn, protoVersion re
 // rebindIdentity moves the new identity onto the inventory the hardware
 // registered before. Name, labels (pool membership) and annotations stay;
 // only the hash changes, plus what this registration reports anyway.
-func (i *InventoryServer) rebindIdentity(sess *registrationSession, inventory, candidate *elementalv1.MachineInventory) *elementalv1.MachineInventory {
+func (i *InventoryServer) rebindIdentity(sess *registrationSession, inventory, candidate *elementalv1.MachineInventory, allowed bool) *elementalv1.MachineInventory {
 	target := candidate.DeepCopy()
 	previous := describeHashes(candidate)
 	target.Spec.TPMHash = inventory.Spec.TPMHash
 	target.Spec.MachineHash = inventory.Spec.MachineHash
 	if sess.observedNetwork != nil {
 		target.Spec.ObservedNetwork = sess.observedNetwork
+	}
+	// What the previous identity reported about itself (auth, tpm-*) must
+	// not outlive it: a stale auth=emulated-tpm would let the next rebind
+	// treat a hardware TPM as a weak identity.
+	for key := range target.Annotations {
+		if key == elementalv1.MachineInventoryAuthAnnotation || strings.HasPrefix(key, "elemental.cattle.io/tpm-") {
+			delete(target.Annotations, key)
+		}
 	}
 	if sess.annotationsData != nil {
 		if err := mergeInventoryAnnotations(sess.annotationsData, target); err != nil {
@@ -317,8 +358,8 @@ func (i *InventoryServer) rebindIdentity(sess *registrationSession, inventory, c
 	}
 	sess.stored = candidate.DeepCopy()
 	// An operator's allow-identity-rebind also settles a conflict on it.
-	sess.consumeRebind = rebindAllowed(candidate)
-	sess.clearConflict = sess.consumeRebind
+	sess.consumeRebind = allowed
+	sess.clearConflict = allowed
 	message := fmt.Sprintf("identity moved from %s (auth %s) to %s (%s): same hardware fingerprint",
 		previous, authOf(candidate), describeHashes(target), sess.describeClient())
 	if sess.consumeRebind {
@@ -336,7 +377,7 @@ func (i *InventoryServer) rebindIdentity(sess *registrationSession, inventory, c
 // from before fingerprints, whose name or machine-uuid annotation carries
 // the same real system UUID without contradiction. More than one match is
 // ambiguous and moves nothing.
-func (i *InventoryServer) findInventoryForHardware(fingerprint identity.Fingerprint, fields identity.Fields, rawUUID string) (*elementalv1.MachineInventory, error) {
+func (i *InventoryServer) findInventoryForHardware(fingerprint identity.Fingerprint, fields identity.Fields, rawUUID string, nameEvidence bool) (*elementalv1.MachineInventory, error) {
 	list := &elementalv1.MachineInventoryList{}
 	if err := i.List(i, list); err != nil {
 		return nil, fmt.Errorf("cannot list MachineInventories: %w", err)
@@ -348,12 +389,13 @@ func (i *InventoryServer) findInventoryForHardware(fingerprint identity.Fingerpr
 			continue
 		}
 		if recorded := m.Annotations[elementalv1.HardwareFingerprintAnnotation]; recorded != "" {
+			// Fingerprints of other versions cannot be compared.
 			if recorded == fingerprint.Value {
 				matches = append(matches, m)
 			}
 			continue
 		}
-		if fields.SystemUUID != "" && carriesUUID(m, fields.SystemUUID) && oldEvidenceContradiction(m, rawUUID) == "" {
+		if fields.SystemUUID != "" && carriesUUID(m, fields.SystemUUID, nameEvidence) && oldEvidenceContradiction(m, rawUUID, nameEvidence) == "" {
 			matches = append(matches, m)
 		}
 	}
@@ -374,12 +416,16 @@ func (i *InventoryServer) findInventoryForHardware(fingerprint identity.Fingerpr
 
 // oldEvidenceContradiction compares what an inventory without fingerprint
 // recorded about its hardware with the system UUID the host reports: the
-// machine-uuid annotation (rendered at every registration) and a UUID
-// rendered into the name (only at creation). It returns why they disagree.
-func oldEvidenceContradiction(inventory *elementalv1.MachineInventory, rawUUID string) string {
+// machine-uuid annotation (rendered at every registration) and, when the
+// registration renders the system UUID into names (nameEvidence), the UUID
+// in the name (rendered at creation). It returns why they disagree.
+func oldEvidenceContradiction(inventory *elementalv1.MachineInventory, rawUUID string, nameEvidence bool) string {
 	reported := identity.CanonicalUUID(rawUUID)
 	if recorded := strings.TrimSpace(inventory.Annotations[elementalv1.MachineUUIDAnnotation]); recorded != "" && identity.CanonicalUUID(recorded) != reported {
 		return fmt.Sprintf("annotation %s is %q, the registering host reports system UUID %q", elementalv1.MachineUUIDAnnotation, recorded, rawUUID)
+	}
+	if !nameEvidence {
+		return ""
 	}
 	if inName := identity.UUIDsInName(inventory.Name); len(inName) > 0 && !slices.Contains(inName, reported) {
 		return fmt.Sprintf("the inventory name carries system UUID %s, the registering host reports %q", strings.Join(inName, ", "), rawUUID)
@@ -387,11 +433,11 @@ func oldEvidenceContradiction(inventory *elementalv1.MachineInventory, rawUUID s
 	return ""
 }
 
-func carriesUUID(inventory *elementalv1.MachineInventory, uuid string) bool {
+func carriesUUID(inventory *elementalv1.MachineInventory, uuid string, nameEvidence bool) bool {
 	if identity.CanonicalUUID(inventory.Annotations[elementalv1.MachineUUIDAnnotation]) == uuid {
 		return true
 	}
-	return slices.Contains(identity.UUIDsInName(inventory.Name), uuid)
+	return nameEvidence && slices.Contains(identity.UUIDsInName(inventory.Name), uuid)
 }
 
 // weakIdentity tells whether anybody knowing the hardware identifiers can
@@ -414,8 +460,23 @@ func authOf(inventory *elementalv1.MachineInventory) string {
 	return inventory.Annotations[elementalv1.MachineInventoryAuthAnnotation]
 }
 
-func rebindAllowed(inventory *elementalv1.MachineInventory) bool {
-	return strings.EqualFold(strings.TrimSpace(inventory.Annotations[elementalv1.AllowIdentityRebindAnnotation]), "true")
+// rebindAllowedFor tells whether an operator allowed this hardware to take
+// the inventory's identity: allow-identity-rebind is "true" (whichever
+// hardware registers next), or names the hardware by its fingerprint, system
+// UUID or a serial number, which settles which of two colliding hosts wins.
+func rebindAllowedFor(inventory *elementalv1.MachineInventory, fields identity.Fields, fingerprint identity.Fingerprint) bool {
+	value := strings.TrimSpace(inventory.Annotations[elementalv1.AllowIdentityRebindAnnotation])
+	switch {
+	case value == "":
+		return false
+	case strings.EqualFold(value, "true"), value == fingerprint.Value:
+		return true
+	}
+	if uuid := identity.NormalizeUUID(value); uuid != "" && uuid == fields.SystemUUID {
+		return true
+	}
+	serial := identity.NormalizeSerial(value)
+	return serial != "" && (serial == fields.SystemSerial || serial == fields.BoardSerial)
 }
 
 func hasIdentityConflict(inventory *elementalv1.MachineInventory) bool {

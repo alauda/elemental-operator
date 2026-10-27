@@ -73,6 +73,12 @@ type Fingerprint struct {
 	Strong bool
 }
 
+// IsCurrentFingerprint tells whether a recorded fingerprint was computed with
+// the rules of this package version and can therefore be compared.
+func IsCurrentFingerprint(value string) bool {
+	return strings.HasPrefix(value, FingerprintVersion+":")
+}
+
 // Strength returns the value of the fingerprint strength annotation.
 func (fp Fingerprint) Strength() string {
 	if fp.Strong {

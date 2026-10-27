@@ -235,7 +235,7 @@ func (i *InventoryServer) getSystemAgentCACert(endpointMode string, secret *core
 func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration) error { //nolint: gocyclo
 	protoVersion := register.MsgUndefined
 	tmpl := templater.NewTemplater()
-	sess := newRegistrationSession(inventory)
+	sess := newRegistrationSession(inventory, registration)
 
 	for {
 		var data []byte
@@ -282,6 +282,9 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 				return err
 			}
 			if err := updateInventoryWithTemplates(tmpl, inventory, registration); err != nil {
+				if writeErr := writeError(conn, protoVersion, register.NewErrorMessage(err)); writeErr != nil {
+					log.Errorf("Error reporting back error to client: %v", writeErr)
+				}
 				return err
 			}
 			sess.applyIdentityAnnotations(inventory)

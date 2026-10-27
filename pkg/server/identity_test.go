@@ -88,6 +88,12 @@ type identityTestEnv struct {
 
 func newIdentityTestEnv(t *testing.T, objects ...client.Object) *identityTestEnv {
 	t.Helper()
+	return newIdentityTestEnvFor(t, nil, objects...)
+}
+
+// newIdentityTestEnvFor lets a test adjust the MachineRegistration.
+func newIdentityTestEnvFor(t *testing.T, customize func(*elementalv1.MachineRegistration), objects ...client.Object) *identityTestEnv {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := elementalv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -112,6 +118,9 @@ func newIdentityTestEnv(t *testing.T, objects ...client.Object) *identityTestEnv
 			ServiceAccountRef: &corev1.ObjectReference{Name: "registration", Namespace: identityTestNamespace},
 			Conditions:        []metav1.Condition{{Type: elementalv1.ReadyCondition, Status: metav1.ConditionTrue, Reason: elementalv1.SuccessfullyCreatedReason}},
 		},
+	}
+	if customize != nil {
+		customize(registration)
 	}
 	objects = append(objects,
 		registration,
@@ -577,4 +586,138 @@ func TestIdentityRebindAnnotationSettlesConflict(t *testing.T) {
 	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.IdentityConflictAnnotation))
 	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.AllowIdentityRebindAnnotation))
 	g.Expect(env.events()).To(ConsistOf(SatisfyAll(HavePrefix("Normal IdentityRebound"), ContainSubstring("allowed by"))))
+}
+
+func TestIdentityRandomUUIDNamesAreNoEvidence(t *testing.T) {
+	g := NewWithT(t)
+	// node-${Random/UUID}: the UUID in the name says nothing about the
+	// hardware, so it must not turn every installed host into a conflict.
+	legacy := &elementalv1.MachineInventory{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-0f8e4f9a-3c2b-4d1e-9a7b-6c5d4e3f2a1b", Namespace: identityTestNamespace, CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{elementalv1.MachineInventoryAuthAnnotation: "emulated-tpm"}},
+		Spec: elementalv1.MachineInventorySpec{TPMHash: "hash-a"},
+	}
+	env := newIdentityTestEnvFor(t, func(r *elementalv1.MachineRegistration) {
+		r.Spec.MachineName = "node-${Random/UUID}"
+	}, legacy)
+	reply, data := env.register(host{auth: "tpm:hash-a", update: true, smbios: smbios(uuidA, "", ""), annotations: map[string]string{"auth": "emulated-tpm"}})
+	g.Expect(reply).To(Equal(register.MsgConfig), string(data))
+	inventory := env.inventory(legacy.Name)
+	g.Expect(inventory.Annotations).To(HaveKeyWithValue(elementalv1.HardwareFingerprintAnnotation, fingerprintOf(uuidA, "", "").Value))
+	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.IdentityConflictAnnotation))
+}
+
+func TestIdentityAllowRebindIsNotForCollidingNewHosts(t *testing.T) {
+	g := NewWithT(t)
+	stored := registeredInventory("node-a", "hash-a", "emulated-tpm", fingerprintOf(uuidA, "", ""))
+	stored.Annotations[elementalv1.AllowIdentityRebindAnnotation] = "true"
+	env := newIdentityTestEnv(t, stored)
+	before := env.inventory("node-a")
+
+	// A new host whose derived seed collides is not the inventory's
+	// hardware after a repair: it has to take another salt.
+	message := env.refused(host{auth: "tpm:hash-a", smbios: smbios(uuidB, "", ""), annotations: selfHealingClient()})
+	g.Expect(message.Code).To(Equal(register.ErrorCodeIdentityConflict))
+	g.Expect(env.inventory("node-a")).To(Equal(before))
+}
+
+func TestIdentityAllowRebindCanNameTheHardware(t *testing.T) {
+	g := NewWithT(t)
+	// Two installed hosts collided on node-a; the operator decides that the
+	// one with system UUID B keeps it.
+	stored := registeredInventory("node-a", "hash-a", "emulated-tpm", fingerprintOf(uuidA, "", ""))
+	stored.Annotations[elementalv1.IdentityConflictAnnotation] = "hardware fingerprint does not match the registered host: x"
+	stored.Annotations[elementalv1.AllowIdentityRebindAnnotation] = strings.ToLower(uuidB)
+	env := newIdentityTestEnv(t, stored)
+
+	third := "4C4C4544-0099-4410-8058-B4C04F4D4E32"
+	message := env.refused(host{auth: "tpm:hash-a", update: true, smbios: smbios(third, "", ""), annotations: map[string]string{"auth": "emulated-tpm"}})
+	g.Expect(message.Code).To(Equal(register.ErrorCodeIdentityConflict))
+	g.Expect(env.inventory("node-a").Annotations).To(HaveKey(elementalv1.AllowIdentityRebindAnnotation))
+
+	reply, data := env.register(host{auth: "tpm:hash-a", update: true, smbios: smbios(uuidB, "", ""), annotations: map[string]string{"auth": "emulated-tpm"}})
+	g.Expect(reply).To(Equal(register.MsgConfig), string(data))
+	inventory := env.inventory("node-a")
+	g.Expect(inventory.Annotations).To(HaveKeyWithValue(elementalv1.HardwareFingerprintAnnotation, fingerprintOf(uuidB, "", "").Value))
+	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.AllowIdentityRebindAnnotation))
+	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.IdentityConflictAnnotation))
+}
+
+func TestIdentityUnknownFingerprintVersionIsKept(t *testing.T) {
+	g := NewWithT(t)
+	stored := registeredInventory("node-a", "hash-a", "emulated-tpm", fingerprintOf(uuidA, "", ""))
+	stored.Annotations[elementalv1.HardwareFingerprintAnnotation] = "v9:0123"
+	env := newIdentityTestEnv(t, stored)
+
+	reply, data := env.register(host{auth: "tpm:hash-a", update: true, smbios: smbios(uuidB, "", ""), annotations: map[string]string{"auth": "emulated-tpm"}})
+	g.Expect(reply).To(Equal(register.MsgConfig), string(data))
+	inventory := env.inventory("node-a")
+	g.Expect(inventory.Annotations).To(HaveKeyWithValue(elementalv1.HardwareFingerprintAnnotation, "v9:0123"))
+	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.IdentityConflictAnnotation))
+}
+
+func TestIdentityTemplatesCannotSetServerOwnedAnnotations(t *testing.T) {
+	g := NewWithT(t)
+	env := newIdentityTestEnvFor(t, func(r *elementalv1.MachineRegistration) {
+		r.Spec.MachineInventoryAnnotations[elementalv1.AllowIdentityRebindAnnotation] = "true"
+		r.Spec.MachineInventoryAnnotations[elementalv1.HardwareFingerprintAnnotation] = "v1:templated"
+	})
+	reply, data := env.register(host{auth: "tpm:hash-a", smbios: smbios(uuidA, "", ""), annotations: selfHealingClient()})
+	g.Expect(reply).To(Equal(register.MsgConfig), string(data))
+	inventory := env.inventory("node-4c4c4544-0042-3510-8058-b4c04f4d4e32")
+	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.AllowIdentityRebindAnnotation))
+	g.Expect(inventory.Annotations).To(HaveKeyWithValue(elementalv1.HardwareFingerprintAnnotation, fingerprintOf(uuidA, "", "").Value))
+}
+
+func TestIdentityRebindCandidates(t *testing.T) {
+	t.Run("skips inventories being deleted", func(t *testing.T) {
+		g := NewWithT(t)
+		deleting := registeredInventory("node-a", "hash-v1", "emulated-tpm", fingerprintOf(uuidA, "", ""))
+		deleting.Finalizers = []string{elementalv1.MachineInventoryFinalizer}
+		now := metav1.Now()
+		deleting.DeletionTimestamp = &now
+		env := newIdentityTestEnv(t, deleting)
+		reply, data := env.register(host{auth: "tpm:hash-v2", smbios: smbios(uuidA, "", ""), annotations: selfHealingClient()})
+		g.Expect(reply).To(Equal(register.MsgConfig), string(data))
+		g.Expect(env.inventories()).To(HaveLen(2))
+		g.Expect(env.inventory("node-a").Spec.TPMHash).To(Equal("hash-v1"))
+	})
+	t.Run("looks cluster wide", func(t *testing.T) {
+		g := NewWithT(t)
+		other := registeredInventory("node-a", "hash-v1", "emulated-tpm", fingerprintOf(uuidA, "", ""))
+		other.Namespace = "other-namespace"
+		env := newIdentityTestEnv(t, other)
+		reply, data := env.register(host{auth: "tpm:hash-v2", smbios: smbios(uuidA, "", ""), annotations: selfHealingClient()})
+		g.Expect(reply).To(Equal(register.MsgConfig), string(data))
+		g.Expect(env.inventories()).To(HaveLen(1))
+		moved := &elementalv1.MachineInventory{}
+		g.Expect(env.server.Get(context.Background(), client.ObjectKey{Namespace: "other-namespace", Name: "node-a"}, moved)).To(Succeed())
+		g.Expect(moved.Spec.TPMHash).To(Equal("hash-v2"))
+	})
+	t.Run("drops what the previous identity reported", func(t *testing.T) {
+		g := NewWithT(t)
+		stored := registeredInventory("node-a", "hash-v1", "emulated-tpm", fingerprintOf(uuidA, "", ""))
+		stored.Annotations["elemental.cattle.io/tpm-mode"] = "emulated"
+		stored.Annotations["elemental.cattle.io/tpm-seed-version"] = "legacy"
+		stored.Annotations["elemental.cattle.io/registration-ip"] = "10.0.0.21"
+		env := newIdentityTestEnv(t, stored)
+		// A client too old to send annotations.
+		reply, data := env.register(host{auth: "plain:plain-new", smbios: smbios(uuidA, "", "")})
+		g.Expect(reply).To(Equal(register.MsgConfig), string(data))
+		inventory := env.inventory("node-a")
+		g.Expect(inventory.Spec.MachineHash).To(Equal("plain-new"))
+		g.Expect(inventory.Spec.TPMHash).To(BeEmpty())
+		g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.MachineInventoryAuthAnnotation))
+		g.Expect(inventory.Annotations).ToNot(HaveKey("elemental.cattle.io/tpm-mode"))
+		g.Expect(inventory.Annotations).ToNot(HaveKey("elemental.cattle.io/tpm-seed-version"))
+		g.Expect(inventory.Annotations).To(HaveKeyWithValue("elemental.cattle.io/registration-ip", "10.0.0.21"))
+	})
+}
+
+func TestIdentityRegistrationWithoutSMBIOSIsReported(t *testing.T) {
+	g := NewWithT(t)
+	env := newIdentityTestEnv(t, registeredInventory("node-a", "hash-a", "emulated-tpm", fingerprintOf(uuidA, "", "")))
+	reply, data := env.register(host{auth: "tpm:hash-a", update: true, annotations: map[string]string{"auth": "emulated-tpm"}})
+	g.Expect(reply).To(Equal(register.MsgConfig), string(data))
+	g.Expect(env.events()).To(ConsistOf(SatisfyAll(HavePrefix("Warning IdentityConflict"), ContainSubstring("without SMBIOS"))))
 }
