@@ -23,7 +23,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/rancher/yip/pkg/schema"
@@ -207,6 +209,11 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 		return ctrl.Result{}, nil
 	}
 
+	// Whatever the plan says, an inventory whose identity other hardware
+	// presented must not look ready: providers only allocate ready ones.
+	previousReady := meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.ReadyCondition).DeepCopy()
+	defer setIdentityConflictCondition(mInventory, previousReady)
+
 	if err := r.createPlanSecret(ctx, mInventory); err != nil {
 		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.ReadyCondition,
@@ -237,6 +244,47 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// maxIdentityConflictMessage bounds the condition message taken from the
+// identity-conflict annotation.
+const maxIdentityConflictMessage = 1024
+
+// setIdentityConflictCondition turns Ready false while the registration
+// server's identity-conflict annotation is present. Removing the annotation
+// hands Ready back to the plan status at the next reconcile. previous is the
+// Ready condition the reconcile started with.
+func setIdentityConflictCondition(mInventory *elementalv1.MachineInventory, previous *metav1.Condition) {
+	detail, conflict := mInventory.Annotations[elementalv1.IdentityConflictAnnotation]
+	if !conflict {
+		return
+	}
+	if ready := meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.ReadyCondition); ready != nil && ready.Reason == elementalv1.PlanCreationFailureReason {
+		// Not ready anyway, and createPlanSecret only retries on this reason.
+		return
+	}
+	message := strings.TrimSpace(detail)
+	if message == "" {
+		message = "hardware fingerprint does not match the registered host"
+	}
+	if len(message) > maxIdentityConflictMessage {
+		cut := maxIdentityConflictMessage
+		for cut > 0 && !utf8.RuneStart(message[cut]) {
+			cut--
+		}
+		message = message[:cut]
+	}
+	meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
+		Type:    elementalv1.ReadyCondition,
+		Reason:  elementalv1.IdentityConflictReason,
+		Status:  metav1.ConditionFalse,
+		Message: message + "; remove annotation " + elementalv1.IdentityConflictAnnotation + " once resolved",
+	})
+	// The plan status may have flipped Ready within this reconcile; Ready was
+	// false before and is false now, so it did not transition.
+	if previous != nil && previous.Status == metav1.ConditionFalse {
+		meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.ReadyCondition).LastTransitionTime = previous.LastTransitionTime
+	}
 }
 
 func isNetworkConfigReadyWithoutReconciliation(mInventory *elementalv1.MachineInventory) bool {

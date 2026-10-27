@@ -193,6 +193,42 @@ var _ = Describe("elemental-register", Label("registration", "cli"), func() {
 				Return(marshalToBytes(alternateConfigFixture), nil)
 			Expect(cmd.Execute()).ToNot(HaveOccurred())
 		})
+		It("derives the emulated TPM seed when the config sets none", func() {
+			// MachineRegistrations that only say emulate-tpm: true used to give
+			// every host seed 1, i.e. one shared identity.
+			newPath := "/a/custom/config/path/no-seed.yaml"
+			noSeed := baseConfigFixture.DeepCopy()
+			noSeed.Elemental.Registration.EmulatedTPMSeed = 0 // omitted from the file
+			marshalIntoFile(fs, noSeed, newPath)
+			cmd.SetArgs([]string{"--config-path", newPath})
+			want := noSeed.Elemental.Registration
+			want.EmulatedTPMSeed = elementalv1.TPMRandomSeedValue
+			client.EXPECT().
+				Register(want, []byte(want.CACert), &stateFixture).
+				Return(marshalToBytes(noSeed), nil)
+			Expect(cmd.Execute()).ToNot(HaveOccurred())
+		})
+		It("reads tpm-mode from the config and from --tpm-mode", func() {
+			newPath := "/a/custom/config/path/tpm-mode.yaml"
+			auto := baseConfigFixture.DeepCopy()
+			auto.Elemental.Registration.EmulateTPM = false
+			auto.Elemental.Registration.TPMMode = elementalv1.TPMModeAuto
+			marshalIntoFile(fs, auto, newPath)
+			cmd.SetArgs([]string{"--config-path", newPath})
+			client.EXPECT().
+				Register(auto.Elemental.Registration, []byte(auto.Elemental.Registration.CACert), &stateFixture).
+				Return(marshalToBytes(auto), nil)
+			Expect(cmd.Execute()).ToNot(HaveOccurred())
+		})
+		It("lets --tpm-mode override the config", func() {
+			cmd.SetArgs([]string{"--tpm-mode", elementalv1.TPMModeEmulated})
+			want := baseConfigFixture.Elemental.Registration
+			want.TPMMode = elementalv1.TPMModeEmulated
+			client.EXPECT().
+				Register(want, []byte(want.CACert), &stateFixture).
+				Return(marshalToBytes(baseConfigFixture), nil)
+			Expect(cmd.Execute()).ToNot(HaveOccurred())
+		})
 	})
 })
 

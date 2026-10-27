@@ -93,6 +93,11 @@ type Reset struct {
 	DisableBootEntry bool `json:"disable-boot-entry,omitempty" yaml:"disable-boot-entry,omitempty"`
 }
 
+// Registration is the registration section of a MachineRegistration. A
+// tpm-mode that contradicts emulate-tpm is rejected at admission; the
+// MachineRegistration controller reports InvalidTPMConfig as well for
+// objects that bypassed it.
+// +kubebuilder:validation:XValidation:rule="!(has(self.tpm__dash__mode) && self.tpm__dash__mode in ['hardware', 'auto'] && has(self.emulate__dash__tpm) && self.emulate__dash__tpm && (!has(self.auth) || self.auth == 'tpm'))",message="tpm-mode hardware or auto cannot be combined with emulate-tpm: true"
 type Registration struct {
 	// +optional
 	URL string `json:"url,omitempty" yaml:"url,omitempty" mapstructure:"url"`
@@ -102,6 +107,16 @@ type Registration struct {
 	EmulateTPM bool `json:"emulate-tpm,omitempty" yaml:"emulate-tpm,omitempty" mapstructure:"emulate-tpm"`
 	// +optional
 	EmulatedTPMSeed int64 `json:"emulated-tpm-seed,omitempty" yaml:"emulated-tpm-seed,omitempty" mapstructure:"emulated-tpm-seed"`
+	// TPMMode selects the TPM behind auth "tpm". "hardware" requires a usable
+	// TPM 2.0 device, "emulated" uses the software TPM seeded by
+	// emulated-tpm-seed, and "auto" probes the host once at its first
+	// registration and keeps the result. The resolved mode is recorded in the
+	// registration state and never changes afterwards. Empty keeps the
+	// emulate-tpm behaviour. "hardware" and "auto" cannot be combined with
+	// emulate-tpm: true. Ignored for other auth methods.
+	// +optional
+	// +kubebuilder:validation:Enum=hardware;emulated;auto
+	TPMMode string `json:"tpm-mode,omitempty" yaml:"tpm-mode,omitempty" mapstructure:"tpm-mode"`
 	// +optional
 	NoSMBIOS bool `json:"no-smbios,omitempty" yaml:"no-smbios,omitempty" mapstructure:"no-smbios"`
 	// +optional

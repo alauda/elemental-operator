@@ -184,8 +184,13 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 	_ = viper.BindPFlag("elemental.registration.ca-cert", cmd.Flags().Lookup("registration-ca-cert"))
 	cmd.Flags().BoolVar(&cfg.Elemental.Registration.EmulateTPM, "emulate-tpm", false, "Emulate /dev/tpm")
 	_ = viper.BindPFlag("elemental.registration.emulate-tpm", cmd.Flags().Lookup("emulate-tpm"))
-	cmd.Flags().Int64Var(&cfg.Elemental.Registration.EmulatedTPMSeed, "emulated-tpm-seed", 1, "Seed for /dev/tpm emulation")
+	// -1 derives the seed from the hardware. The default used to be 1, which
+	// gave every host without an explicit seed the same identity. Hosts that
+	// registered already keep the seed recorded in their state.
+	cmd.Flags().Int64Var(&cfg.Elemental.Registration.EmulatedTPMSeed, "emulated-tpm-seed", elementalv1.TPMRandomSeedValue, "Seed for /dev/tpm emulation (-1: derive from the hardware identity)")
 	_ = viper.BindPFlag("elemental.registration.emulated-tpm-seed", cmd.Flags().Lookup("emulated-tpm-seed"))
+	cmd.Flags().StringVar(&cfg.Elemental.Registration.TPMMode, "tpm-mode", "", "TPM for --auth tpm: hardware, emulated or auto (probe once, then keep the result); empty follows --emulate-tpm")
+	_ = viper.BindPFlag("elemental.registration.tpm-mode", cmd.Flags().Lookup("tpm-mode"))
 	cmd.Flags().BoolVar(&cfg.Elemental.Registration.NoSMBIOS, "no-smbios", false, "Disable the use of dmidecode to get SMBIOS")
 	_ = viper.BindPFlag("elemental.registration.no-smbios", cmd.Flags().Lookup("no-smbios"))
 	cmd.Flags().StringVar(&cfg.Elemental.Registration.Auth, "auth", "tpm", "Registration authentication method")

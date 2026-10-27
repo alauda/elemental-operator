@@ -387,6 +387,7 @@ func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindA
 		SystemAgentServerURL:        systemAgentServerURL,
 		SystemAgentEndpointMode:     systemAgentEndpointMode,
 		SystemAgentSplitAuthEnabled: systemAgentSplitAuthEnabled,
+		EventRecorder:               mgr.GetEventRecorderFor("elemental-registration"),
 	})
 
 	if httpBindAddr != "" {

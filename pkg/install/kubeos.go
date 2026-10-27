@@ -288,8 +288,9 @@ func (i *installer) stageKubeOSFiles(filesDir string, config elementalv1.Config,
 
 	// Registration config and state, bare (not yip-wrapped): the installed
 	// system's elemental-register.timer and the storage observer read them from
-	// /etc/elemental/registration.
-	registrationConfig, err := yaml.Marshal(elementalv1.Config{Elemental: elementalv1.Elemental{Registration: config.Elemental.Registration}})
+	// /etc/elemental/registration. The config carries the TPM mode this host
+	// resolved, not tpm-mode auto.
+	registrationConfig, err := yaml.Marshal(elementalv1.Config{Elemental: elementalv1.Elemental{Registration: register.InstalledRegistration(config.Elemental.Registration, state)}})
 	if err != nil {
 		return nil, fmt.Errorf("marshalling registration config: %w", err)
 	}

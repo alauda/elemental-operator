@@ -168,6 +168,11 @@ spec:
                             type: array
                         type: object
                       registration:
+                        description: |-
+                          Registration is the registration section of a MachineRegistration. A
+                          tpm-mode that contradicts emulate-tpm is rejected at admission; the
+                          MachineRegistration controller reports InvalidTPMConfig as well for
+                          objects that bypassed it.
                         properties:
                           auth:
                             default: tpm
@@ -183,9 +188,30 @@ spec:
                             type: boolean
                           no-toolkit:
                             type: boolean
+                          tpm-mode:
+                            description: |-
+                              TPMMode selects the TPM behind auth "tpm". "hardware" requires a usable
+                              TPM 2.0 device, "emulated" uses the software TPM seeded by
+                              emulated-tpm-seed, and "auto" probes the host once at its first
+                              registration and keeps the result. The resolved mode is recorded in the
+                              registration state and never changes afterwards. Empty keeps the
+                              emulate-tpm behaviour. "hardware" and "auto" cannot be combined with
+                              emulate-tpm: true. Ignored for other auth methods.
+                            enum:
+                            - hardware
+                            - emulated
+                            - auto
+                            type: string
                           url:
                             type: string
                         type: object
+                        x-kubernetes-validations:
+                        - message: 'tpm-mode hardware or auto cannot be combined with
+                            emulate-tpm: true'
+                          rule: '!(has(self.tpm__dash__mode) && self.tpm__dash__mode
+                            in [''hardware'', ''auto''] && has(self.emulate__dash__tpm)
+                            && self.emulate__dash__tpm && (!has(self.auth) || self.auth
+                            == ''tpm''))'
                       reset:
                         default:
                           reboot: true

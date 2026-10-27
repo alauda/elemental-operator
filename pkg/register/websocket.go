@@ -95,9 +95,29 @@ func (mt MessageType) String() string {
 	}
 }
 
+// ErrorMessage is the payload of MsgError. Code was added after Message and
+// is optional: older peers neither send nor read it, so it never replaces
+// the message.
 type ErrorMessage struct {
 	Message string `json:"message,omitempty" yaml:"message"`
+	Code    string `json:"code,omitempty" yaml:"code,omitempty"`
 }
+
+// Values of ErrorMessage.Code.
+const (
+	// ErrorCodeIdentityConflict: the identity the host authenticated with
+	// belongs to a MachineInventory that other hardware registered, and the
+	// server did not commit anything (it only marks the inventory when the
+	// host had registered before). A host registering an identity it derived
+	// itself (see TPMSeedVersionAnnotation) answers it by deriving the next
+	// one; any other host needs an operator to give it another identity.
+	ErrorCodeIdentityConflict = "IdentityConflict"
+	// ErrorCodeIdentityRebindRequired: the identity is new, but the hardware
+	// fingerprint matches a MachineInventory whose identity the server does
+	// not move by itself (a hardware TPM without the allow-identity-rebind
+	// annotation, or an inventory in identity conflict).
+	ErrorCodeIdentityRebindRequired = "IdentityRebindRequired"
+)
 
 func NewErrorMessage(err error) ErrorMessage {
 	return ErrorMessage{

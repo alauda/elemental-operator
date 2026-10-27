@@ -28,6 +28,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
@@ -61,6 +62,9 @@ type Options struct {
 	SystemAgentClusterName      string
 	SystemAgentEndpointMode     string
 	SystemAgentSplitAuthEnabled bool
+	// EventRecorder records hardware identity decisions on
+	// MachineInventories; nil disables events.
+	EventRecorder record.EventRecorder
 }
 
 type InventoryServer struct {
@@ -74,6 +78,7 @@ type InventoryServer struct {
 	SystemAgentClusterName      string
 	SystemAgentEndpointMode     string
 	SystemAgentSplitAuthEnabled bool
+	EventRecorder               record.EventRecorder
 }
 
 func New(ctx context.Context, cl client.Client, serverURL ...string) *InventoryServer {
@@ -101,6 +106,7 @@ func NewWithOptions(ctx context.Context, cl client.Client, options Options) *Inv
 		SystemAgentClusterName:      NormalizeSystemAgentClusterName(options.SystemAgentClusterName),
 		SystemAgentEndpointMode:     NormalizeSystemAgentEndpointMode(options.SystemAgentEndpointMode),
 		SystemAgentSplitAuthEnabled: options.SystemAgentSplitAuthEnabled,
+		EventRecorder:               options.EventRecorder,
 		authenticators: []authenticator{
 			tpm.New(ctx, cl),
 			plainauth.New(ctx, cl),

@@ -162,7 +162,12 @@ func mergeInventoryAnnotations(data []byte, mInventory *elementalv1.MachineInven
 		mInventory.Annotations = map[string]string{}
 	}
 	for key, val := range annotations {
-		mInventory.Annotations[fmt.Sprintf("elemental.cattle.io/%s", sanitizeUserInput(key))] = sanitizeUserInput(val)
+		annotation := fmt.Sprintf("elemental.cattle.io/%s", sanitizeUserInput(key))
+		if isServerOwnedAnnotation(annotation) {
+			log.Warningf("Ignoring annotation %s sent by the registering host: it is owned by the registration server", annotation)
+			continue
+		}
+		mInventory.Annotations[annotation] = sanitizeUserInput(val)
 	}
 	return nil
 }
