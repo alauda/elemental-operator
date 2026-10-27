@@ -378,7 +378,9 @@ func checkSelection(inventory *elementalv1.MachineInventory, session *register.L
 	if session.SurveyError != "" {
 		return nil, elementalv1.TargetNotObservedReason, "the host could not list its disks: " + session.SurveyError
 	}
-	id := strings.TrimSpace(selection)
+	// Without the provider's webhook nobody rejected a hand-written form
+	// such as wwn:0x5000C500...; match it the way the host writes IDs.
+	id := register.NormalizeDeviceID(selection)
 	if id == "" {
 		return nil, elementalv1.TargetNotObservedReason, "the value is empty"
 	}

@@ -52,8 +52,8 @@ import (
 // Disks of the live session fixture: A and B can be the install target, B
 // carries an old system, C is a USB stick.
 const (
-	diskA = "wwn:0x5000c500a1b2c3d4"
-	diskB = "wwn:0x5000c500ffff0001"
+	diskA = "wwn:5000c500a1b2c3d4"
+	diskB = "wwn:5000c500ffff0001"
 	diskC = "serial:4c530001230904110463"
 )
 
@@ -413,6 +413,20 @@ func TestLiveInstallReleasesThePickedDisk(t *testing.T) {
 	g.Expect(env.inventory("node-a").Status.Install.Message).To(Equal("the install released to " + diskA + " in this live boot did not complete"))
 }
 
+// Without the provider's webhook a hand-written ID reaches the server as
+// typed; it matches the candidate the host reported in canonical form.
+func TestLiveInstallMatchesAHandWrittenID(t *testing.T) {
+	g := NewWithT(t)
+	env := newInstallTestEnv(t, installEnvOptions{}, liveInventory("node-a"))
+	env.hold(hostA.in("boot-1"))
+	env.selectDisk("node-a", "WWN:0x5000C500A1B2C3D4")
+
+	config, raw := env.config(hostA.in("boot-1"))
+	g.Expect(config.Elemental.InstallTarget).ToNot(BeNil(), raw)
+	g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
+	g.Expect(env.inventory("node-a").Status.Install.TargetDeviceID).To(Equal(diskA))
+}
+
 func TestLiveInstallReleaseApprovesNoWipeBeyondTheList(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -459,7 +473,7 @@ func TestLiveInstallDiscardsInvalidSelection(t *testing.T) {
 		reason    string
 		message   string
 	}{
-		{name: "not reported", pick: "wwn:0x5000c500deadbeef", reason: elementalv1.TargetNotObservedReason, message: "reported no disk with this ID"},
+		{name: "not reported", pick: "wwn:5000c500deadbeef", reason: elementalv1.TargetNotObservedReason, message: "reported no disk with this ID"},
 		{name: "empty", pick: " ", reason: elementalv1.TargetNotObservedReason, message: "empty"},
 		{name: "reported twice", pick: diskA, reason: elementalv1.TargetNotObservedReason, message: "reported 2 disks",
 			session: func(s *register.LiveInstallSession) { s.Candidates[1].ID = diskA }},
