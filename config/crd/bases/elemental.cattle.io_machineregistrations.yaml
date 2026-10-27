@@ -57,6 +57,18 @@ spec:
                             type: boolean
                           device:
                             type: string
+                          device-selection:
+                            description: |-
+                              DeviceSelection chooses how the install disk is picked. Empty keeps
+                              device and device-selector. "inventory" makes a host booted from the
+                              live ISO report its disks on its MachineInventory (status.install) and
+                              wait until a person picks one with the
+                              baremetal.alauda.io/install-target-device annotation; device and
+                              device-selector are not used then.
+                            enum:
+                            - ""
+                            - inventory
+                            type: string
                           device-selector:
                             items:
                               description: |-

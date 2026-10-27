@@ -23,6 +23,10 @@ import (
 
 const TPMRandomSeedValue = -1
 
+// DeviceSelectionInventory is the Install.DeviceSelection value that has a
+// person pick the install disk on the MachineInventory.
+const DeviceSelectionInventory = "inventory"
+
 type Install struct {
 	// +optional
 	Firmware string `json:"firmware,omitempty" yaml:"firmware,omitempty"`
@@ -30,6 +34,15 @@ type Install struct {
 	Device string `json:"device,omitempty" yaml:"device,omitempty"`
 	// +optional
 	DeviceSelector DeviceSelector `json:"device-selector,omitempty" yaml:"device-selector,omitempty"`
+	// DeviceSelection chooses how the install disk is picked. Empty keeps
+	// device and device-selector. "inventory" makes a host booted from the
+	// live ISO report its disks on its MachineInventory (status.install) and
+	// wait until a person picks one with the
+	// baremetal.alauda.io/install-target-device annotation; device and
+	// device-selector are not used then.
+	// +optional
+	// +kubebuilder:validation:Enum="";inventory
+	DeviceSelection string `json:"device-selection,omitempty" yaml:"device-selection,omitempty"`
 	// +optional
 	NoFormat bool `json:"no-format,omitempty" yaml:"no-format,omitempty"`
 	// +optional

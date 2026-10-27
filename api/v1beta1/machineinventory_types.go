@@ -154,6 +154,10 @@ type MachineInventoryStatus struct {
 	// provider Inventory Storage Reconciler.
 	// +optional
 	Storage *MachineInventoryStorageStatus `json:"storage,omitempty"`
+	// Install is the install session of a host booted from the live ISO with
+	// elemental-register --install, written by the registration server.
+	// +optional
+	Install *InstallStatus `json:"install,omitempty"`
 }
 
 type PlanState string
@@ -178,6 +182,9 @@ type PlanStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Install",type="string",JSONPath=".status.install.phase"
+// +kubebuilder:printcolumn:name="Target",type="string",JSONPath=".status.install.targetDeviceID"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 type MachineInventory struct {
 	metav1.TypeMeta   `json:",inline"`
