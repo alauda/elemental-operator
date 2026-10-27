@@ -82,6 +82,9 @@ type registrationSession struct {
 	// update is true when the host sent MsgUpdate, i.e. it registered
 	// before (an installed host).
 	update bool
+	// liveInstall is the MsgLiveInstallSession payload of a host installing
+	// from the live ISO; nil for any other registration.
+	liveInstall *register.LiveInstallSession
 	// nameEvidence is true when the MachineRegistration renders the system
 	// UUID into inventory names, so a UUID in a name says which hardware
 	// created the inventory.

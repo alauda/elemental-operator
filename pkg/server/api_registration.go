@@ -130,7 +130,9 @@ func (i *InventoryServer) unauthenticatedResponse(registration *elementalv1.Mach
 		Encode(config)
 }
 
-func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration, netConf elementalv1.NetworkConfig) error {
+// writeMachineInventoryCloudConfig sends the configuration of the inventory;
+// adjust, when set, changes it first.
+func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration, netConf elementalv1.NetworkConfig, adjust func(*elementalv1.Config)) error {
 	sa := &corev1.ServiceAccount{}
 
 	if err := i.Get(i, types.NamespacedName{
@@ -174,6 +176,9 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 	config.Elemental.Install = registration.Spec.Config.Elemental.Install
 	config.Elemental.Reset = registration.Spec.Config.Elemental.Reset
 	config.CloudConfig = registration.Spec.Config.CloudConfig
+	if adjust != nil {
+		adjust(config)
+	}
 
 	// If client does not support MsgConfig we send back the config as a
 	// byte-stream without a message-type to keep backwards-compatibility.
@@ -288,8 +293,12 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 				return err
 			}
 			sess.applyIdentityAnnotations(inventory)
+			sess.applyInstallSelection(inventory)
 			setRegistrationIPLabel(inventory)
-			return i.handleGet(conn, protoVersion, inventory, registration, sess.afterCommit)
+			if sess.liveInstall != nil {
+				return i.handleLiveInstallGet(conn, protoVersion, inventory, registration, sess)
+			}
+			return i.handleGet(conn, protoVersion, inventory, registration, sess.afterCommit, i.settleInstall)
 		case register.MsgUpdate:
 			err = i.handleUpdate(conn, protoVersion, inventory)
 			if err != nil {
@@ -315,6 +324,15 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 			}
 			inventory.Spec.ObservedNetwork = observed
 			sess.observedNetwork = observed
+		case register.MsgLiveInstallSession:
+			session, err := decodeLiveInstallSession(data)
+			if err != nil {
+				if writeErr := writeError(conn, protoVersion, register.NewErrorMessage(err)); writeErr != nil {
+					log.Errorf("Error reporting back error to client: %v", writeErr)
+				}
+				return err
+			}
+			sess.liveInstall = session
 		case register.MsgObserveStorage:
 			if isNewInventory(inventory) || inventory.UID == "" {
 				return errors.New("storage observer requires an existing MachineInventory UID")
@@ -523,7 +541,6 @@ func (i *InventoryServer) handleGetNetworkConfig(inventory *elementalv1.MachineI
 // committed run right after the inventory is stored.
 func (i *InventoryServer) handleGet(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration, committed ...func(*elementalv1.MachineInventory)) error {
 	var err error
-	var netConf elementalv1.NetworkConfig
 
 	inventory, err = i.commitMachineInventory(inventory)
 	if err != nil {
@@ -537,6 +554,16 @@ func (i *InventoryServer) handleGet(conn *websocket.Conn, protoVersion register.
 		f(inventory)
 	}
 
+	return i.sendConfig(conn, protoVersion, inventory, registration, withoutInstallRelease(registration))
+}
+
+// sendConfig sends the configuration of a committed inventory, once its
+// network configuration is ready when the client takes one. adjust, when set,
+// changes the configuration first.
+func (i *InventoryServer) sendConfig(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration, adjust func(*elementalv1.Config)) error {
+	var err error
+	var netConf elementalv1.NetworkConfig
+
 	if protoVersion >= register.MsgNetworkConfig {
 		netConf, err = i.handleGetNetworkConfig(inventory)
 		if err != nil {
@@ -547,7 +574,7 @@ func (i *InventoryServer) handleGet(conn *websocket.Conn, protoVersion register.
 		}
 	}
 
-	if err := i.writeMachineInventoryCloudConfig(conn, protoVersion, inventory, registration, netConf); err != nil {
+	if err := i.writeMachineInventoryCloudConfig(conn, protoVersion, inventory, registration, netConf, adjust); err != nil {
 		if writeErr := writeError(conn, protoVersion, register.NewErrorMessage(err)); writeErr != nil {
 			log.Errorf("Error reporting back error to client: %v", writeErr)
 		}
