@@ -198,3 +198,32 @@ var _ = Describe("hardware TPM probe", Label("tpm", "probe"), func() {
 		Expect(result.Reason).To(ContainSubstring("/dev/tpm0 is missing"))
 	})
 })
+
+var _ = Describe("hardware TPM probe, go-attestation parity", Label("tpm", "probe"), func() {
+	It("does not skip a broken first TPM 2.0 for a later one", func() {
+		fs := newFakeSysfs()
+		fs.mkdir("sys/class/tpm/tpm0")
+		fs.write("sys/class/tpm/tpm0/tpm_version_major", "2\n")
+		fs.tpm2("tpm1", "tpmrm1", true)
+		p, _ := testProber(fs, func() error { return nil })
+		Expect(p.Present()).To(BeFalse())
+		result := p.Probe()
+		Expect(result.Usable).To(BeFalse())
+		Expect(result.Reason).To(ContainSubstring("/dev/tpm0 is missing"))
+	})
+	It("skips TPM 1.2 devices like go-attestation does", func() {
+		fs := newFakeSysfs()
+		fs.write("sys/class/tpm/tpm0/caps", "Manufacturer: 0x0\n")
+		fs.tpm2("tpm1", "tpmrm1", true)
+		p, _ := testProber(fs, func() error { return nil })
+		Expect(p.Probe()).To(Equal(ProbeResult{Usable: true, Device: "/dev/tpmrm1"}))
+	})
+	It("turns a panicking self-test into a failed probe", func() {
+		fs := newFakeSysfs()
+		fs.tpm2("tpm0", "tpmrm0", true)
+		p, _ := testProber(fs, func() error { panic("boom") })
+		result := p.Probe()
+		Expect(result.Usable).To(BeFalse())
+		Expect(result.Reason).To(ContainSubstring("panic: boom"))
+	})
+})

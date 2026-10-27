@@ -69,11 +69,12 @@ type Prober struct {
 // NewProber returns a prober for this host.
 func NewProber() *Prober {
 	return &Prober{
-		Root:            "/",
-		SettleTimeout:   30 * time.Second,
-		DeviceWait:      60 * time.Second,
-		PollInterval:    2 * time.Second,
-		SelfTestTimeout: 60 * time.Second,
+		Root:          "/",
+		SettleTimeout: 30 * time.Second,
+		DeviceWait:    60 * time.Second,
+		PollInterval:  2 * time.Second,
+		// Covers EK, SRK and AK generation (RSA-2048 each) on slow TPMs.
+		SelfTestTimeout: 3 * time.Minute,
 		Settle:          udevSettle,
 		SelfTest:        func() error { return SelfTest() },
 		Sleep:           time.Sleep,
@@ -134,7 +135,8 @@ func (p *Prober) WaitForDevice() (string, string) {
 }
 
 // scan applies go-attestation's device rules to /sys/class/tpm: the first
-// TPM 2.0 wins and its kernel resource manager (tpmrmN) is preferred.
+// TPM 2.0 (in name order) is the one it opens, through its kernel resource
+// manager (tpmrmN) when there is one.
 func (p *Prober) scan() (string, string) {
 	classDir := filepath.Join(p.Root, "sys", "class", "tpm")
 	entries, err := os.ReadDir(classDir)
@@ -153,8 +155,9 @@ func (p *Prober) scan() (string, string) {
 		}
 		node := p.deviceNode(name)
 		if _, err := os.Stat(filepath.Join(p.Root, node)); err != nil {
+			// go-attestation would fail on this one, not try the next.
 			notes = append(notes, fmt.Sprintf("%s: device node %s is missing", name, node))
-			continue
+			return "", strings.Join(notes, "; ")
 		}
 		return node, ""
 	}
@@ -206,7 +209,14 @@ func (p *Prober) firmwareDeclaresTPM2() bool {
 // emulation.
 func (p *Prober) runSelfTest() error {
 	done := make(chan error, 1)
-	go func() { done <- p.SelfTest() }()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("panic: %v", r)
+			}
+		}()
+		done <- p.SelfTest()
+	}()
 	timer := time.NewTimer(p.SelfTestTimeout)
 	defer timer.Stop()
 	select {

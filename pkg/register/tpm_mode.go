@@ -163,7 +163,8 @@ func newTPMIdentity(reg elementalv1.Registration, state *State, hw hardwareTPM) 
 	switch state.TPMMode {
 	case elementalv1.TPMModeHardware:
 		state.EmulatedTPM = false
-		id.hardwarePresent = true
+		// Without tpm-mode nothing probed the device; look instead of assuming.
+		id.hardwarePresent = hw.Present()
 	case elementalv1.TPMModeEmulated:
 		seed, err := getTPMSeed(reg, false, 0, state.EmulatedTPMSeedSalt)
 		if err != nil {

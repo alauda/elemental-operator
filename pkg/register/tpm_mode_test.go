@@ -103,6 +103,8 @@ var _ = Describe("tpm-mode for a new identity", Label("registration", "tpm-mode"
 		Expect(id.mode).To(Equal(elementalv1.TPMModeHardware))
 		Expect(state.TPMModeSource).To(Equal(TPMModeSourceEmulateTPM))
 		Expect(hw.probes).To(BeZero())
+		// Not probed, so the device is looked at rather than assumed.
+		Expect(id.hardwarePresent).To(BeFalse())
 	})
 	It("auto uses a hardware TPM that passes the probe", func() {
 		hw.probe = usableTPM
