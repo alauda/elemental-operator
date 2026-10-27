@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -841,4 +842,179 @@ func TestDecodeLiveInstallSessionBoundsWhatItStores(t *testing.T) {
 	// never gets approved for wiping.
 	g.Expect(decoded.StaleSystemDisks[1]).To(Equal(elementalv1.StaleSystemDisk{ID: "wwn:0x1", Action: elementalv1.StaleSystemDiskBlocked, Reason: `elemental-register reported action "Target"`}))
 	g.Expect(decoded.StaleSystemDisks[2]).To(Equal(elementalv1.StaleSystemDisk{ID: "wwn:0x2", Action: elementalv1.StaleSystemDiskBlocked, Reason: `elemental-register reported action "": busy`}))
+}
+
+// report sends an install report on a session of its own, the way a
+// released host does, and returns the reply.
+func (e *installTestEnv) report(auth string, report register.InstallReport) (register.MessageType, []byte) {
+	e.t.Helper()
+	g := NewWithT(e.t)
+	ws := e.dial(auth, register.MsgLast)
+	defer ws.Close()
+	data, err := json.Marshal(report)
+	g.Expect(err).ToNot(HaveOccurred())
+	reply, payload := exchange(e.t, ws, register.MsgInstallReport, data)
+	if reply == register.MsgReady {
+		// The server ends the session instead of waiting for more.
+		g.Expect(ws.SetReadDeadline(time.Now().Add(5 * time.Second))).To(Succeed())
+		_, _, err := ws.ReadMessage()
+		var netErr net.Error
+		g.Expect(errors.As(err, &netErr) && netErr.Timeout()).To(BeFalse(), "the server kept the report session open")
+	}
+	return reply, payload
+}
+
+func installingInventory(bootID string) *elementalv1.MachineInventory {
+	inventory := liveInventory("node-a")
+	session := liveSession(bootID)
+	inventory.Status.Install = &elementalv1.InstallStatus{
+		Phase: elementalv1.InstallPhaseInstalling, BootID: bootID, TargetDeviceID: diskA,
+		Candidates: session.Candidates, StaleSystemDisks: session.StaleSystemDisks,
+	}
+	return inventory
+}
+
+func TestInstallReportOfAFailedInstall(t *testing.T) {
+	for _, tc := range []struct {
+		reason    string
+		condition string
+	}{
+		{reason: elementalv1.WipeFailedReason, condition: elementalv1.StaleSystemDisksCondition},
+		{reason: elementalv1.BlockedReason, condition: elementalv1.StaleSystemDisksCondition},
+		{reason: elementalv1.TargetMismatchReason, condition: elementalv1.InstallTargetReadyCondition},
+		{reason: elementalv1.TargetNotObservedReason, condition: elementalv1.InstallTargetReadyCondition},
+		{reason: "TargetAmbiguous", condition: elementalv1.InstallTargetReadyCondition},
+		{reason: "ImagePullFailed"},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			g := NewWithT(t)
+			env := newInstallTestEnv(t, installEnvOptions{}, installingInventory("boot-1"))
+			before := env.inventory("node-a")
+
+			reply, data := env.report(hostA.auth, register.InstallReport{
+				BootID: "boot-1", Phase: elementalv1.InstallPhaseFailed, TargetDeviceID: diskA,
+				Reason: tc.reason, Message: "something went wrong on " + diskB,
+			})
+			g.Expect(reply).To(Equal(register.MsgReady), string(data))
+
+			inventory := env.inventory("node-a")
+			install := inventory.Status.Install
+			g.Expect(install.Phase).To(Equal(elementalv1.InstallPhaseFailed))
+			g.Expect(install.Message).To(Equal("something went wrong on " + diskB))
+			g.Expect(install.TargetDeviceID).To(Equal(diskA))
+			g.Expect(install.BootID).To(Equal("boot-1"))
+			if tc.condition != "" {
+				reported := condition(inventory, tc.condition)
+				g.Expect(reported).To(haveCondition(metav1.ConditionFalse, tc.reason))
+				g.Expect(reported.Message).To(Equal(install.Message))
+			} else {
+				g.Expect(inventory.Status.Conditions).To(Equal(before.Status.Conditions))
+			}
+			g.Expect(env.events()).To(ConsistOf(SatisfyAll(
+				HavePrefix("Warning InstallFailed the install in live boot boot-1 failed ("+tc.reason+")"),
+				HaveSuffix("something went wrong on "+diskB),
+			)))
+		})
+	}
+}
+
+func TestInstallReportOfARunningInstall(t *testing.T) {
+	g := NewWithT(t)
+	inventory := installingInventory("boot-1")
+	inventory.Status.Install.TargetDeviceID = ""
+	env := newInstallTestEnv(t, installEnvOptions{}, inventory)
+
+	reply, data := env.report(hostA.auth, register.InstallReport{BootID: "boot-1", Phase: elementalv1.InstallPhaseInstalling, TargetDeviceID: diskA})
+	g.Expect(reply).To(Equal(register.MsgReady), string(data))
+	install := env.inventory("node-a").Status.Install
+	g.Expect(install.Phase).To(Equal(elementalv1.InstallPhaseInstalling))
+	g.Expect(install.TargetDeviceID).To(Equal(diskA))
+	g.Expect(env.events()).To(BeEmpty())
+}
+
+func TestInstallReportOfAnotherBootIsIgnored(t *testing.T) {
+	for name, inventory := range map[string]*elementalv1.MachineInventory{
+		"another boot":     installingInventory("boot-2"),
+		"no install known": liveInventory("node-a"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			env := newInstallTestEnv(t, installEnvOptions{}, inventory)
+			before := env.inventory("node-a")
+			reply, data := env.report(hostA.auth, register.InstallReport{BootID: "boot-1", Phase: elementalv1.InstallPhaseFailed, Reason: elementalv1.WipeFailedReason, Message: "late"})
+			g.Expect(reply).To(Equal(register.MsgReady), string(data))
+			g.Expect(env.inventory("node-a").Status).To(Equal(before.Status))
+			g.Expect(env.events()).To(BeEmpty())
+		})
+	}
+}
+
+func TestInstallReportIsAProtocolErrorWhenMalformed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		auth    string
+		payload string
+		message string
+	}{
+		{name: "unknown identity", auth: "tpm:hash-new", payload: `{"bootID":"boot-1","phase":"Failed"}`, message: "needs a registered MachineInventory"},
+		{name: "not JSON", auth: hostA.auth, payload: "[", message: "cannot decode install report"},
+		{name: "unexpected phase", auth: hostA.auth, payload: `{"bootID":"boot-1","phase":"Installed"}`, message: `phase "Installed"`},
+		{name: "no phase", auth: hostA.auth, payload: `{"bootID":"boot-1"}`, message: `phase ""`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			env := newInstallTestEnv(t, installEnvOptions{}, installingInventory("boot-1"))
+			ws := env.dial(tc.auth, register.MsgLast)
+			defer ws.Close()
+			reply, data := exchange(t, ws, register.MsgInstallReport, []byte(tc.payload))
+			g.Expect(errorReply(t, reply, data).Message).To(ContainSubstring(tc.message))
+			g.Expect(env.inventories()).To(HaveLen(1))
+			g.Expect(env.inventory("node-a").Status.Install.Phase).To(Equal(elementalv1.InstallPhaseInstalling))
+		})
+	}
+}
+
+// A host goes through the whole live install: it waits, is released, fails
+// to wipe a stale system disk, is released again after a person dealt with
+// it, and its installed system registers.
+func TestLiveInstallEndToEnd(t *testing.T) {
+	g := NewWithT(t)
+	env := newInstallTestEnv(t, installEnvOptions{}, liveInventory("node-a"))
+
+	g.Expect(env.hold(hostA.in("boot-1")).Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	env.selectDisk("node-a", diskA)
+	config, _ := env.config(hostA.in("boot-1"))
+	g.Expect(*config.Elemental.InstallTarget.WipeDeviceIDs).To(Equal([]string{diskB}))
+
+	reply, _ := env.report(hostA.auth, register.InstallReport{BootID: "boot-1", Phase: elementalv1.InstallPhaseInstalling, TargetDeviceID: diskA})
+	g.Expect(reply).To(Equal(register.MsgReady))
+	reply, _ = env.report(hostA.auth, register.InstallReport{BootID: "boot-1", Phase: elementalv1.InstallPhaseFailed, TargetDeviceID: diskA,
+		Reason: elementalv1.WipeFailedReason, Message: diskB + " still carries COS_STATE after the wipe"})
+	g.Expect(reply).To(Equal(register.MsgReady))
+	g.Expect(condition(env.inventory("node-a"), elementalv1.StaleSystemDisksCondition)).To(haveCondition(metav1.ConditionFalse, elementalv1.WipeFailedReason))
+
+	// elemental-register starts over in the same boot: the selection was
+	// consumed, a person picks again.
+	hold := env.hold(hostA.in("boot-1"))
+	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	install := env.inventory("node-a").Status.Install
+	g.Expect(install.Phase).To(Equal(elementalv1.InstallPhaseAwaitingTarget))
+	g.Expect(install.Message).To(Equal("the last install attempt in this live boot failed: " + diskB + " still carries COS_STATE after the wipe"))
+	env.selectDisk("node-a", diskA)
+	config, _ = env.config(hostA.in("boot-1"))
+	g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
+
+	// The installed system registers: no live session any more.
+	env.config(liveHost{auth: hostA.auth, annotations: map[string]string{"registration-ip": "10.0.0.31"}})
+	inventory := env.inventory("node-a")
+	g.Expect(inventory.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseInstalled))
+	g.Expect(inventory.Status.Install.TargetDeviceID).To(Equal(diskA))
+	g.Expect(condition(inventory, elementalv1.InstallTargetReadyCondition)).To(haveCondition(metav1.ConditionTrue, elementalv1.ReleasedReason))
+	g.Expect(condition(inventory, elementalv1.StaleSystemDisksCondition)).To(haveCondition(metav1.ConditionTrue, elementalv1.WipedReason))
+	g.Expect(inventory.Labels).To(HaveKeyWithValue(elementalv1.RegistrationIPLabel, "10.0.0.31"))
+	g.Expect(env.events()).To(ConsistOf(
+		HavePrefix("Normal InstallReleased"),
+		HavePrefix("Warning InstallFailed"),
+		HavePrefix("Normal InstallReleased"),
+	))
 }

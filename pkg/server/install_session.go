@@ -45,14 +45,21 @@ import (
 // (MsgLiveInstallSession) before MsgGet. The server records them in
 // status.install and holds the host (MsgInstallHold) until a person picks the
 // install disk with the one-shot install-target annotation; the next
-// registration then consumes the annotation and releases the install.
+// registration then consumes the annotation and releases the install. The
+// released host reports how its install goes (MsgInstallReport) on a short
+// session of its own.
 
 // Event reasons of live install sessions, recorded on the MachineInventory.
 const (
 	EventReasonInstallReleased    = "InstallReleased"
 	EventReasonInstallInterrupted = "InstallInterrupted"
+	EventReasonInstallFailed      = "InstallFailed"
 	EventReasonSelectionDiscarded = "SelectionDiscarded"
 )
+
+// targetAmbiguousReason is what elemental-register reports when several disks
+// carry the released ID; the API has no constant for it.
+const targetAmbiguousReason = "TargetAmbiguous"
 
 // installTargetRequiresSelection is install.device in the configuration of
 // an inventory-mode registration that releases no install. No such disk
@@ -736,6 +743,106 @@ func installReleasedTo(target elementalv1.InstallTarget) func(*elementalv1.Confi
 		config.Elemental.Install.DeviceSelector = nil
 		config.Elemental.InstallTarget = &target
 	}
+}
+
+// handleInstallReport records the outcome a released host reports on a short
+// session of its own, then ends the session.
+func (i *InventoryServer) handleInstallReport(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, data []byte) error {
+	if err := i.recordInstallReport(inventory, data); err != nil {
+		if writeErr := writeError(conn, protoVersion, register.NewErrorMessage(err)); writeErr != nil {
+			log.Errorf("Error reporting back error to client: %v", writeErr)
+		}
+		return err
+	}
+	if err := register.WriteMessage(conn, register.MsgReady, nil); err != nil {
+		return fmt.Errorf("cannot acknowledge the install report: %w", err)
+	}
+	return nil
+}
+
+// recordInstallReport applies a MsgInstallReport payload to status.install. A
+// report from another live boot than the one recorded is ignored: it is
+// stale.
+func (i *InventoryServer) recordInstallReport(inventory *elementalv1.MachineInventory, data []byte) error {
+	if isNewInventory(inventory) || inventory.UID == "" {
+		return errors.New("an install report needs a registered MachineInventory")
+	}
+	report, err := decodeInstallReport(data)
+	if err != nil {
+		return err
+	}
+	now := i.now()
+	applied := false
+	err = i.patchInstallStatus(inventory, func(status *elementalv1.MachineInventoryStatus) bool {
+		install := status.Install
+		applied = install != nil && install.BootID == report.BootID
+		if !applied {
+			return false
+		}
+		install.Phase = report.Phase
+		if report.TargetDeviceID != "" {
+			install.TargetDeviceID = report.TargetDeviceID
+		}
+		if report.Phase == elementalv1.InstallPhaseFailed {
+			install.Message = report.Message
+			if condition := reportedCondition(report); condition != nil {
+				setInstallCondition(status, *condition, now)
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("cannot record the install report on MachineInventory %s/%s: %w", inventory.Namespace, inventory.Name, err)
+	}
+	if !applied {
+		log.Warningf("Ignoring the install report of live boot %s for MachineInventory %s/%s: status.install belongs to another boot", report.BootID, inventory.Namespace, inventory.Name)
+		return nil
+	}
+	if report.Phase == elementalv1.InstallPhaseFailed {
+		message := fmt.Sprintf("the install in live boot %s failed", report.BootID)
+		if report.Reason != "" {
+			message += " (" + report.Reason + ")"
+		}
+		i.recordEvent(inventory, corev1.EventTypeWarning, EventReasonInstallFailed, message+": "+report.Message)
+	}
+	log.Infof("MachineInventory %s/%s: live boot %s reports the install %s", inventory.Namespace, inventory.Name, report.BootID, report.Phase)
+	return nil
+}
+
+// decodeInstallReport parses a MsgInstallReport payload and bounds it.
+func decodeInstallReport(data []byte) (*register.InstallReport, error) {
+	report := &register.InstallReport{}
+	if err := json.Unmarshal(data, report); err != nil {
+		return nil, fmt.Errorf("cannot decode install report: %w", err)
+	}
+	switch report.Phase {
+	case elementalv1.InstallPhaseInstalling, elementalv1.InstallPhaseFailed:
+	default:
+		return nil, fmt.Errorf("install report has phase %q, expected %s or %s", truncate(string(report.Phase), 64), elementalv1.InstallPhaseInstalling, elementalv1.InstallPhaseFailed)
+	}
+	report.BootID = strings.TrimSpace(report.BootID)
+	report.TargetDeviceID = truncate(strings.TrimSpace(report.TargetDeviceID), maxInstallField)
+	report.Reason = truncate(strings.TrimSpace(report.Reason), maxInstallField)
+	report.Message = truncate(strings.TrimSpace(report.Message), maxInstallMessage)
+	if report.Phase == elementalv1.InstallPhaseFailed && report.Message == "" {
+		report.Message = "elemental-register reported no details"
+	}
+	return report, nil
+}
+
+// reportedCondition is the condition a failed install sets: its reason says
+// whether the target disk or a stale system disk stopped the install.
+func reportedCondition(report *register.InstallReport) *metav1.Condition {
+	condition := &metav1.Condition{Status: metav1.ConditionFalse, Reason: report.Reason, Message: report.Message}
+	switch report.Reason {
+	case elementalv1.BlockedReason, elementalv1.WipeFailedReason:
+		condition.Type = elementalv1.StaleSystemDisksCondition
+	case elementalv1.TargetNotObservedReason, elementalv1.TargetIneligibleReason, elementalv1.TargetMismatchReason, targetAmbiguousReason:
+		condition.Type = elementalv1.InstallTargetReadyCondition
+	default:
+		return nil
+	}
+	return condition
 }
 
 // liveBootTracker remembers the last two live boots that registered for each

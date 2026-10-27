@@ -333,6 +333,8 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 				return err
 			}
 			sess.liveInstall = session
+		case register.MsgInstallReport:
+			return i.handleInstallReport(conn, protoVersion, inventory, data)
 		case register.MsgObserveStorage:
 			if isNewInventory(inventory) || inventory.UID == "" {
 				return errors.New("storage observer requires an existing MachineInventory UID")
