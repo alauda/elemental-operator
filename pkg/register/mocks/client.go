@@ -72,3 +72,32 @@ func (mr *MockClientMockRecorder) Register(arg0, arg1, arg2 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Register", reflect.TypeOf((*MockClient)(nil).Register), arg0, arg1, arg2)
 }
+
+// RegisterForInstall mocks base method.
+func (m *MockClient) RegisterForInstall(arg0 v1beta1.Registration, arg1 []byte, arg2 *register.State, arg3 *register.LiveInstallSession) ([]byte, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RegisterForInstall", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].([]byte)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RegisterForInstall indicates an expected call of RegisterForInstall.
+func (mr *MockClientMockRecorder) RegisterForInstall(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RegisterForInstall", reflect.TypeOf((*MockClient)(nil).RegisterForInstall), arg0, arg1, arg2, arg3)
+}
+
+// ReportInstall mocks base method.
+func (m *MockClient) ReportInstall(arg0 v1beta1.Registration, arg1 []byte, arg2 *register.State, arg3 register.InstallReport) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ReportInstall", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ReportInstall indicates an expected call of ReportInstall.
+func (mr *MockClientMockRecorder) ReportInstall(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReportInstall", reflect.TypeOf((*MockClient)(nil).ReportInstall), arg0, arg1, arg2, arg3)
+}

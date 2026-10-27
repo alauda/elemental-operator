@@ -44,6 +44,13 @@ import (
 
 type Client interface {
 	Register(reg elementalv1.Registration, caCert []byte, state *State) ([]byte, error)
+	// RegisterForInstall is Register that also sends the live install
+	// session of a host booted from the live ISO with --install; the
+	// operator may hold the host instead (*InstallHoldError). See
+	// install_client.go.
+	RegisterForInstall(reg elementalv1.Registration, caCert []byte, state *State, session *LiveInstallSession) ([]byte, error)
+	// ReportInstall reports the install outcome of a released host.
+	ReportInstall(reg elementalv1.Registration, caCert []byte, state *State, report InstallReport) error
 }
 
 type authClient interface {
@@ -56,7 +63,11 @@ type authClient interface {
 
 var _ Client = (*client)(nil)
 
-type client struct{}
+type client struct {
+	// sessionUnsupportedLogged is set once RegisterForInstall said that the
+	// operator has no live install session.
+	sessionUnsupportedLogged bool
+}
 
 func NewClient() Client {
 	return &client{}
@@ -82,7 +93,7 @@ func (e *RegistrationError) Error() string {
 // Registration updates will fetch and apply new labels, and update Machine annotations such as the IP address.
 func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *State) ([]byte, error) {
 	return registerWithSaltRetries(state, func() ([]byte, *tpmIdentity, error) {
-		return r.register(reg, caCert, state)
+		return r.register(reg, caCert, state, nil)
 	})
 }
 
@@ -118,18 +129,19 @@ func registerWithSaltRetries(state *State, attempt func() ([]byte, *tpmIdentity,
 	}
 }
 
-// register is one registration attempt. It also returns how the TPM
-// identity was resolved, which decides about retrying.
-func (r *client) register(reg elementalv1.Registration, caCert []byte, state *State) ([]byte, *tpmIdentity, error) {
+// register is one registration attempt, with the live install session when
+// there is one. It also returns how the TPM identity was resolved, which
+// decides about retrying.
+func (r *client) register(reg elementalv1.Registration, caCert []byte, state *State, session *LiveInstallSession) ([]byte, *tpmIdentity, error) {
 	auth, tpmID, err := newAuthenticator(reg, state)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing authenticator: %w", err)
 	}
-	data, err := r.registerWith(reg, caCert, state, auth, tpmID)
+	data, err := r.registerWith(reg, caCert, state, auth, tpmID, session)
 	return data, tpmID, err
 }
 
-func (r *client) registerWith(reg elementalv1.Registration, caCert []byte, state *State, auth authClient, tpmID *tpmIdentity) ([]byte, error) {
+func (r *client) registerWith(reg elementalv1.Registration, caCert []byte, state *State, auth authClient, tpmID *tpmIdentity, session *LiveInstallSession) ([]byte, error) {
 	log.Infof("Connect to %s", reg.URL)
 
 	conn, err := initWebsocketConn(reg.URL, caCert, auth)
@@ -184,6 +196,12 @@ func (r *client) registerWith(reg elementalv1.Registration, caCert []byte, state
 		if err := sendObservedNetwork(conn); err != nil {
 			// Informational data: warn but continue registration.
 			log.Warningf("failed to send observed network snapshot: %v", err)
+		}
+	}
+
+	if session != nil {
+		if err := r.sendLiveInstallSession(conn, protoVersion, session); err != nil {
+			return nil, err
 		}
 	}
 
@@ -567,6 +585,8 @@ func getConfig(conn *websocket.Conn) ([]byte, error) {
 		return nil, &RegistrationError{Code: msg.Code, Message: msg.Message}
 	case MsgConfig:
 		return data, nil
+	case MsgInstallHold:
+		return nil, installHoldError(data)
 	default:
 		return nil, fmt.Errorf("unexpected response message: %s", msgType)
 	}
