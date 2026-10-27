@@ -319,49 +319,75 @@ func TestIdentityMatchingHardwareRegisters(t *testing.T) {
 	g.Expect(env.events()).To(BeEmpty())
 }
 
-func TestIdentityConflictLeavesInventoryUntouched(t *testing.T) {
-	g := NewWithT(t)
-	stored := registeredInventory("node-a", "hash-a", "emulated-tpm", fingerprintOf(uuidA, "", ""))
-	env := newIdentityTestEnv(t, stored)
-	before := env.inventory("node-a")
-
-	// Host B derived the same EK (31-bit seed collision) on its first
-	// registration: it can retry with another salt.
-	reply, data := env.register(host{auth: "tpm:hash-a", smbios: smbios(uuidB, "", ""), annotations: selfHealingClient()})
-	message := errorReply(t, reply, data)
-	g.Expect(message.Code).To(Equal(register.ErrorCodeIdentityConflict))
-	g.Expect(message.Message).To(ContainSubstring("node-a"))
-
-	g.Expect(env.inventory("node-a")).To(Equal(before))
-	g.Expect(env.inventories()).To(HaveLen(1))
-	events := env.events()
-	g.Expect(events).To(HaveLen(1))
-	g.Expect(events[0]).To(HavePrefix("Warning IdentityConflict hardware fingerprint does not match the registered host"))
-	g.Expect(events[0]).To(ContainSubstring("retries with another seed salt"))
+// conflictingClients are the kinds of host that can present an identity
+// another host's inventory already holds.
+var conflictingClients = []struct {
+	name        string
+	plain       bool
+	annotations map[string]string
+	event       string
+}{
+	{name: "new client with a derived seed", annotations: selfHealingClient(), event: "retries with another seed salt"},
+	{name: "static seed", annotations: map[string]string{"auth": "emulated-tpm", "tpm-seed-version": "static"}},
+	{name: "inherited seed", annotations: map[string]string{"auth": "emulated-tpm", "tpm-seed-version": "legacy"}},
+	{name: "old client", annotations: map[string]string{"auth": "emulated-tpm"}},
+	{name: "client without annotations"},
+	{name: "hardware TPM", annotations: map[string]string{"auth": "tpm", "tpm-seed-version": "none"}},
+	{name: "plain auth", plain: true, annotations: map[string]string{"auth": "sys-uuid"}},
 }
 
-func TestIdentityConflictMarksInventoryWhenClientCannotHeal(t *testing.T) {
-	tests := []struct {
-		name string
-		host host
-	}{
-		{name: "installed host", host: host{update: true, annotations: map[string]string{"auth": "emulated-tpm", "tpm-seed-version": "2"}}},
-		{name: "static seed", host: host{annotations: map[string]string{"auth": "emulated-tpm", "tpm-seed-version": "static"}}},
-		{name: "inherited seed", host: host{annotations: map[string]string{"auth": "emulated-tpm", "tpm-seed-version": "legacy"}}},
-		{name: "old client", host: host{annotations: map[string]string{"auth": "emulated-tpm"}}},
-		{name: "hardware TPM", host: host{annotations: map[string]string{"auth": "tpm", "tpm-seed-version": "none"}}},
+// conflictEnv holds node-a, registered by host A, under the identity the
+// client kind authenticates with.
+func conflictEnv(t *testing.T, plain bool) (*identityTestEnv, string) {
+	stored := registeredInventory("node-a", "hash-a", "emulated-tpm", fingerprintOf(uuidA, "", ""))
+	auth := "tpm:hash-a"
+	if plain {
+		stored.Spec = elementalv1.MachineInventorySpec{MachineHash: "plain-a"}
+		stored.Annotations[elementalv1.MachineInventoryAuthAnnotation] = "sys-uuid"
+		auth = "plain:plain-a"
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	return newIdentityTestEnv(t, stored), auth
+}
+
+func TestIdentityConflictOnFirstRegistrationLeavesInventoryUntouched(t *testing.T) {
+	for _, client := range conflictingClients {
+		t.Run(client.name, func(t *testing.T) {
 			g := NewWithT(t)
-			env := newIdentityTestEnv(t, registeredInventory("node-a", "hash-a", "emulated-tpm", fingerprintOf(uuidA, "", "")))
+			env, auth := conflictEnv(t, client.plain)
 			before := env.inventory("node-a")
 
-			h := tt.host
-			h.auth = "tpm:hash-a"
-			h.smbios = smbios(uuidB, "", "")
-			message := env.refused(h)
+			// Host B presents A's identity on its first registration: it
+			// never got node-a's system-agent credentials.
+			message := env.refused(host{auth: auth, smbios: smbios(uuidB, "", ""), annotations: client.annotations})
 			g.Expect(message.Code).To(Equal(register.ErrorCodeIdentityConflict))
+			g.Expect(message.Message).To(ContainSubstring("node-a"))
+
+			g.Expect(env.inventory("node-a")).To(Equal(before))
+			g.Expect(env.inventories()).To(HaveLen(1))
+			event := client.event
+			if event == "" {
+				event = "first registration refused"
+			}
+			g.Expect(env.events()).To(ConsistOf(SatisfyAll(
+				HavePrefix("Warning IdentityConflict hardware fingerprint does not match the registered host"),
+				ContainSubstring(event),
+			)))
+		})
+	}
+}
+
+func TestIdentityConflictOnReRegistrationMarksInventory(t *testing.T) {
+	for _, client := range conflictingClients {
+		t.Run(client.name, func(t *testing.T) {
+			g := NewWithT(t)
+			env, auth := conflictEnv(t, client.plain)
+			before := env.inventory("node-a")
+
+			// An installed host B (MsgUpdate) presents A's identity: it
+			// holds node-a's system-agent credentials.
+			message := env.refused(host{auth: auth, update: true, smbios: smbios(uuidB, "", ""), annotations: client.annotations})
+			g.Expect(message.Code).To(Equal(register.ErrorCodeIdentityConflict))
+			g.Expect(message.Message).To(ContainSubstring(elementalv1.IdentityConflictAnnotation))
 
 			after := env.inventory("node-a")
 			g.Expect(after.Annotations).To(HaveKeyWithValue(elementalv1.IdentityConflictAnnotation, HavePrefix("hardware fingerprint does not match the registered host")))
@@ -411,6 +437,14 @@ func TestIdentityBackfillChecksOldEvidence(t *testing.T) {
 		inventory := env.inventory("node-4c4c4544-0042-3510-8058-b4c04f4d4e32")
 		g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.HardwareFingerprintAnnotation))
 		g.Expect(inventory.Annotations).To(HaveKey(elementalv1.IdentityConflictAnnotation))
+	})
+	t.Run("a contradicting first registration is only refused", func(t *testing.T) {
+		g := NewWithT(t)
+		env := newIdentityTestEnv(t, legacy("node-4c4c4544-0042-3510-8058-b4c04f4d4e32", uuidA))
+		before := env.inventory("node-4c4c4544-0042-3510-8058-b4c04f4d4e32")
+		message := env.refused(host{auth: "tpm:hash-a", smbios: smbios(uuidB, "", ""), annotations: map[string]string{"auth": "emulated-tpm"}})
+		g.Expect(message.Code).To(Equal(register.ErrorCodeIdentityConflict))
+		g.Expect(env.inventory("node-4c4c4544-0042-3510-8058-b4c04f4d4e32")).To(Equal(before))
 	})
 	t.Run("a machine-uuid annotation contradicting the host is a conflict", func(t *testing.T) {
 		g := NewWithT(t)

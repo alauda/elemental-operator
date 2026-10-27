@@ -45,10 +45,12 @@ const (
 	HardwareFingerprintStrong             = "strong"
 	HardwareFingerprintWeak               = "weak"
 	// IdentityConflictAnnotation marks a MachineInventory whose identity was
-	// presented by other hardware that cannot switch to a new identity by
-	// itself (static seed, hardware TPM, an old client, or an installed host).
-	// The value describes the conflict. The MachineInventory controller keeps
-	// the inventory Ready=False/IdentityConflict until an operator removes it.
+	// presented by other hardware that had registered with it before (a
+	// re-registration, i.e. MsgUpdate), so that hardware holds the inventory's
+	// system-agent credentials. First registrations that collide are only
+	// refused and leave the inventory alone. The value describes the
+	// conflict. The MachineInventory controller keeps the inventory
+	// Ready=False/IdentityConflict until an operator removes it.
 	IdentityConflictAnnotation = "elemental.cattle.io/identity-conflict"
 	// AllowIdentityRebindAnnotation, set by an operator, lets a registration
 	// move this inventory's identity: a hardware TPM inventory (or one in

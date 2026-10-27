@@ -107,9 +107,10 @@ type ErrorMessage struct {
 const (
 	// ErrorCodeIdentityConflict: the identity the host authenticated with
 	// belongs to a MachineInventory that other hardware registered, and the
-	// server left that inventory untouched. A host registering an identity
-	// it derived itself (see TPMSeedVersionAnnotation) answers it by
-	// deriving the next one; for any other host an operator has to step in.
+	// server did not commit anything (it only marks the inventory when the
+	// host had registered before). A host registering an identity it derived
+	// itself (see TPMSeedVersionAnnotation) answers it by deriving the next
+	// one; any other host needs an operator to give it another identity.
 	ErrorCodeIdentityConflict = "IdentityConflict"
 	// ErrorCodeIdentityRebindRequired: the identity is new, but the hardware
 	// fingerprint matches a MachineInventory whose identity the server does

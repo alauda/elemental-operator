@@ -254,22 +254,33 @@ func (i *InventoryServer) checkKnownIdentity(conn *websocket.Conn, protoVersion 
 }
 
 // refuseIdentityConflict leaves the stored inventory as it is, tells the
-// client, and records the conflict. A client that cannot pick another
-// identity also gets the inventory marked: whoever holds that identity can
-// fetch its system-agent configuration, so a person has to look at it.
+// client and records a Warning event. Only a host that registered before
+// (the session sent MsgUpdate) also gets the inventory marked
+// identity-conflict, which keeps it Ready=False: that host already holds the
+// inventory's system-agent credentials, so a person has to look at it. A
+// first registration never received them and is only refused, whatever the
+// client: a new host whose derived seed collided retries with the next salt,
+// any other keeps being refused until an operator gives it another identity.
 func (i *InventoryServer) refuseIdentityConflict(conn *websocket.Conn, protoVersion register.MessageType, sess *registrationSession, fields identity.Fields, mismatch string) error {
 	stored := sess.stored
 	detail := fmt.Sprintf("%s: %s (registering host: %s, %s)", identityConflictMessage, mismatch, fields.Describe(), sess.describeClient())
 	clientMessage := fmt.Sprintf("identity conflict: MachineInventory %s/%s belongs to other hardware; %s", stored.Namespace, stored.Name, mismatch)
-	if sess.selfHealing() {
-		i.recordEvent(stored, corev1.EventTypeWarning, EventReasonIdentityConflict, detail+"; the host derived this identity and retries with another seed salt")
-		clientMessage += "; derive another identity and register again"
-	} else {
-		i.recordEvent(stored, corev1.EventTypeWarning, EventReasonIdentityConflict, detail+"; marked with "+elementalv1.IdentityConflictAnnotation)
+	switch {
+	case sess.update:
+		i.recordEvent(stored, corev1.EventTypeWarning, EventReasonIdentityConflict,
+			detail+"; the host registered before and holds this inventory's system-agent credentials, marked with "+elementalv1.IdentityConflictAnnotation)
 		if err := i.markIdentityConflict(stored, detail); err != nil {
 			log.Errorf("Cannot mark MachineInventory %s/%s with %s: %v", stored.Namespace, stored.Name, elementalv1.IdentityConflictAnnotation, err)
 		}
 		clientMessage += fmt.Sprintf("; the inventory is marked %s until an operator resolves it", elementalv1.IdentityConflictAnnotation)
+	case sess.selfHealing():
+		i.recordEvent(stored, corev1.EventTypeWarning, EventReasonIdentityConflict,
+			detail+"; first registration of an identity the host derived, it retries with another seed salt")
+		clientMessage += "; derive another identity and register again"
+	default:
+		i.recordEvent(stored, corev1.EventTypeWarning, EventReasonIdentityConflict,
+			detail+"; first registration refused, the inventory is left as it is")
+		clientMessage += "; this host cannot change its identity by itself: give it a unique one (an ISO that derives the emulated TPM seed from the hardware, or a unique emulated-tpm-seed)"
 	}
 	log.Warningf("Refusing registration for MachineInventory %s/%s: %s", stored.Namespace, stored.Name, detail)
 	if err := writeError(conn, protoVersion, register.ErrorMessage{Message: clientMessage, Code: register.ErrorCodeIdentityConflict}); err != nil {

@@ -63,9 +63,11 @@ const (
 	// itself: a registration that sends tpm-seed-version=2 and no MsgUpdate
 	// is the first registration of an identity this client derived, and on
 	// an IdentityConflict error the client derives the next one (new salt)
-	// and registers again. Everything else (MsgUpdate, static or legacy
-	// seeds, hardware TPMs, plain auth, clients that predate this
-	// annotation) cannot change its identity and needs an operator.
+	// and registers again. Everything else (static or legacy seeds, hardware
+	// TPMs, plain auth, clients that predate this annotation) cannot change
+	// its identity and is refused until an operator acts; after a MsgUpdate
+	// the server also marks the inventory, since that host already holds its
+	// system-agent credentials.
 	TPMSeedVersionAnnotation = "tpm-seed-version"
 	tpmSeedSaltAnnotation    = "tpm-seed-salt"
 

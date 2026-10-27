@@ -91,8 +91,8 @@ func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *St
 // the seed again with the next salt, at most MaxSeedSaltRetries times. The
 // state the caller saves after a success keeps the salt that worked. Static
 // seeds, inherited seeds, hardware TPMs and registered hosts never retry:
-// their identity is what it is, the server marks the conflict for an
-// operator.
+// their identity is what it is and stays refused until an operator acts
+// (the server marks the inventory when a registered host conflicts).
 func registerWithSaltRetries(state *State, attempt func() ([]byte, *tpmIdentity, error)) ([]byte, error) {
 	loaded := *state
 	for retry := 0; ; retry++ {
