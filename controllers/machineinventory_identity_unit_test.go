@@ -18,13 +18,19 @@ package controllers
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
@@ -84,9 +90,87 @@ func TestMachineInventoryIdentityConflictWithEmptyAnnotation(t *testing.T) {
 	inventory := &elementalv1.MachineInventory{ObjectMeta: metav1.ObjectMeta{
 		Annotations: map[string]string{elementalv1.IdentityConflictAnnotation: ""},
 	}}
-	setIdentityConflictCondition(inventory)
+	setIdentityConflictCondition(inventory, nil)
 	ready := meta.FindStatusCondition(inventory.Status.Conditions, elementalv1.ReadyCondition)
 	g.Expect(ready).ToNot(BeNil())
 	g.Expect(ready.Reason).To(Equal(elementalv1.IdentityConflictReason))
 	g.Expect(ready.Message).To(ContainSubstring(elementalv1.IdentityConflictAnnotation))
+}
+
+func TestMachineInventoryIdentityConflictKeepsPlanCreationRetrying(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	inventory := &elementalv1.MachineInventory{ObjectMeta: metav1.ObjectMeta{
+		Name: "node-a", Namespace: "default",
+		Finalizers:  []string{elementalv1.MachineInventoryFinalizer},
+		Annotations: map[string]string{elementalv1.IdentityConflictAnnotation: "hardware fingerprint does not match the registered host: x"},
+	}}
+	failCreate := true
+	scheme := newFakeElementalClient(t).Scheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(inventory).WithInterceptorFuncs(interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, secret := obj.(*corev1.Secret); secret && failCreate {
+				return errors.New("apiserver unavailable")
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}).Build()
+	r := &MachineInventoryReconciler{Client: cl}
+	key := client.ObjectKeyFromObject(inventory)
+
+	_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+	g.Expect(err).To(HaveOccurred())
+	current := &elementalv1.MachineInventory{}
+	g.Expect(cl.Get(ctx, key, current)).To(Succeed())
+	ready := meta.FindStatusCondition(current.Status.Conditions, elementalv1.ReadyCondition)
+	g.Expect(ready.Reason).To(Equal(elementalv1.PlanCreationFailureReason))
+
+	failCreate = false
+	_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(cl.Get(ctx, key, &corev1.Secret{})).To(Succeed())
+	g.Expect(cl.Get(ctx, key, current)).To(Succeed())
+	g.Expect(meta.FindStatusCondition(current.Status.Conditions, elementalv1.ReadyCondition).Reason).To(Equal(elementalv1.IdentityConflictReason))
+}
+
+func TestMachineInventoryIdentityConflictKeepsTransitionTime(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	since := metav1.NewTime(time.Date(2026, time.October, 1, 0, 0, 0, 0, time.UTC))
+	inventory := &elementalv1.MachineInventory{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-a", Namespace: "default",
+			Finalizers:  []string{elementalv1.MachineInventoryFinalizer},
+			Annotations: map[string]string{elementalv1.IdentityConflictAnnotation: "hardware fingerprint does not match the registered host: x"},
+		},
+		Status: elementalv1.MachineInventoryStatus{
+			Conditions: []metav1.Condition{{Type: elementalv1.ReadyCondition, Status: metav1.ConditionFalse, Reason: elementalv1.IdentityConflictReason, Message: "x", LastTransitionTime: since}},
+			Plan:       &elementalv1.PlanStatus{PlanSecretRef: &corev1.ObjectReference{Namespace: "default", Name: "node-a"}},
+		},
+	}
+	plan := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a", Namespace: "default"},
+		Data:       map[string][]byte{"applied-checksum": []byte("abc")},
+	}
+	cl := newFakeElementalClient(t, inventory, plan)
+	r := &MachineInventoryReconciler{Client: cl}
+	key := client.ObjectKeyFromObject(inventory)
+
+	_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+	g.Expect(err).ToNot(HaveOccurred())
+	current := &elementalv1.MachineInventory{}
+	g.Expect(cl.Get(ctx, key, current)).To(Succeed())
+	ready := meta.FindStatusCondition(current.Status.Conditions, elementalv1.ReadyCondition)
+	g.Expect(ready.Reason).To(Equal(elementalv1.IdentityConflictReason))
+	g.Expect(ready.LastTransitionTime.Time).To(BeTemporally("==", since.Time))
+}
+
+func TestMachineInventoryIdentityConflictMessageStaysValidUTF8(t *testing.T) {
+	g := NewWithT(t)
+	inventory := &elementalv1.MachineInventory{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{elementalv1.IdentityConflictAnnotation: strings.Repeat("序", maxIdentityConflictMessage)},
+	}}
+	setIdentityConflictCondition(inventory, nil)
+	ready := meta.FindStatusCondition(inventory.Status.Conditions, elementalv1.ReadyCondition)
+	g.Expect(utf8.ValidString(ready.Message)).To(BeTrue())
 }
