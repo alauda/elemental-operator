@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
@@ -207,6 +208,10 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 		return ctrl.Result{}, nil
 	}
 
+	// Whatever the plan says, an inventory whose identity other hardware
+	// presented must not look ready: providers only allocate ready ones.
+	defer setIdentityConflictCondition(mInventory)
+
 	if err := r.createPlanSecret(ctx, mInventory); err != nil {
 		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.ReadyCondition,
@@ -237,6 +242,33 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// maxIdentityConflictMessage bounds the condition message taken from the
+// identity-conflict annotation.
+const maxIdentityConflictMessage = 1024
+
+// setIdentityConflictCondition turns Ready false while the registration
+// server's identity-conflict annotation is present. Removing the annotation
+// hands Ready back to the plan status at the next reconcile.
+func setIdentityConflictCondition(mInventory *elementalv1.MachineInventory) {
+	detail, conflict := mInventory.Annotations[elementalv1.IdentityConflictAnnotation]
+	if !conflict {
+		return
+	}
+	message := strings.TrimSpace(detail)
+	if message == "" {
+		message = "hardware fingerprint does not match the registered host"
+	}
+	if len(message) > maxIdentityConflictMessage {
+		message = message[:maxIdentityConflictMessage]
+	}
+	meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
+		Type:    elementalv1.ReadyCondition,
+		Reason:  elementalv1.IdentityConflictReason,
+		Status:  metav1.ConditionFalse,
+		Message: message + "; remove annotation " + elementalv1.IdentityConflictAnnotation + " once resolved",
+	})
 }
 
 func isNetworkConfigReadyWithoutReconciliation(mInventory *elementalv1.MachineInventory) bool {
