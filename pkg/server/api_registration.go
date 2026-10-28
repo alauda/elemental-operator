@@ -298,7 +298,9 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 			if sess.liveInstall != nil {
 				return i.handleLiveInstallGet(conn, protoVersion, inventory, registration, sess)
 			}
-			return i.handleGet(conn, protoVersion, inventory, registration, sess.afterCommit, i.settleInstall)
+			return i.handleGet(conn, protoVersion, inventory, registration, sess.afterCommit, func(committed *elementalv1.MachineInventory) {
+				i.settleInstall(committed, sess.update)
+			})
 		case register.MsgUpdate:
 			err = i.handleUpdate(conn, protoVersion, inventory)
 			if err != nil {

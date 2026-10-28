@@ -84,7 +84,9 @@ type InstallStatus struct {
 	// LastSeenAt is refreshed by every registration of the live session.
 	// +optional
 	LastSeenAt metav1.Time `json:"lastSeenAt,omitempty"`
-	// TargetDeviceID is the canonical ID of the disk the install was released to.
+	// TargetDeviceID is the canonical ID of the disk the install was released
+	// to. While an installed host waits in the live ISO again, it is the disk
+	// its installed system is on.
 	// +optional
 	TargetDeviceID string `json:"targetDeviceID,omitempty"`
 	// +optional

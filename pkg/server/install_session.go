@@ -54,6 +54,7 @@ const (
 	EventReasonInstallReleased    = "InstallReleased"
 	EventReasonInstallInterrupted = "InstallInterrupted"
 	EventReasonInstallFailed      = "InstallFailed"
+	EventReasonInstallCompleted   = "InstallCompleted"
 	EventReasonSelectionDiscarded = "SelectionDiscarded"
 )
 
@@ -233,6 +234,9 @@ type installRound struct {
 	// InstallTargetReady condition; nil removes the condition.
 	next        *elementalv1.InstallStatus
 	targetReady *metav1.Condition
+	// installedTo is the disk the host's installed system is on, when it is
+	// known while the host waits in the live ISO.
+	installedTo string
 }
 
 // handleLiveInstallGet answers MsgGet of a host that sent a live install
@@ -287,6 +291,7 @@ func (i *InventoryServer) installFromSelection(conn *websocket.Conn, protoVersio
 	prev := inventory.Status.Install
 	newBoot := prev == nil || prev.BootID != session.BootID
 	round.next.Message = installHistory(prev, newBoot)
+	round.installedTo = installedTarget(prev, newBoot)
 	if newBoot && prev != nil && prev.Phase == elementalv1.InstallPhaseInstalling {
 		i.recordEvent(inventory, corev1.EventTypeWarning, EventReasonInstallInterrupted, round.next.Message)
 	}
@@ -336,6 +341,8 @@ func installHistory(prev *elementalv1.InstallStatus, newBoot bool) string {
 	switch {
 	case newBoot && prev.Phase == elementalv1.InstallPhaseInstalling:
 		return fmt.Sprintf("the install released%s in live boot %s did not complete", target, prev.BootID)
+	case newBoot && prev.Phase == elementalv1.InstallPhaseInstalled:
+		return fmt.Sprintf("the host booted the live ISO again after the install%s completed; if the installation media stayed attached, remove it and boot from disk, or pick a disk to install again", target)
 	case newBoot:
 		return ""
 	case prev.Phase == elementalv1.InstallPhaseInstalling:
@@ -344,6 +351,23 @@ func installHistory(prev *elementalv1.InstallStatus, newBoot bool) string {
 		return "the last install attempt in this live boot failed: " + prev.Message
 	case prev.Phase == elementalv1.InstallPhaseAwaitingTarget:
 		return prev.Message
+	default:
+		return ""
+	}
+}
+
+// installedTarget is the disk a waiting host's installed system is on: the
+// target of a completed install, kept while the host waits in the live ISO
+// after it (installation media left attached, or a reinstall that was not
+// pursued) until an install is released to another disk. An interrupted or
+// failed install leaves no installed system it would name.
+func installedTarget(prev *elementalv1.InstallStatus, newBoot bool) string {
+	switch {
+	case prev == nil:
+		return ""
+	case newBoot && prev.Phase == elementalv1.InstallPhaseInstalled,
+		!newBoot && prev.Phase == elementalv1.InstallPhaseAwaitingTarget:
+		return prev.TargetDeviceID
 	default:
 		return ""
 	}
@@ -541,7 +565,7 @@ func (i *InventoryServer) holdInstall(conn *websocket.Conn, round *installRound,
 	inventory := round.inventory
 	message = truncate(message, maxInstallMessage)
 	round.next.Phase = elementalv1.InstallPhaseAwaitingTarget
-	round.next.TargetDeviceID = ""
+	round.next.TargetDeviceID = round.installedTo
 	round.targetReady = &metav1.Condition{
 		Type:    elementalv1.InstallTargetReadyCondition,
 		Status:  metav1.ConditionFalse,
@@ -678,9 +702,13 @@ func (i *InventoryServer) discardSelection(inventory *elementalv1.MachineInvento
 // settleInstall runs after a registration without a live install session: an
 // installed system (or a client from before sessions). An install that was
 // released or failed is then over, the system it installed registered; a
-// selection left on the inventory goes with it.
-func (i *InventoryServer) settleInstall(inventory *elementalv1.MachineInventory) {
-	if !installUnsettled(inventory.Status.Install) {
+// selection left on the inventory goes with it. registered is set for a
+// registration update, i.e. a host with registration state: an installed
+// system. Only such a host also ends a wait for an install target, as when
+// the installation media stayed attached and the host went back to the live
+// ISO once before someone booted it from its disk.
+func (i *InventoryServer) settleInstall(inventory *elementalv1.MachineInventory, registered bool) {
+	if !installUnsettled(inventory.Status.Install, registered) {
 		return
 	}
 	if err := i.removeSelection(inventory); err != nil {
@@ -689,11 +717,19 @@ func (i *InventoryServer) settleInstall(inventory *elementalv1.MachineInventory)
 	now := i.now()
 	err := i.patchInstallStatus(inventory, func(status *elementalv1.MachineInventoryStatus) bool {
 		install := status.Install
-		if !installUnsettled(install) {
+		if !installUnsettled(install, registered) {
 			return false
 		}
+		waited := install.Phase == elementalv1.InstallPhaseAwaitingTarget
 		install.Phase = elementalv1.InstallPhaseInstalled
 		install.Message = ""
+		if waited {
+			// The disks were surveyed by a live boot that installed
+			// nothing: they say nothing about the running system.
+			meta.RemoveStatusCondition(&status.Conditions, elementalv1.InstallTargetReadyCondition)
+			meta.RemoveStatusCondition(&status.Conditions, elementalv1.StaleSystemDisksCondition)
+			return true
+		}
 		setInstallCondition(status, installedStaleSystemDisksCondition(install.StaleSystemDisks), now)
 		return true
 	})
@@ -704,8 +740,18 @@ func (i *InventoryServer) settleInstall(inventory *elementalv1.MachineInventory)
 	log.Infof("MachineInventory %s/%s: the installed system registered", inventory.Namespace, inventory.Name)
 }
 
-func installUnsettled(install *elementalv1.InstallStatus) bool {
-	return install != nil && (install.Phase == elementalv1.InstallPhaseInstalling || install.Phase == elementalv1.InstallPhaseFailed)
+func installUnsettled(install *elementalv1.InstallStatus, registered bool) bool {
+	if install == nil {
+		return false
+	}
+	switch install.Phase {
+	case elementalv1.InstallPhaseInstalling, elementalv1.InstallPhaseFailed:
+		return true
+	case elementalv1.InstallPhaseAwaitingTarget:
+		return registered
+	default:
+		return false
+	}
 }
 
 func installedStaleSystemDisksCondition(disks []elementalv1.StaleSystemDisk) metav1.Condition {
@@ -785,11 +831,17 @@ func (i *InventoryServer) recordInstallReport(inventory *elementalv1.MachineInve
 		if report.TargetDeviceID != "" {
 			install.TargetDeviceID = report.TargetDeviceID
 		}
-		if report.Phase == elementalv1.InstallPhaseFailed {
+		switch report.Phase {
+		case elementalv1.InstallPhaseFailed:
 			install.Message = report.Message
 			if condition := reportedCondition(report); condition != nil {
 				setInstallCondition(status, *condition, now)
 			}
+		case elementalv1.InstallPhaseInstalled:
+			// The disk is installed and the host reboots into it; its
+			// first registration finds nothing left to settle.
+			install.Message = ""
+			setInstallCondition(status, installedStaleSystemDisksCondition(install.StaleSystemDisks), now)
 		}
 		return true
 	})
@@ -800,12 +852,19 @@ func (i *InventoryServer) recordInstallReport(inventory *elementalv1.MachineInve
 		log.Warningf("Ignoring the install report of live boot %s for MachineInventory %s/%s: status.install belongs to another boot", report.BootID, inventory.Namespace, inventory.Name)
 		return nil
 	}
-	if report.Phase == elementalv1.InstallPhaseFailed {
+	switch report.Phase {
+	case elementalv1.InstallPhaseFailed:
 		message := fmt.Sprintf("the install in live boot %s failed", report.BootID)
 		if report.Reason != "" {
 			message += " (" + report.Reason + ")"
 		}
 		i.recordEvent(inventory, corev1.EventTypeWarning, EventReasonInstallFailed, message+": "+report.Message)
+	case elementalv1.InstallPhaseInstalled:
+		target := ""
+		if report.TargetDeviceID != "" {
+			target = " to " + report.TargetDeviceID
+		}
+		i.recordEvent(inventory, corev1.EventTypeNormal, EventReasonInstallCompleted, fmt.Sprintf("the install%s in live boot %s completed; the host reboots into the installed system", target, report.BootID))
 	}
 	log.Infof("MachineInventory %s/%s: live boot %s reports the install %s", inventory.Namespace, inventory.Name, report.BootID, report.Phase)
 	return nil
@@ -818,9 +877,10 @@ func decodeInstallReport(data []byte) (*register.InstallReport, error) {
 		return nil, fmt.Errorf("cannot decode install report: %w", err)
 	}
 	switch report.Phase {
-	case elementalv1.InstallPhaseInstalling, elementalv1.InstallPhaseFailed:
+	case elementalv1.InstallPhaseInstalling, elementalv1.InstallPhaseInstalled, elementalv1.InstallPhaseFailed:
 	default:
-		return nil, fmt.Errorf("install report has phase %q, expected %s or %s", truncate(string(report.Phase), 64), elementalv1.InstallPhaseInstalling, elementalv1.InstallPhaseFailed)
+		return nil, fmt.Errorf("install report has phase %q, expected %s, %s or %s", truncate(string(report.Phase), 64),
+			elementalv1.InstallPhaseInstalling, elementalv1.InstallPhaseInstalled, elementalv1.InstallPhaseFailed)
 	}
 	report.BootID = strings.TrimSpace(report.BootID)
 	report.TargetDeviceID = truncate(strings.TrimSpace(report.TargetDeviceID), maxInstallField)

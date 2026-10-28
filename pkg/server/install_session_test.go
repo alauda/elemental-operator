@@ -202,6 +202,8 @@ type liveHost struct {
 	protoVersion register.MessageType // register.MsgLast when unset
 	annotations  map[string]string
 	session      *register.LiveInstallSession
+	// update sends MsgUpdate, as a host with registration state does.
+	update bool
 }
 
 // dial authenticates and negotiates the protocol version.
@@ -245,6 +247,10 @@ func (e *installTestEnv) registerLive(h liveHost) (register.MessageType, []byte)
 		data, _ := json.Marshal(h.annotations)
 		reply, _ := exchange(e.t, ws, register.MsgAnnotations, data)
 		g.Expect(reply).To(Equal(register.MsgReady))
+	}
+	if h.update {
+		reply, payload := exchange(e.t, ws, register.MsgUpdate, nil)
+		g.Expect(reply).To(Equal(register.MsgReady), string(payload))
 	}
 	if h.session != nil {
 		data, _ := json.Marshal(h.session)
@@ -753,6 +759,29 @@ func TestInstalledSystemSettlesTheInstall(t *testing.T) {
 		g.Expect(stored.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseInstalled))
 		g.Expect(condition(stored, elementalv1.StaleSystemDisksCondition)).To(haveCondition(metav1.ConditionTrue, elementalv1.NoneDetectedReason))
 	})
+	// The installation media stayed attached: the host went back to the
+	// live ISO after the install and waited there until someone booted it
+	// from its disk. Its installed system registering ends the wait.
+	t.Run("an installed system ends a wait for a target", func(t *testing.T) {
+		g := NewWithT(t)
+		inventory := liveInventory("node-a")
+		session := liveSession("boot-2")
+		inventory.Status.Install = &elementalv1.InstallStatus{
+			Phase: elementalv1.InstallPhaseAwaitingTarget, BootID: "boot-2", Message: "waiting",
+			Candidates: session.Candidates, StaleSystemDisks: session.StaleSystemDisks,
+		}
+		inventory.Status.Conditions = append(inventory.Status.Conditions,
+			metav1.Condition{Type: elementalv1.InstallTargetReadyCondition, Status: metav1.ConditionFalse, Reason: elementalv1.AwaitingSelectionReason, LastTransitionTime: metav1.Now()},
+			metav1.Condition{Type: elementalv1.StaleSystemDisksCondition, Status: metav1.ConditionFalse, Reason: elementalv1.DetectedReason, LastTransitionTime: metav1.Now()})
+		env := newInstallTestEnv(t, installEnvOptions{}, inventory)
+
+		env.config(liveHost{auth: hostA.auth, update: true})
+		stored := env.inventory("node-a")
+		g.Expect(stored.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseInstalled))
+		g.Expect(stored.Status.Install.Message).To(BeEmpty())
+		g.Expect(meta.FindStatusCondition(stored.Status.Conditions, elementalv1.InstallTargetReadyCondition)).To(BeNil())
+		g.Expect(meta.FindStatusCondition(stored.Status.Conditions, elementalv1.StaleSystemDisksCondition)).To(BeNil())
+	})
 	t.Run("an install awaiting a target is left alone", func(t *testing.T) {
 		g := NewWithT(t)
 		inventory := liveInventory("node-a")
@@ -946,6 +975,34 @@ func TestInstallReportOfARunningInstall(t *testing.T) {
 	g.Expect(env.events()).To(BeEmpty())
 }
 
+// A host reports its install complete before it reboots. When the
+// installation media stayed attached it comes back in a new live boot: that
+// install did complete, so nothing says it was interrupted.
+func TestInstallReportOfACompletedInstall(t *testing.T) {
+	g := NewWithT(t)
+	env := newInstallTestEnv(t, installEnvOptions{}, installingInventory("boot-1"))
+
+	reply, data := env.report(hostA.auth, register.InstallReport{BootID: "boot-1", Phase: elementalv1.InstallPhaseInstalled, TargetDeviceID: diskA})
+	g.Expect(reply).To(Equal(register.MsgReady), string(data))
+	stored := env.inventory("node-a")
+	g.Expect(stored.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseInstalled))
+	g.Expect(stored.Status.Install.TargetDeviceID).To(Equal(diskA))
+	g.Expect(condition(stored, elementalv1.StaleSystemDisksCondition)).To(haveCondition(metav1.ConditionTrue, elementalv1.WipedReason))
+	g.Expect(env.events()).To(ConsistOf(SatisfyAll(HavePrefix("Normal InstallCompleted"), ContainSubstring(diskA))))
+
+	hold := env.hold(hostA.in("boot-2"))
+	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	install := env.inventory("node-a").Status.Install
+	g.Expect(install.Phase).To(Equal(elementalv1.InstallPhaseAwaitingTarget))
+	g.Expect(install.Message).To(HavePrefix("the host booted the live ISO again after the install to " + diskA + " completed"))
+	// Still the disk the installed system is on, until another install
+	// is released.
+	g.Expect(install.TargetDeviceID).To(Equal(diskA))
+	g.Expect(env.hold(hostA.in("boot-2")).Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	g.Expect(env.inventory("node-a").Status.Install.TargetDeviceID).To(Equal(diskA))
+	g.Expect(env.events()).To(BeEmpty())
+}
+
 func TestInstallReportOfAnotherBootIsIgnored(t *testing.T) {
 	for name, inventory := range map[string]*elementalv1.MachineInventory{
 		"another boot":     installingInventory("boot-2"),
@@ -972,7 +1029,7 @@ func TestInstallReportIsAProtocolErrorWhenMalformed(t *testing.T) {
 	}{
 		{name: "unknown identity", auth: "tpm:hash-new", payload: `{"bootID":"boot-1","phase":"Failed"}`, message: "needs a registered MachineInventory"},
 		{name: "not JSON", auth: hostA.auth, payload: "[", message: "cannot decode install report"},
-		{name: "unexpected phase", auth: hostA.auth, payload: `{"bootID":"boot-1","phase":"Installed"}`, message: `phase "Installed"`},
+		{name: "unexpected phase", auth: hostA.auth, payload: `{"bootID":"boot-1","phase":"AwaitingTarget"}`, message: `phase "AwaitingTarget"`},
 		{name: "no phase", auth: hostA.auth, payload: `{"bootID":"boot-1"}`, message: `phase ""`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

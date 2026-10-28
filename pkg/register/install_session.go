@@ -60,10 +60,12 @@ type InstallHold struct {
 
 // InstallReport is the MsgInstallReport payload a released host sends on a
 // short session of its own (authenticate, negotiate, report) when its
-// install fails.
+// install ends: Installed before it reboots into the installed system, or
+// Failed.
 type InstallReport struct {
 	BootID string `json:"bootID"`
-	// Phase is Installing or Failed.
+	// Phase is Installing, Installed (the disk is installed and the host
+	// reboots into it) or Failed.
 	Phase elementalv1.InstallPhase `json:"phase"`
 	// +optional
 	TargetDeviceID string `json:"targetDeviceID,omitempty"`

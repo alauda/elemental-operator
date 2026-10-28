@@ -191,7 +191,22 @@ func TestLiveInstallWithTheRegisterClient(t *testing.T) {
 	config = released(liveRound())
 	g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
 
-	// The installed system registers without a live session.
+	// This time the install completes and the host says so before it
+	// reboots; the installation media stays attached and it comes back in
+	// a new live boot. It waits there, and nothing says the install failed.
+	g.Expect(registerClient.ReportInstall(reg, nil, state, register.InstallReport{
+		BootID: "boot-1", Phase: elementalv1.InstallPhaseInstalled, TargetDeviceID: diskA,
+	})).To(Succeed())
+	g.Expect(inventory().Status.Install.Phase).To(Equal(elementalv1.InstallPhaseInstalled))
+	registered := state.InitialRegistration
+	session = liveSession("boot-2")
+	_, err = liveRound()
+	g.Expect(held(err).Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	g.Expect(inventory().Status.Install.Message).To(HavePrefix("the host booted the live ISO again after the install to " + diskA + " completed"))
+	state.InitialRegistration = registered
+
+	// Booted from its disk, the installed system registers without a live
+	// session: the wait is over.
 	config = released(registerClient.Register(reg, nil, state))
 	g.Expect(config.Elemental.InstallTarget).To(BeNil())
 	g.Expect(config.Elemental.Install.Device).To(Equal(installTargetRequiresSelection))

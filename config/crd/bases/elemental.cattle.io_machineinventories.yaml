@@ -555,8 +555,10 @@ spec:
                       type: object
                     type: array
                   targetDeviceID:
-                    description: TargetDeviceID is the canonical ID of the disk the
-                      install was released to.
+                    description: |-
+                      TargetDeviceID is the canonical ID of the disk the install was released
+                      to. While an installed host waits in the live ISO again, it is the disk
+                      its installed system is on.
                     type: string
                 type: object
               observedStorage:
