@@ -152,16 +152,20 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 					}
 				} else if osInstaller == install.KubeOSInstaller {
 					log.Info("Installing KubeOS")
+					power := live.takePowerAction(&cfg.Elemental.Install)
 					if err := installer.InstallKubeOS(cfg, registrationState, netCfg); err != nil {
 						live.reportFailure(&registrationState, cfg.Elemental.InstallTarget, err)
 						return fmt.Errorf("installing kubeos: %w", err)
 					}
+					return live.finish(&registrationState, cfg.Elemental.InstallTarget, power)
 				} else {
 					log.Info("Installing elemental")
+					power := live.takePowerAction(&cfg.Elemental.Install)
 					if err := installer.InstallElemental(cfg, registrationState, netCfg); err != nil {
 						live.reportFailure(&registrationState, cfg.Elemental.InstallTarget, err)
 						return fmt.Errorf("installing elemental: %w", err)
 					}
+					return live.finish(&registrationState, cfg.Elemental.InstallTarget, power)
 				}
 				return nil
 			}

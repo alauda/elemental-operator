@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -53,6 +54,14 @@ const (
 var (
 	sleep      = time.Sleep
 	holdJitter = func() time.Duration { return rand.N(maxHoldJitter + 1) }
+	// powerAction runs "systemctl reboot" or "systemctl poweroff".
+	powerAction = func(action string) error {
+		out, err := exec.Command("systemctl", action).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
 )
 
 // liveInstall is the live install session of this process.
@@ -158,6 +167,53 @@ func (l *liveInstall) session(installer install.Installer) *register.LiveInstall
 	}
 	session.Candidates, session.StaleSystemDisks = candidates, stale
 	return session
+}
+
+// takePowerAction takes the reboot or poweroff the configuration asks for
+// after the install away from the install backend, so that the host can
+// report the install complete first: an operator that saw no report could
+// not tell a host that rebooted into the live ISO again (installation media
+// still attached) from one that lost power halfway. Each backend's own
+// precedence is kept: the toolkit reboots first, the KubeOS backend powers
+// off first. A command that does not install from the live ISO keeps the
+// configuration as it is.
+func (l *liveInstall) takePowerAction(cfg *elementalv1.Install) string {
+	if l == nil {
+		return ""
+	}
+	action := ""
+	switch {
+	case cfg.Reboot && (osInstaller != install.KubeOSInstaller || !cfg.PowerOff):
+		action = "reboot"
+	case cfg.PowerOff:
+		action = "poweroff"
+	}
+	cfg.Reboot, cfg.PowerOff = false, false
+	return action
+}
+
+// finish reports the completed install, then reboots or powers off as the
+// configuration asked. The report is best effort; the power action is not.
+func (l *liveInstall) finish(state *register.State, target *elementalv1.InstallTarget, action string) error {
+	if l == nil {
+		return nil
+	}
+	report := register.InstallReport{BootID: l.bootID, Phase: elementalv1.InstallPhaseInstalled}
+	if target != nil {
+		report.TargetDeviceID = target.DeviceID
+	}
+	if err := l.client.ReportInstall(l.registration, l.caCert, state, report); err != nil {
+		log.Warningf("Reporting the completed install to the operator: %v", err)
+	}
+	if action == "" {
+		log.Info("Install completed; reboot to start the installed system")
+		return nil
+	}
+	log.Infof("Install completed; running systemctl %s", action)
+	if err := powerAction(action); err != nil {
+		return fmt.Errorf("systemctl %s after the install: %w", action, err)
+	}
+	return nil
 }
 
 // reportFailure tells the operator that the install failed. It is best

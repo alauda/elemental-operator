@@ -305,6 +305,8 @@ var _ = Describe("elemental-register --install", Label("registration", "cli", "i
 		client = rmocks.NewMockClient(mockCtrl)
 		cmd = newCommand(fs, client, stateHandler, installer)
 		DeferCleanup(fsCleanup)
+		allowCompletionReports(client)
+		fakePowerActions()
 	})
 	When("using existing live config", func() {
 		BeforeEach(func() {
@@ -317,7 +319,7 @@ var _ = Describe("elemental-register --install", Label("registration", "cli", "i
 			Expect(err).ShouldNot(HaveOccurred())
 
 			cmd.SetArgs([]string{"--install"})
-			installer.EXPECT().InstallElemental(alternateConfigFixture, stateFixture, networkConfigFixture).Return(nil)
+			installer.EXPECT().InstallElemental(handedOver(alternateConfigFixture), stateFixture, networkConfigFixture).Return(nil)
 			installer.EXPECT().SurveyInstallDisks().Return(nil, nil, nil)
 			client.EXPECT().
 				RegisterForInstall(baseConfigFixture.Elemental.Registration, []byte(baseConfigFixture.Elemental.Registration.CACert), &stateFixture, gomock.Any()).
@@ -427,6 +429,7 @@ var _ = Describe("elemental-register --install --installer kubeos", Label("regis
 	var client *rmocks.MockClient
 	var installer *imocks.MockInstaller
 	var stateHandler *rmocks.MockStateHandler
+	var powerActions *[]string
 	BeforeEach(func() {
 		fs, fsCleanup, err = vfst.NewTestFS(map[string]interface{}{})
 		Expect(err).ToNot(HaveOccurred())
@@ -438,6 +441,8 @@ var _ = Describe("elemental-register --install --installer kubeos", Label("regis
 		DeferCleanup(fsCleanup)
 		// The package-level flag variable persists across Describe blocks.
 		DeferCleanup(func() { osInstaller = install.ToolkitInstaller })
+		allowCompletionReports(client)
+		powerActions = fakePowerActions()
 	})
 	When("using existing live config", func() {
 		BeforeEach(func() {
@@ -449,7 +454,7 @@ var _ = Describe("elemental-register --install --installer kubeos", Label("regis
 		})
 		It("dispatches to the kubeos backend after registering", func() {
 			cmd.SetArgs([]string{"--install", "--installer", "kubeos"})
-			installer.EXPECT().InstallKubeOS(alternateConfigFixture, stateFixture, networkConfigFixture).Return(nil)
+			installer.EXPECT().InstallKubeOS(handedOver(alternateConfigFixture), stateFixture, networkConfigFixture).Return(nil)
 			installer.EXPECT().SurveyInstallDisks().Return(nil, nil, nil)
 			var installers []elementalv1.InstallerKind
 			client.EXPECT().
@@ -460,6 +465,9 @@ var _ = Describe("elemental-register --install --installer kubeos", Label("regis
 				})
 			Expect(cmd.Execute()).ToNot(HaveOccurred())
 			Expect(installers).To(Equal([]elementalv1.InstallerKind{elementalv1.InstallerKubeOS}))
+			// The KubeOS backend powers off before it reboots, and so does
+			// the register in its place.
+			Expect(*powerActions).To(Equal([]string{"poweroff"}))
 		})
 	})
 	It("rejects an unknown installer before reading any config", func() {
@@ -472,6 +480,43 @@ var _ = Describe("elemental-register --install --installer kubeos", Label("regis
 
 // testJitter is the hold jitter in tests.
 const testJitter = 1500 * time.Millisecond
+
+// handedOver is the configuration an install backend gets from the live
+// install: the reboot and poweroff are the register's to run, after it
+// reported the install complete.
+func handedOver(config elementalv1.Config) elementalv1.Config {
+	config.Elemental.Install.Reboot = false
+	config.Elemental.Install.PowerOff = false
+	return config
+}
+
+// fakePowerActions records the systemctl power actions instead of running
+// them.
+func fakePowerActions() *[]string {
+	actions := &[]string{}
+	orig := powerAction
+	powerAction = func(action string) error {
+		*actions = append(*actions, action)
+		return nil
+	}
+	DeferCleanup(func() { powerAction = orig })
+	return actions
+}
+
+// reportOfPhase matches an InstallReport by its phase.
+type reportOfPhase elementalv1.InstallPhase
+
+func (m reportOfPhase) Matches(x any) bool {
+	report, ok := x.(register.InstallReport)
+	return ok && report.Phase == elementalv1.InstallPhase(m)
+}
+
+func (m reportOfPhase) String() string { return "an install report of phase " + string(m) }
+
+// allowCompletionReports lets every successful install report itself.
+func allowCompletionReports(client *rmocks.MockClient) {
+	client.EXPECT().ReportInstall(gomock.Any(), gomock.Any(), gomock.Any(), reportOfPhase(elementalv1.InstallPhaseInstalled)).Return(nil).AnyTimes()
+}
 
 // fakeInstallWaits records the waits of the install loop instead of sleeping.
 func fakeInstallWaits() *[]time.Duration {
@@ -493,6 +538,7 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 	var installer *imocks.MockInstaller
 	var stateHandler *rmocks.MockStateHandler
 	var waits *[]time.Duration
+	var powerActions *[]string
 
 	const bootID = "4f6c1b2a-0d3e-4c5f-9a8b-7c6d5e4f3a2b"
 	registration := baseConfigFixture.Elemental.Registration
@@ -525,10 +571,69 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 		marshalIntoFile(fs, baseConfigFixture, defaultLiveConfigPath)
 		stateHandler.EXPECT().Init(defaultLiveStatePath).Return(nil)
 		waits = fakeInstallWaits()
+		powerActions = fakePowerActions()
 		cmd.SetArgs([]string{"--install"})
 	})
 
+	It("reports the install complete before it reboots", func() {
+		stateHandler.EXPECT().Load().Return(stateFixture, nil)
+		stateHandler.EXPECT().Save(stateFixture).Return(nil)
+		installer.EXPECT().SurveyInstallDisks().Return(candidates, stale, nil)
+		config := alternateConfigFixture
+		config.Elemental.InstallTarget = &elementalv1.InstallTarget{DeviceID: "wwn:5000c500000000a1"}
+		client.EXPECT().RegisterForInstall(registration, caCert, &stateFixture, gomock.Any()).Return(released(config), nil)
+		installer.EXPECT().InstallElemental(handedOver(config), stateFixture, networkConfigFixture).DoAndReturn(
+			func(elementalv1.Config, register.State, elementalv1.NetworkConfig) error {
+				Expect(*powerActions).To(BeEmpty())
+				return nil
+			})
+		client.EXPECT().ReportInstall(registration, caCert, gomock.Any(), register.InstallReport{
+			BootID: bootID, Phase: elementalv1.InstallPhaseInstalled, TargetDeviceID: "wwn:5000c500000000a1",
+		}).DoAndReturn(func(elementalv1.Registration, []byte, *register.State, register.InstallReport) error {
+			Expect(*powerActions).To(BeEmpty(), "reported before the reboot")
+			return nil
+		})
+		Expect(cmd.Execute()).To(Succeed())
+		// The toolkit reboots before it powers off; the fixture asks for both.
+		Expect(*powerActions).To(Equal([]string{"reboot"}))
+	})
+
+	It("reboots even when the operator does not take the report", func() {
+		stateHandler.EXPECT().Load().Return(stateFixture, nil)
+		stateHandler.EXPECT().Save(stateFixture).Return(nil)
+		installer.EXPECT().SurveyInstallDisks().Return(candidates, stale, nil)
+		client.EXPECT().RegisterForInstall(registration, caCert, &stateFixture, gomock.Any()).Return(released(alternateConfigFixture), nil)
+		installer.EXPECT().InstallElemental(handedOver(alternateConfigFixture), stateFixture, networkConfigFixture).Return(nil)
+		client.EXPECT().ReportInstall(gomock.Any(), gomock.Any(), gomock.Any(), reportOfPhase(elementalv1.InstallPhaseInstalled)).Return(errors.New("connection refused"))
+		Expect(cmd.Execute()).To(Succeed())
+		Expect(*powerActions).To(Equal([]string{"reboot"}))
+	})
+
+	It("leaves the host running when the configuration asks for no reboot", func() {
+		stateHandler.EXPECT().Load().Return(stateFixture, nil)
+		stateHandler.EXPECT().Save(stateFixture).Return(nil)
+		installer.EXPECT().SurveyInstallDisks().Return(candidates, stale, nil)
+		config := handedOver(alternateConfigFixture)
+		client.EXPECT().RegisterForInstall(registration, caCert, &stateFixture, gomock.Any()).Return(released(config), nil)
+		installer.EXPECT().InstallElemental(config, stateFixture, networkConfigFixture).Return(nil)
+		client.EXPECT().ReportInstall(gomock.Any(), gomock.Any(), gomock.Any(), reportOfPhase(elementalv1.InstallPhaseInstalled)).Return(nil)
+		Expect(cmd.Execute()).To(Succeed())
+		Expect(*powerActions).To(BeEmpty())
+	})
+
+	It("fails when the reboot after the install fails", func() {
+		stateHandler.EXPECT().Load().Return(stateFixture, nil)
+		stateHandler.EXPECT().Save(stateFixture).Return(nil)
+		installer.EXPECT().SurveyInstallDisks().Return(candidates, stale, nil)
+		client.EXPECT().RegisterForInstall(registration, caCert, &stateFixture, gomock.Any()).Return(released(alternateConfigFixture), nil)
+		installer.EXPECT().InstallElemental(handedOver(alternateConfigFixture), stateFixture, networkConfigFixture).Return(nil)
+		client.EXPECT().ReportInstall(gomock.Any(), gomock.Any(), gomock.Any(), reportOfPhase(elementalv1.InstallPhaseInstalled)).Return(nil)
+		powerAction = func(string) error { return errors.New("Failed to connect to bus") }
+		Expect(cmd.Execute()).To(MatchError(ContainSubstring("systemctl reboot after the install: Failed to connect to bus")))
+	})
+
 	It("registers again while held, touching no disk, and installs once released", func() {
+		allowCompletionReports(client)
 		stateHandler.EXPECT().Load().Return(stateFixture, nil)
 		stateHandler.EXPECT().Save(stateFixture).Return(nil).Times(3)
 		installer.EXPECT().SurveyInstallDisks().Return(candidates, stale, nil).Times(3)
@@ -536,13 +641,14 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 			client.EXPECT().RegisterForInstall(registration, caCert, &stateFixture, gomock.Any()).Return(nil, hold(0)),
 			client.EXPECT().RegisterForInstall(registration, caCert, &stateFixture, gomock.Any()).Return(nil, hold(40)),
 			client.EXPECT().RegisterForInstall(registration, caCert, &stateFixture, gomock.Any()).Return(released(alternateConfigFixture), nil),
-			installer.EXPECT().InstallElemental(alternateConfigFixture, stateFixture, networkConfigFixture).Return(nil),
+			installer.EXPECT().InstallElemental(handedOver(alternateConfigFixture), stateFixture, networkConfigFixture).Return(nil),
 		)
 		Expect(cmd.Execute()).To(Succeed())
 		Expect(*waits).To(Equal([]time.Duration{heldWait, 40*time.Second + testJitter}))
 	})
 
 	It("tells the operator about the boot, the installer and the disks", func() {
+		allowCompletionReports(client)
 		stateHandler.EXPECT().Load().Return(stateFixture, nil)
 		stateHandler.EXPECT().Save(stateFixture).Return(nil)
 		installer.EXPECT().SurveyInstallDisks().Return(candidates, stale, nil)
@@ -552,7 +658,7 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 				sessions = append(sessions, *session)
 				return released(alternateConfigFixture), nil
 			})
-		installer.EXPECT().InstallElemental(alternateConfigFixture, stateFixture, networkConfigFixture).Return(nil)
+		installer.EXPECT().InstallElemental(handedOver(alternateConfigFixture), stateFixture, networkConfigFixture).Return(nil)
 		Expect(cmd.Execute()).To(Succeed())
 		Expect(sessions).To(Equal([]register.LiveInstallSession{{
 			BootID:           bootID,
@@ -582,6 +688,7 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 	})
 
 	It("makes a boot ID up once when the kernel's cannot be read", func() {
+		allowCompletionReports(client)
 		Expect(fs.Remove(bootIDPath)).To(Succeed())
 		stateHandler.EXPECT().Load().Return(stateFixture, nil)
 		stateHandler.EXPECT().Save(stateFixture).Return(nil).Times(2)
@@ -595,7 +702,7 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 				}
 				return released(alternateConfigFixture), nil
 			}).Times(2)
-		installer.EXPECT().InstallElemental(alternateConfigFixture, stateFixture, networkConfigFixture).Return(nil)
+		installer.EXPECT().InstallElemental(handedOver(alternateConfigFixture), stateFixture, networkConfigFixture).Return(nil)
 		Expect(cmd.Execute()).To(Succeed())
 		Expect(bootIDs).To(HaveLen(2))
 		Expect(bootIDs[0]).To(MatchRegexp(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`))
@@ -612,6 +719,7 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 	})
 
 	It("retries errors with a backoff once the operator held the host", func() {
+		allowCompletionReports(client)
 		stateHandler.EXPECT().Load().Return(stateFixture, nil)
 		stateHandler.EXPECT().Save(stateFixture).Return(nil).Times(3)
 		installer.EXPECT().SurveyInstallDisks().Return(candidates, stale, nil).Times(10)
@@ -627,7 +735,7 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 			round().Return(nil, hold(0)),
 			round().Return(nil, refused),
 			round().Return(released(alternateConfigFixture), nil),
-			installer.EXPECT().InstallElemental(alternateConfigFixture, stateFixture, networkConfigFixture).Return(nil),
+			installer.EXPECT().InstallElemental(handedOver(alternateConfigFixture), stateFixture, networkConfigFixture).Return(nil),
 		)
 		gomock.InOrder(calls...)
 		Expect(cmd.Execute()).To(Succeed())
@@ -638,6 +746,7 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 	})
 
 	It("registers as a new host in every round until released", func() {
+		allowCompletionReports(client)
 		stateHandler.EXPECT().Load().Return(register.State{}, nil)
 		installer.EXPECT().SurveyInstallDisks().Return(candidates, stale, nil).Times(3)
 		var seen []register.State
@@ -660,7 +769,7 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 			saved = append(saved, state)
 			return nil
 		}).Times(3)
-		installer.EXPECT().InstallElemental(alternateConfigFixture, gomock.Any(), networkConfigFixture).Return(nil)
+		installer.EXPECT().InstallElemental(handedOver(alternateConfigFixture), gomock.Any(), networkConfigFixture).Return(nil)
 		Expect(cmd.Execute()).To(Succeed())
 		decided := register.State{TPMMode: elementalv1.TPMModeEmulated, EmulatedTPMSeedSalt: 1}
 		Expect(seen).To(Equal([]register.State{{}, decided, decided}))
@@ -680,7 +789,7 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 		client.EXPECT().RegisterForInstall(registration, caCert, &stateFixture, gomock.Any()).Return(released(*target), nil)
 		installErr := fmt.Errorf("failed picking installation device: %w",
 			install.NewDiskError("Blocked", "stale system disks cannot be wiped safely"))
-		installer.EXPECT().InstallElemental(*target, stateFixture, networkConfigFixture).Return(installErr)
+		installer.EXPECT().InstallElemental(handedOver(*target), stateFixture, networkConfigFixture).Return(installErr)
 		// With the registration the host registered with, not the one the
 		// operator returned. A report that fails is only logged.
 		client.EXPECT().ReportInstall(registration, caCert, &stateFixture, register.InstallReport{
@@ -699,7 +808,7 @@ var _ = Describe("elemental-register --install live session", Label("registratio
 		stateHandler.EXPECT().Save(stateFixture).Return(nil)
 		installer.EXPECT().SurveyInstallDisks().Return(candidates, stale, nil)
 		client.EXPECT().RegisterForInstall(registration, caCert, &stateFixture, gomock.Any()).Return(released(alternateConfigFixture), nil)
-		installer.EXPECT().InstallKubeOS(alternateConfigFixture, stateFixture, networkConfigFixture).Return(errors.New("kbimg install disk failed: exit status 1"))
+		installer.EXPECT().InstallKubeOS(handedOver(alternateConfigFixture), stateFixture, networkConfigFixture).Return(errors.New("kbimg install disk failed: exit status 1"))
 		client.EXPECT().ReportInstall(registration, caCert, &stateFixture, register.InstallReport{
 			BootID:  bootID,
 			Phase:   elementalv1.InstallPhaseFailed,
