@@ -36,6 +36,14 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - clusters
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - elemental.cattle.io
   resources:
   - machineinventories

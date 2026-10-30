@@ -67,6 +67,7 @@ const (
 // +kubebuilder:rbac:groups=elemental.cattle.io,resources=seedimages,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=elemental.cattle.io,resources=seedimages/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=elemental.cattle.io,resources=machineregistrations,verbs=get;watch;list
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;watch;list
 // TODO: restrict access to resources to the required namespace only:
 //   https://github.com/rancher/elemental-operator/issues/457
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
@@ -263,7 +264,18 @@ func (r *SeedImageReconciler) reconcileBuildImagePod(ctx context.Context, seedIm
 
 	logger.V(5).Info("Creating pod")
 
+	registry, err := r.seedImageRegistry(ctx, seedImg, mRegistration)
+	if err != nil {
+		meta.SetStatusCondition(&seedImg.Status.Conditions, metav1.Condition{
+			Type:    elementalv1.SeedImageConditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  elementalv1.SeedImageBuildNotStartedReason,
+			Message: err.Error(),
+		})
+		return err
+	}
 	pod := fillBuildImagePod(seedImg, r.SeedImageImage, r.SeedImageImagePullPolicy, r.SeedImageImagePullSecrets, r.DisableSeedImagePullImageTLSVerify)
+	applySeedImageRegistry(pod, seedImg, registry)
 	if err := controllerutil.SetControllerReference(seedImg, pod, r.Scheme()); err != nil {
 		meta.SetStatusCondition(&seedImg.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.SeedImageConditionReady,
