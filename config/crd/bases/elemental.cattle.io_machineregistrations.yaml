@@ -141,6 +141,31 @@ spec:
                           tty:
                             type: string
                         type: object
+                      install-registry:
+                        description: |-
+                          InstallRegistry is the registry mirror the install pulls the system
+                          image through. The operator sets it from the MachineRegistration's
+                          registryClusterRef in the configuration that starts an install; it is
+                          not taken from MachineRegistration.
+                        properties:
+                          docker-config:
+                            description: |-
+                              DockerConfig is a dockerconfigjson document with the endpoints'
+                              credentials; empty auths for an anonymous mirror.
+                            type: string
+                          endpoints:
+                            description: Endpoints are the real registries, tried
+                              in order.
+                            items:
+                              type: string
+                            type: array
+                          source:
+                            description: Source is the logical registry, cpaas-registry.cpaas-system.
+                            type: string
+                        required:
+                        - endpoints
+                        - source
+                        type: object
                       install-target:
                         description: |-
                           InstallTarget pins the disk of one install. The operator sets it in the
@@ -328,6 +353,27 @@ spec:
                 type: object
               machineName:
                 type: string
+              registryClusterRef:
+                description: |-
+                  RegistryClusterRef names a CAPI Cluster in this namespace that pulls
+                  through the registry mirror. A host that installs from the live ISO
+                  gets the mirror endpoints and credentials of that cluster's registry
+                  bootstrap Secret (cpaas.io/registry-config-secret), so a system-uri
+                  under cpaas-registry.cpaas-system can be pulled without logging in on
+                  the live system. SeedImages registering here pull a baseImage under
+                  that registry the same way. Unset gives neither.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
             type: object
           status:
             properties:

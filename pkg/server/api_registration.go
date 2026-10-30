@@ -179,6 +179,9 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 	if adjust != nil {
 		adjust(config)
 	}
+	if err := i.addInstallRegistry(registration, config); err != nil {
+		return err
+	}
 
 	// If client does not support MsgConfig we send back the config as a
 	// byte-stream without a message-type to keep backwards-compatibility.

@@ -169,6 +169,26 @@ type Elemental struct {
 	// not taken from MachineRegistration.
 	// +optional
 	InstallTarget *InstallTarget `json:"install-target,omitempty" yaml:"install-target,omitempty"`
+	// InstallRegistry is the registry mirror the install pulls the system
+	// image through. The operator sets it from the MachineRegistration's
+	// registryClusterRef in the configuration that starts an install; it is
+	// not taken from MachineRegistration.
+	// +optional
+	InstallRegistry *InstallRegistry `json:"install-registry,omitempty" yaml:"install-registry,omitempty"`
+}
+
+// InstallRegistry maps the logical registry onto its real endpoints for a
+// live install. Hosts never verify the endpoints' certificates and keep none
+// of it in the installed system.
+type InstallRegistry struct {
+	// Source is the logical registry, cpaas-registry.cpaas-system.
+	Source string `json:"source" yaml:"source"`
+	// Endpoints are the real registries, tried in order.
+	Endpoints []string `json:"endpoints" yaml:"endpoints"`
+	// DockerConfig is a dockerconfigjson document with the endpoints'
+	// credentials; empty auths for an anonymous mirror.
+	// +optional
+	DockerConfig string `json:"docker-config,omitempty" yaml:"docker-config,omitempty"`
 }
 
 // InstallTarget names the disk an install must use by its canonical ID, as
