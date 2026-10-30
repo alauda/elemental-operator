@@ -33,6 +33,7 @@ import (
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 	"github.com/rancher/elemental-operator/pkg/log"
 	"github.com/rancher/elemental-operator/pkg/register"
+	"github.com/rancher/elemental-operator/pkg/registryaccess"
 )
 
 // KubeOS install backend.
@@ -61,6 +62,12 @@ const (
 	kubeosDefaultWorkDir      = "/tmp/elemental/kubeos"
 	kubeosLiveRegistriesDir   = "/etc/containers/registries.conf.d"
 	kubeosLiveAuthFile        = "/run/containers/0/auth.json"
+	// The registry mirror the operator gives an install (InstallRegistry)
+	// lives on the live system only: a registries.conf.d drop-in and a
+	// credential file skopeo and kbimg read through REGISTRY_AUTH_FILE.
+	kubeosMirrorConfName      = "50-acp-registry-mirror.conf"
+	kubeosRegistryAuthFile    = "/run/elemental/registry-auth.json"
+	kubeosRegistryAuthFileEnv = "REGISTRY_AUTH_FILE"
 
 	// Target-side paths. /etc, /var and /root are overlays whose upperdirs
 	// live on PERSIST, shared by both A/B slots. kbimg writes install.configs
@@ -137,6 +144,7 @@ type kubeosOptions struct {
 	workDir           string
 	liveRegistriesDir string
 	liveAuthFile      string
+	registryAuthFile  string
 }
 
 func defaultKubeOSOptions() kubeosOptions {
@@ -146,6 +154,7 @@ func defaultKubeOSOptions() kubeosOptions {
 		workDir:           kubeosDefaultWorkDir,
 		liveRegistriesDir: kubeosLiveRegistriesDir,
 		liveAuthFile:      kubeosLiveAuthFile,
+		registryAuthFile:  kubeosRegistryAuthFile,
 	}
 }
 
@@ -164,6 +173,11 @@ func (i *installer) InstallKubeOS(config elementalv1.Config, state register.Stat
 	if config.Elemental.Install.SystemURI == "" {
 		return errors.New("kubeos install requires elemental.install.system-uri (the kubeos-rootfs image reference)")
 	}
+	restoreRegistry, err := i.useKubeOSInstallRegistry(config.Elemental.InstallRegistry)
+	if err != nil {
+		return err
+	}
+	defer restoreRegistry()
 
 	// 2. Target disk, resolved to its kernel path and checked before anything
 	// is written (target.go). kbimg matches the literal target_disk against
@@ -340,7 +354,9 @@ func (i *installer) stageKubeOSFiles(filesDir string, config elementalv1.Config,
 	// rootfs are needed again by kbosctl upgrade in the installed system.
 	if entries, err := i.fs.ReadDir(i.kubeos.liveRegistriesDir); err == nil {
 		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".conf") {
+			// The install's registry mirror stays on the live system: the
+			// provider gives kbosctl its own credential at each upgrade.
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".conf") || e.Name() == kubeosMirrorConfName {
 				continue
 			}
 			content, err := i.fs.ReadFile(filepath.Join(i.kubeos.liveRegistriesDir, e.Name()))
@@ -358,6 +374,68 @@ func (i *installer) stageKubeOSFiles(filesDir string, config elementalv1.Config,
 		}
 	}
 	return staged, nil
+}
+
+// useKubeOSInstallRegistry points skopeo and kbimg at the registry mirror of
+// reg on the live system: a registries.conf.d drop-in that maps the logical
+// registry onto the endpoints in order, every endpoint without certificate
+// verification, and the credentials in a root-only file named by
+// REGISTRY_AUTH_FILE. The returned function restores the environment. A nil
+// reg changes nothing.
+func (i *installer) useKubeOSInstallRegistry(reg *elementalv1.InstallRegistry) (func(), error) {
+	if reg == nil {
+		return func() {}, nil
+	}
+	if reg.Source == "" || len(reg.Endpoints) == 0 {
+		return nil, errors.New("install-registry needs a source and endpoints")
+	}
+	for _, endpoint := range append([]string{reg.Source}, reg.Endpoints...) {
+		if !registryaccess.ValidEndpoint(endpoint) {
+			return nil, fmt.Errorf("install-registry names an invalid registry %q", endpoint)
+		}
+	}
+	var conf strings.Builder
+	conf.WriteString("# Written by elemental-register: the registry mirror of this install.\n")
+	conf.WriteString("# It stays on the live system; the installed system does not get it.\n")
+	fmt.Fprintf(&conf, "[[registry]]\nprefix = %q\nlocation = %q\n", reg.Source, reg.Source)
+	for _, endpoint := range reg.Endpoints {
+		fmt.Fprintf(&conf, "\n[[registry.mirror]]\nlocation = %q\ninsecure = true\n", endpoint)
+	}
+	for _, endpoint := range reg.Endpoints {
+		fmt.Fprintf(&conf, "\n[[registry]]\nlocation = %q\ninsecure = true\n", endpoint)
+	}
+	if err := vfs.MkdirAll(i.fs, i.kubeos.liveRegistriesDir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", i.kubeos.liveRegistriesDir, err)
+	}
+	if err := i.fs.WriteFile(filepath.Join(i.kubeos.liveRegistriesDir, kubeosMirrorConfName), []byte(conf.String()), 0o644); err != nil {
+		return nil, fmt.Errorf("writing the registry mirror: %w", err)
+	}
+	auth := reg.DockerConfig
+	if auth == "" {
+		auth = `{"auths":{}}`
+	}
+	if err := vfs.MkdirAll(i.fs, filepath.Dir(i.kubeos.registryAuthFile), 0o700); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", filepath.Dir(i.kubeos.registryAuthFile), err)
+	}
+	if err := i.fs.WriteFile(i.kubeos.registryAuthFile, []byte(auth), 0o600); err != nil {
+		return nil, fmt.Errorf("writing the registry mirror credentials: %w", err)
+	}
+	authPath, err := i.fs.RawPath(i.kubeos.registryAuthFile)
+	if err != nil {
+		return nil, err
+	}
+	previous, had := os.LookupEnv(kubeosRegistryAuthFileEnv)
+	if err := os.Setenv(kubeosRegistryAuthFileEnv, authPath); err != nil {
+		return nil, err
+	}
+	log.Infof("Pulling the system image through the registry mirror %s via %s", reg.Source, strings.Join(reg.Endpoints, ", "))
+	return func() {
+		if had {
+			_ = os.Setenv(kubeosRegistryAuthFileEnv, previous)
+		} else {
+			_ = os.Unsetenv(kubeosRegistryAuthFileEnv)
+		}
+	}, nil
 }
 
 // writeKubeOSToml copies the image's template, rewrites exactly three keys and

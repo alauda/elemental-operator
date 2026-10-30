@@ -179,6 +179,7 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 				workDir:           "/tmp/elemental/kubeos",
 				liveRegistriesDir: "/etc/containers/registries.conf.d",
 				liveAuthFile:      "/run/containers/0/auth.json",
+				registryAuthFile:  "/run/elemental/registry-auth.json",
 			},
 			disk: disk,
 		}
@@ -290,6 +291,67 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 		Expect(calls[1]).To(ContainElement("/tmp/elemental/kubeos/kbimg.toml"))
 		Expect(calls[2]).To(Equal([]string{"lsblk", "-rno", "LABEL", "/dev/sda"}))
 		Expect(calls[6]).To(Equal([]string{"systemctl", "reboot"}))
+	})
+
+	It("pulls through the install registry and keeps it out of the installed system", func() {
+		const dockerConfig = `{"auths":{"harbor.example.com:11443":{"auth":"cm9ib3Q6eA=="}}}`
+		config.Elemental.Install.SystemURI = "cpaas-registry.cpaas-system/tkestack/kubeos-rootfs:alaudaos-44.ku.1-0.x86_64"
+		config.Elemental.InstallRegistry = &elementalv1.InstallRegistry{
+			Source:       "cpaas-registry.cpaas-system",
+			Endpoints:    []string{"harbor.example.com:11443", "backup.example.com"},
+			DockerConfig: dockerConfig,
+		}
+		authPath, err := fs.RawPath("/run/elemental/registry-auth.json")
+		Expect(err).ToNot(HaveOccurred())
+		var skopeoAuth, kbimgAuth string
+		runner.results["skopeo"] = fakeResult{out: `{"schemaVersion":2}`, do: func() { skopeoAuth = os.Getenv("REGISTRY_AUTH_FILE") }}
+		runner.results["kbimg"] = fakeResult{out: "KubeOS installed successfully\n", do: func() { kbimgAuth = os.Getenv("REGISTRY_AUTH_FILE") }}
+
+		Expect(inst.InstallKubeOS(config, stateFixture, networkConfigFixture)).To(Succeed())
+
+		Expect(skopeoAuth).To(Equal(authPath))
+		Expect(kbimgAuth).To(Equal(authPath))
+		_, set := os.LookupEnv("REGISTRY_AUTH_FILE")
+		Expect(set).To(BeFalse(), "REGISTRY_AUTH_FILE must be restored after the install")
+		Expect(readFile("/run/elemental/registry-auth.json")).To(Equal(dockerConfig))
+		info, err := fs.Stat("/run/elemental/registry-auth.json")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(info.Mode().String()).To(Equal("-rw-------"))
+		Expect(readFile("/etc/containers/registries.conf.d/50-acp-registry-mirror.conf")).To(Equal(`# Written by elemental-register: the registry mirror of this install.
+# It stays on the live system; the installed system does not get it.
+[[registry]]
+prefix = "cpaas-registry.cpaas-system"
+location = "cpaas-registry.cpaas-system"
+
+[[registry.mirror]]
+location = "harbor.example.com:11443"
+insecure = true
+
+[[registry.mirror]]
+location = "backup.example.com"
+insecure = true
+
+[[registry]]
+location = "harbor.example.com:11443"
+insecure = true
+
+[[registry]]
+location = "backup.example.com"
+insecure = true
+`))
+
+		toml := readFile("/tmp/elemental/kubeos/kbimg.toml")
+		Expect(toml).To(ContainSubstring(`oci_image = "docker://cpaas-registry.cpaas-system/tkestack/kubeos-rootfs:alaudaos-44.ku.1-0.x86_64"`))
+		Expect(toml).NotTo(ContainSubstring("50-acp-registry-mirror.conf"))
+		Expect(toml).NotTo(ContainSubstring("registry-auth"))
+		// What an operator set up by hand still goes to the target.
+		Expect(toml).To(ContainSubstring(`dst = "/etc/containers/registries.conf.d/99-kubeos.conf"`))
+	})
+
+	It("rejects an install registry that would break out of registries.conf", func() {
+		config.Elemental.InstallRegistry = &elementalv1.InstallRegistry{Source: "cpaas-registry.cpaas-system", Endpoints: []string{"evil\"\n[[registry]]"}}
+		Expect(inst.InstallKubeOS(config, stateFixture, networkConfigFixture)).To(MatchError(ContainSubstring("invalid registry")))
+		Expect(runner.calls).To(BeEmpty())
 	})
 
 	It("fails before touching the disk when the image is unreachable", func() {
