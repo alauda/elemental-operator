@@ -86,9 +86,22 @@ func planSecretToMachineInventoryRequests(_ context.Context, obj client.Object) 
 	return []reconcile.Request{{
 		NamespacedName: types.NamespacedName{
 			Namespace: obj.GetNamespace(),
-			Name:      obj.GetName(),
+			Name:      planSecretInventoryName(obj),
 		},
 	}}
+}
+
+// planSecretInventoryName returns the MachineInventory a plan Secret belongs
+// to: its controlling owner, otherwise the Secret name without the global
+// plan prefix. A global-scoped inventory's plan Secret is not named after it.
+func planSecretInventoryName(obj client.Object) string {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.Kind == "MachineInventory" && ref.Controller != nil && *ref.Controller && ref.Name != "" &&
+			strings.HasPrefix(ref.APIVersion, elementalv1.GroupVersion.Group+"/") {
+			return ref.Name
+		}
+	}
+	return strings.TrimPrefix(obj.GetName(), elementalv1.GlobalPlanSecretPrefix)
 }
 
 func planSecretPredicate() predicate.Predicate {
@@ -506,11 +519,13 @@ func (r *MachineInventoryReconciler) createPlanSecret(ctx context.Context, mInve
 		return nil
 	}
 
+	// A global-scoped inventory gets the global-bm-plan- prefix, which
+	// etcd-sync keeps on its own side of a DR pair.
 	planSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{elementalv1.PlanTypeAnnotation: elementalv1.PlanTypeEmpty},
 			Namespace:   mInventory.Namespace,
-			Name:        mInventory.Name,
+			Name:        elementalv1.PlanSecretName(mInventory),
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: elementalv1.GroupVersion.String(),
@@ -554,17 +569,12 @@ func (r *MachineInventoryReconciler) createPlanSecret(ctx context.Context, mInve
 func (r *MachineInventoryReconciler) updateInventoryWithPlanStatus(ctx context.Context, mInventory *elementalv1.MachineInventory) error {
 	logger := ctrl.LoggerFrom(ctx)
 
-	planSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: mInventory.Namespace,
-			Name:      mInventory.Name,
-		},
-	}
+	planSecret := &corev1.Secret{}
 
 	logger.V(log.DebugDepth).Info("Attempting to set plan status")
 	if err := r.Get(ctx, types.NamespacedName{
 		Namespace: mInventory.Namespace,
-		Name:      mInventory.Name,
+		Name:      elementalv1.PlanSecretName(mInventory),
 	}, planSecret); err != nil {
 		return fmt.Errorf("failed to get secret: %w", err)
 	}

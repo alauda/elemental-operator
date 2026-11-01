@@ -208,6 +208,17 @@ func (r *MachineRegistrationReconciler) reconcile(ctx context.Context, mRegistra
 		return ctrl.Result{}, nil
 	}
 
+	if err := validateGlobalRegistrationName(ctx, mRegistration); err != nil {
+		meta.SetStatusCondition(&mRegistration.Status.Conditions, metav1.Condition{
+			Type:    elementalv1.ReadyCondition,
+			Status:  metav1.ConditionFalse,
+			Reason:  elementalv1.InvalidGlobalRegistrationNameReason,
+			Message: err.Error(),
+		})
+		// Names cannot change; nothing to retry until the object does.
+		return ctrl.Result{}, nil
+	}
+
 	if !r.sharedAuthEnabled() && r.isReady(ctx, mRegistration) {
 		logger.Info("Machine registration is ready, no need to reconcile it")
 		return ctrl.Result{}, nil
@@ -241,6 +252,23 @@ func (r *MachineRegistrationReconciler) reconcile(ctx context.Context, mRegistra
 	})
 
 	return ctrl.Result{RequeueAfter: recheckAfter}, nil
+}
+
+// validateGlobalRegistrationName requires a global-scoped registration to be
+// named "global" or to start with "global-", the names etcd-sync keeps on
+// their own side of a DR pair. A registration that already serves hosts keeps
+// working with a warning, so an upgrade does not stop it.
+func validateGlobalRegistrationName(ctx context.Context, mRegistration *elementalv1.MachineRegistration) error {
+	if !elementalv1.IsGlobalSystemAgentAuthScope(mRegistration.Annotations) || elementalv1.IsGlobalRegistrationName(mRegistration.Name) {
+		return nil
+	}
+	err := fmt.Errorf("global-scoped MachineRegistration %s must be named %q or start with %q, so that etcd-sync keeps it and its machines on this side of a DR pair",
+		mRegistration.Name, "global", elementalv1.GlobalNamePrefix)
+	if mRegistration.Status.RegistrationURL != "" {
+		ctrl.LoggerFrom(ctx).Info("Warning: " + err.Error() + "; it keeps working because it already has a registration URL")
+		return nil
+	}
+	return err
 }
 
 // validateRegistrationTPMConfig rejects a tpm-mode that elemental-register

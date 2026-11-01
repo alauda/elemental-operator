@@ -170,7 +170,7 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 		URL:             systemAgentURL,
 		CACert:          systemAgentCACert,
 		Token:           string(secret.Data["token"]),
-		SecretName:      inventory.Name,
+		SecretName:      elementalv1.PlanSecretName(inventory),
 		SecretNamespace: inventory.Namespace,
 	}
 	config.Elemental.Install = registration.Spec.Config.Elemental.Install

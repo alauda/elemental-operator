@@ -206,3 +206,16 @@ type MachineInventoryList struct {
 func init() {
 	SchemeBuilder.Register(&MachineInventory{}, &MachineInventoryList{})
 }
+
+// PlanSecretName returns the name of the plan Secret of inventory: the Secret
+// its status already references, otherwise global-bm-plan-<inventory> for a
+// global-scoped inventory and the inventory name for any other.
+func PlanSecretName(inventory *MachineInventory) string {
+	if inventory.Status.Plan != nil && inventory.Status.Plan.PlanSecretRef != nil && inventory.Status.Plan.PlanSecretRef.Name != "" {
+		return inventory.Status.Plan.PlanSecretRef.Name
+	}
+	if IsGlobalSystemAgentAuthScope(inventory.Annotations) {
+		return GlobalPlanSecretPrefix + inventory.Name
+	}
+	return inventory.Name
+}
