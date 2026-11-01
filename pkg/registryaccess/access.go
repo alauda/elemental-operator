@@ -14,13 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package registryaccess reads the registry bootstrap Secret that cluster
-// transformer (or the installer, for a self-hosted Global) publishes for a
-// CAPI Cluster: the real registry endpoints behind the logical registry
-// cpaas-registry.cpaas-system and their pull credentials. The rules are the
-// ones of cluster-api-provider-baremetal's internal/registryaccess. External
-// registry certificates are never verified, so the CA and the TLS policy are
-// not read. An Access never prints its credentials.
+// Package registryaccess reads the registry mirror input a live install
+// pulls through: the real registry endpoints behind the logical registry
+// cpaas-registry.cpaas-system and their pull credentials. The input is a
+// CloudCredential the MachineRegistration selects with the
+// cpaas.io/registry-reference label, as business clusters do, and
+// public-registry-credential when the label is unset. Before the installer
+// fills that default (a bootstrap cluster before POST), the prepared Global
+// input acp-registry-config is used instead. External registry certificates
+// are never verified, so the CA and the TLS policy are not read. An Access
+// never prints its credentials.
 package registryaccess
 
 import (
@@ -30,40 +33,38 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
 	// LogicalRegistry is the registry mirror source.
 	LogicalRegistry = "cpaas-registry.cpaas-system"
-	// ConfigSecretAnnotation names the bootstrap Secret on the CAPI Cluster.
-	ConfigSecretAnnotation = "cpaas.io/registry-config-secret"
-	// ModeAnnotation is "mirror" on a cluster that pulls through the mirror.
-	ModeAnnotation = "cpaas.io/registry-mode"
+	// ReferenceLabel names the CloudCredential an object pulls through, the
+	// label business clusters carry for the same purpose.
+	ReferenceLabel = "cpaas.io/registry-reference"
+	// DefaultCredential is the platform's default registry credential.
+	DefaultCredential = "public-registry-credential"
+	// PreparedInput is the Global registry input the bootstrap cluster
+	// prepares before the installer fills DefaultCredential.
+	PreparedInput = "acp-registry-config"
 
-	maxEndpoints = 16
+	credentialType          = corev1.SecretType("CloudCredential")
+	credentialProviderLabel = "capi.cpaas.io/provider"
+	credentialProvider      = "registry-credential"
+	maxEndpoints            = 16
 )
 
-var (
-	configVersionPattern = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
-	clusterGVK           = schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"}
-)
-
-// Access is the parsed bootstrap Secret of a mirror cluster.
+// Access is a parsed registry mirror input.
 type Access struct {
-	Source        string
-	Endpoints     []string
-	ConfigVersion string
-	// ConfigSecret and CredentialsSecret are namespace/name, for messages.
-	ConfigSecret      string
+	Source    string
+	Endpoints []string
+	// Input and CredentialsSecret are namespace/name, for messages.
+	Input             string
 	CredentialsSecret string
 
 	auths map[string]AuthEntry
@@ -80,7 +81,7 @@ type AuthEntry struct {
 
 // String describes a without its credentials.
 func (a Access) String() string {
-	return fmt.Sprintf("registry %s via %s (config %s, %s)", a.Source, strings.Join(a.Endpoints, ","), a.ConfigVersion, a.ConfigSecret)
+	return fmt.Sprintf("registry %s via %s (input %s)", a.Source, strings.Join(a.Endpoints, ","), a.Input)
 }
 
 // GoString keeps %#v from printing the credentials too.
@@ -98,7 +99,7 @@ func (a *Access) DockerConfig() ([]byte, error) {
 	return json.Marshal(map[string]any{"auths": auths})
 }
 
-// InvalidError reports registry bootstrap input that is missing or does not
+// InvalidError reports registry mirror input that is missing or does not
 // validate; Message says which object or field.
 type InvalidError struct{ Message string }
 
@@ -114,92 +115,117 @@ type secretReference struct {
 	ResourceVersion string `json:"resourceVersion,omitempty"`
 }
 
+// payload is the config.json of a registry mirror input, as minialauda
+// writes acp-registry-config and the installer writes it into
+// public-registry-credential. Fields an install does not need (TLS policy,
+// CA, the SSH-only sandbox credentials) are ignored.
 type payload struct {
-	SchemaVersion                 string           `json:"schemaVersion,omitempty"`
-	Mode                          string           `json:"mode"`
-	Source                        string           `json:"source"`
-	Endpoints                     []string         `json:"endpoints"`
-	ClusterUID                    string           `json:"clusterUID"`
-	ConfigVersion                 string           `json:"configVersion"`
-	SandboxCredentialsSecretRef   *secretReference `json:"sandboxCredentialsSecretRef,omitempty"`
-	BootstrapCredentialsSecretRef *secretReference `json:"bootstrapCredentialsSecretRef,omitempty"`
+	SchemaVersion        string           `json:"schemaVersion,omitempty"`
+	Mode                 string           `json:"mode"`
+	Source               string           `json:"source"`
+	Endpoints            []string         `json:"endpoints"`
+	CredentialsSecretRef *secretReference `json:"credentialsSecretRef,omitempty"`
 }
 
-// Resolve returns the Access of the CAPI Cluster namespace/name. A missing
-// Cluster, a Cluster without mirror input or invalid input is an
-// *InvalidError: a MachineRegistration that names a cluster expects one.
-// Other errors are transient API errors.
-func Resolve(ctx context.Context, reader client.Reader, namespace, name string) (*Access, error) {
-	cluster := &unstructured.Unstructured{}
-	cluster.SetGroupVersionKind(clusterGVK)
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, cluster); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, invalid("CAPI Cluster %s/%s does not exist", namespace, name)
+// ResolveDefault returns the registry mirror input selected by labels in
+// namespace: the CloudCredential named by ReferenceLabel, or
+// DefaultCredential when the label is unset. For the default only, a
+// placeholder without data, or no credential at all, falls back to
+// PreparedInput. It returns nil without an error when the default selects no
+// mirror input: a platform that does not pull through a mirror. An explicitly
+// named credential must be a mirror input. Missing or invalid input is an
+// *InvalidError; other errors are transient API errors.
+func ResolveDefault(ctx context.Context, reader client.Reader, namespace string, labels map[string]string) (*Access, error) {
+	name := strings.TrimSpace(labels[ReferenceLabel])
+	explicit := name != ""
+	if !explicit {
+		name = DefaultCredential
+	}
+	ref := namespace + "/" + name
+	credential := &corev1.Secret{}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, credential); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("read registry credential %s: %w", ref, err)
 		}
-		return nil, fmt.Errorf("read CAPI Cluster %s/%s: %w", namespace, name, err)
+		if explicit {
+			return nil, invalid("registry credential %s named by %s does not exist", ref, ReferenceLabel)
+		}
+		return resolvePrepared(ctx, reader, namespace)
 	}
-	annotations := cluster.GetAnnotations()
-	if annotations[ModeAnnotation] != "mirror" {
-		return nil, invalid("CAPI Cluster %s/%s is not annotated %s=mirror", namespace, name, ModeAnnotation)
+	if credential.Type != credentialType || credential.Labels[credentialProviderLabel] != credentialProvider {
+		return nil, invalid("registry credential %s is not a %s with %s=%s", ref, credentialType, credentialProviderLabel, credentialProvider)
 	}
-	configName := strings.TrimSpace(annotations[ConfigSecretAnnotation])
-	if configName == "" {
-		return nil, invalid("CAPI Cluster %s/%s has no %s annotation yet", namespace, name, ConfigSecretAnnotation)
+	switch {
+	case len(credential.Data["config.json"]) > 0:
+		return parseInput(ctx, reader, credential, ref)
+	case explicit && len(credential.Data) == 0:
+		return nil, invalid("registry credential %s named by %s is still an empty placeholder", ref, ReferenceLabel)
+	case explicit:
+		return nil, invalid("registry credential %s named by %s has no registry mirror input (config.json)", ref, ReferenceLabel)
+	case len(credential.Data) == 0:
+		// The chart placeholder before the installer fills it.
+		return resolvePrepared(ctx, reader, namespace)
+	default:
+		// A filled credential without config.json: the platform pulls from a
+		// direct registry, not through the mirror.
+		return nil, nil
 	}
-	configRef := namespace + "/" + configName
+}
+
+func resolvePrepared(ctx context.Context, reader client.Reader, namespace string) (*Access, error) {
+	ref := namespace + "/" + PreparedInput
 	secret := &corev1.Secret{}
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: configName}, secret); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: PreparedInput}, secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, invalid("registry bootstrap Secret %s does not exist", configRef)
+			return nil, nil
 		}
-		return nil, fmt.Errorf("read registry bootstrap Secret %s: %w", configRef, err)
+		return nil, fmt.Errorf("read registry input %s: %w", ref, err)
 	}
 	if secret.Type != corev1.SecretTypeOpaque {
-		return nil, invalid("registry bootstrap Secret %s has type %s, want %s", configRef, secret.Type, corev1.SecretTypeOpaque)
+		return nil, invalid("registry input %s has type %s, want %s", ref, secret.Type, corev1.SecretTypeOpaque)
 	}
+	return parseInput(ctx, reader, secret, ref)
+}
+
+func parseInput(ctx context.Context, reader client.Reader, secret *corev1.Secret, ref string) (*Access, error) {
 	var p payload
 	if err := json.Unmarshal(secret.Data["config.json"], &p); err != nil {
-		return nil, invalid("registry bootstrap Secret %s: config.json does not decode: %v", configRef, err)
+		return nil, invalid("registry input %s: config.json does not decode: %v", ref, err)
 	}
 	switch {
 	case p.SchemaVersion != "" && p.SchemaVersion != "v1":
-		return nil, invalid("registry bootstrap Secret %s: unsupported schemaVersion %q", configRef, p.SchemaVersion)
+		return nil, invalid("registry input %s: unsupported schemaVersion %q", ref, p.SchemaVersion)
 	case p.Mode != "mirror":
-		return nil, invalid("registry bootstrap Secret %s: mode %q, want mirror", configRef, p.Mode)
+		return nil, invalid("registry input %s: mode %q, want mirror", ref, p.Mode)
 	case p.Source != LogicalRegistry:
-		return nil, invalid("registry bootstrap Secret %s: source %q, want %s", configRef, p.Source, LogicalRegistry)
-	case string(cluster.GetUID()) == "" || p.ClusterUID != string(cluster.GetUID()):
-		return nil, invalid("registry bootstrap Secret %s belongs to cluster UID %q, not %s/%s", configRef, p.ClusterUID, namespace, name)
-	case !configVersionPattern.MatchString(p.ConfigVersion):
-		return nil, invalid("registry bootstrap Secret %s: configVersion %q is not sha256:<64 hex>", configRef, p.ConfigVersion)
+		return nil, invalid("registry input %s: source %q, want %s", ref, p.Source, LogicalRegistry)
 	case len(p.Endpoints) == 0 || len(p.Endpoints) > maxEndpoints:
-		return nil, invalid("registry bootstrap Secret %s: %d endpoints, want 1 to %d", configRef, len(p.Endpoints), maxEndpoints)
-	case p.SandboxCredentialsSecretRef != nil:
-		return nil, invalid("registry bootstrap Secret %s carries sandboxCredentialsSecretRef, which only SSH nodes take", configRef)
+		return nil, invalid("registry input %s: %d endpoints, want 1 to %d", ref, len(p.Endpoints), maxEndpoints)
 	}
 	seen := map[string]bool{}
 	for _, endpoint := range p.Endpoints {
 		if !ValidEndpoint(endpoint) || endpoint == p.Source || seen[endpoint] {
-			return nil, invalid("registry bootstrap Secret %s: endpoint %q is invalid, the logical source or a duplicate", configRef, endpoint)
+			return nil, invalid("registry input %s: endpoint %q is invalid, the logical source or a duplicate", ref, endpoint)
 		}
 		seen[endpoint] = true
 	}
-	a := &Access{Source: p.Source, Endpoints: append([]string(nil), p.Endpoints...), ConfigVersion: p.ConfigVersion, ConfigSecret: configRef}
-	if ref := p.BootstrapCredentialsSecretRef; ref != nil {
-		if ref.Name == "" {
-			return nil, invalid("registry bootstrap Secret %s: bootstrapCredentialsSecretRef has no name", configRef)
+	a := &Access{Source: p.Source, Endpoints: append([]string(nil), p.Endpoints...), Input: ref}
+	if cref := p.CredentialsSecretRef; cref != nil {
+		if cref.Name == "" {
+			return nil, invalid("registry input %s: credentialsSecretRef has no name", ref)
 		}
+		namespace := secret.Namespace
 		creds := &corev1.Secret{}
-		if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ref.Name}, creds); err != nil {
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: cref.Name}, creds); err != nil {
 			if apierrors.IsNotFound(err) {
-				return nil, invalid("Secret %s/%s referenced by bootstrapCredentialsSecretRef of %s does not exist", namespace, ref.Name, configRef)
+				return nil, invalid("Secret %s/%s referenced by credentialsSecretRef of %s does not exist", namespace, cref.Name, ref)
 			}
-			return nil, fmt.Errorf("read Secret %s/%s: %w", namespace, ref.Name, err)
+			return nil, fmt.Errorf("read Secret %s/%s: %w", namespace, cref.Name, err)
 		}
-		if (ref.UID != "" && string(creds.UID) != ref.UID) || (ref.ResourceVersion != "" && creds.ResourceVersion != ref.ResourceVersion) {
-			return nil, invalid("Secret %s/%s changed after %s referenced it (uid/resourceVersion mismatch)", namespace, ref.Name, configRef)
+		if (cref.UID != "" && string(creds.UID) != cref.UID) || (cref.ResourceVersion != "" && creds.ResourceVersion != cref.ResourceVersion) {
+			return nil, invalid("Secret %s/%s changed after %s referenced it (uid/resourceVersion mismatch)", namespace, cref.Name, ref)
 		}
-		a.CredentialsSecret = namespace + "/" + ref.Name
+		a.CredentialsSecret = namespace + "/" + cref.Name
 		var err error
 		if a.auths, err = parseAuths(creds, a.CredentialsSecret, p.Endpoints); err != nil {
 			return nil, err

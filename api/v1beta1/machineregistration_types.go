@@ -40,15 +40,6 @@ type MachineRegistrationSpec struct {
 	// Config the cloud config that will be used to provision the node.
 	// +optional
 	Config Config `json:"config,omitempty"`
-	// RegistryClusterRef names a CAPI Cluster in this namespace that pulls
-	// through the registry mirror. A host that installs from the live ISO
-	// gets the mirror endpoints and credentials of that cluster's registry
-	// bootstrap Secret (cpaas.io/registry-config-secret), so a system-uri
-	// under cpaas-registry.cpaas-system can be pulled without logging in on
-	// the live system. SeedImages registering here pull a baseImage under
-	// that registry the same way. Unset gives neither.
-	// +optional
-	RegistryClusterRef *corev1.LocalObjectReference `json:"registryClusterRef,omitempty"`
 }
 
 type MachineRegistrationStatus struct {

@@ -18,7 +18,6 @@ package controllers
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,7 +26,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,60 +34,37 @@ import (
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 )
 
-func seedImageMirrorObjects() []client.Object {
-	cluster := &unstructured.Unstructured{}
-	cluster.SetAPIVersion("cluster.x-k8s.io/v1beta1")
-	cluster.SetKind("Cluster")
-	cluster.SetNamespace("fleet-default")
-	cluster.SetName("global")
-	cluster.SetUID("cluster-uid")
-	cluster.SetAnnotations(map[string]string{"cpaas.io/registry-mode": "mirror", "cpaas.io/registry-config-secret": "acp-registry-config-global"})
-	body, _ := json.Marshal(map[string]any{
-		"schemaVersion": "v1", "mode": "mirror", "source": "cpaas-registry.cpaas-system",
-		"endpoints": []string{"harbor.example.com:11443", "backup.example.com"}, "clusterUID": "cluster-uid",
-		"configVersion":                 "sha256:" + strings.Repeat("3", 64),
-		"bootstrapCredentialsSecretRef": map[string]string{"name": "acp-registry-bootstrap-global"},
-	})
-	return []client.Object{
-		cluster,
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "fleet-default", Name: "acp-registry-config-global"}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{"config.json": body}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "fleet-default", Name: "acp-registry-bootstrap-global"}, Type: corev1.SecretTypeDockerConfigJson,
-			Data: map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{"harbor.example.com:11443":{"auth":"cm9ib3Q6eA=="},"backup.example.com":{"auth":"cm9ib3Q6eQ=="}}}`)}},
+func pullSecret(typ corev1.SecretType) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "cpaas-system", Name: seedImagePullSecret},
+		Type:       typ,
+		Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{"harbor.example.com:11443":{"auth":"cm9ib3Q6eA=="}}}`)},
 	}
 }
 
-func TestSeedImageRegistry(t *testing.T) {
+func TestSeedImagePullAuth(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = elementalv1.AddToScheme(scheme)
 	_ = clientgoscheme.AddToScheme(scheme)
+	reconciler := func(objs ...client.Object) *SeedImageReconciler {
+		return &SeedImageReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()}
+	}
 	seedImg := &elementalv1.SeedImage{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "fleet-default", Name: "kubeos-arm", UID: "seed-uid"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "cpaas-system", Name: "kubeos-arm"},
 		Spec: elementalv1.SeedImageSpec{
-			BaseImage:      "cpaas-registry.cpaas-system/tkestack/kubeos-iso:alaudaos-44.ku.1-0.aarch64",
+			BaseImage:      "harbor.example.com:11443/tkestack/kubeos-iso:alaudaos-44.ku.1-0.aarch64",
 			TargetPlatform: "linux/arm64",
 		},
 	}
-	registration := &elementalv1.MachineRegistration{ObjectMeta: metav1.ObjectMeta{Namespace: "fleet-default", Name: "kubeos"}}
-	registration.Spec.RegistryClusterRef = &corev1.LocalObjectReference{Name: "global"}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(seedImageMirrorObjects()...).Build()
-	r := &SeedImageReconciler{Client: c}
 
-	registry, err := r.seedImageRegistry(context.Background(), seedImg, registration)
-	if err != nil {
-		t.Fatal(err)
+	if got, err := reconciler(pullSecret(corev1.SecretTypeDockerConfigJson)).seedImagePullAuth(context.Background(), seedImg); err != nil || got != seedImagePullSecret {
+		t.Fatalf("seedImagePullAuth() = %q, %v; want %s", got, err, seedImagePullSecret)
 	}
-	if registry == nil || registry.secretName != "kubeos-arm-registry-auth" || strings.Join(registry.endpoints, ",") != "harbor.example.com:11443,backup.example.com" {
-		t.Fatalf("registry = %+v", registry)
+	if got, err := reconciler().seedImagePullAuth(context.Background(), seedImg); err != nil || got != "" {
+		t.Fatalf("without the Secret: seedImagePullAuth() = %q, %v; want an anonymous pull", got, err)
 	}
-	secret := &corev1.Secret{}
-	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "fleet-default", Name: "kubeos-arm-registry-auth"}, secret); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(secret.Data["config.json"]), `"backup.example.com":{"auth":"cm9ib3Q6eQ=="}`) {
-		t.Fatalf("credential Secret = %s", secret.Data["config.json"])
-	}
-	if len(secret.OwnerReferences) != 1 || secret.OwnerReferences[0].UID != "seed-uid" {
-		t.Fatalf("credential Secret owners = %+v, want the SeedImage", secret.OwnerReferences)
+	if _, err := reconciler(pullSecret(corev1.SecretTypeOpaque)).seedImagePullAuth(context.Background(), seedImg); err == nil || !strings.Contains(err.Error(), "has type Opaque") {
+		t.Fatalf("seedImagePullAuth() error = %v, want a type error", err)
 	}
 
 	// Nothing to do when the builder does not pull the base image itself.
@@ -100,78 +75,88 @@ func TestSeedImageRegistry(t *testing.T) {
 	} {
 		s := seedImg.DeepCopy()
 		mutate(s)
-		if got, err := r.seedImageRegistry(context.Background(), s, registration); err != nil || got != nil {
-			t.Fatalf("%s: seedImageRegistry() = %+v, %v; want nothing", name, got, err)
+		if got, err := reconciler(pullSecret(corev1.SecretTypeDockerConfigJson)).seedImagePullAuth(context.Background(), s); err != nil || got != "" {
+			t.Fatalf("%s: seedImagePullAuth() = %q, %v; want nothing", name, got, err)
 		}
-	}
-	registration.Spec.RegistryClusterRef.Name = "missing"
-	if _, err := r.seedImageRegistry(context.Background(), seedImg, registration); err == nil || !strings.Contains(err.Error(), "registryClusterRef missing") {
-		t.Fatalf("seedImageRegistry() error = %v", err)
 	}
 }
 
-// The rewritten baseiso command tries each endpoint and stops at the first
-// pull that works; run it with a stub elemental.
-func TestApplySeedImageRegistryTriesEachEndpoint(t *testing.T) {
+// The baseiso command pulls baseImage as written, with the mounted
+// credentials and without certificate verification; run it with a stub
+// elemental.
+func TestApplySeedImagePullAuth(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
 	}
 	seedImg := &elementalv1.SeedImage{Spec: elementalv1.SeedImageSpec{
-		BaseImage:      "cpaas-registry.cpaas-system/tkestack/kubeos-iso:alaudaos-44.ku.1-0.aarch64",
+		BaseImage:      "harbor.example.com:11443/tkestack/kubeos-iso:alaudaos-44.ku.1-0.aarch64",
 		TargetPlatform: "linux/arm64",
 	}}
-	pod := fillBuildImagePod(seedImg, "builder:latest", corev1.PullNever, nil, false)
-	applySeedImageRegistry(pod, seedImg, &seedImageRegistry{source: "cpaas-registry.cpaas-system", endpoints: []string{"harbor.example.com:11443", "backup.example.com"}, secretName: "kubeos-arm-registry-auth"})
+	for name, disableTLSVerify := range map[string]bool{"verifying operator": false, "operator already skips verification": true} {
+		t.Run(name, func(t *testing.T) {
+			pod := fillBuildImagePod(seedImg, "builder:latest", corev1.PullNever, nil, disableTLSVerify)
+			applySeedImagePullAuth(pod, seedImagePullSecret)
 
-	baseiso := pod.Spec.InitContainers[0]
-	if baseiso.Name != "baseiso" {
-		t.Fatalf("first init container = %s", baseiso.Name)
-	}
-	if !containsEnv(baseiso.Env, "DOCKER_CONFIG", seedImageRegistryMount) || !containsMount(baseiso.VolumeMounts, seedImageRegistryVolume, seedImageRegistryMount) {
-		t.Fatalf("baseiso env %v mounts %v", baseiso.Env, baseiso.VolumeMounts)
-	}
-	found := false
-	for _, v := range pod.Spec.Volumes {
-		if v.Name == seedImageRegistryVolume && v.Secret != nil && v.Secret.SecretName == "kubeos-arm-registry-auth" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("volumes = %v", pod.Spec.Volumes)
-	}
+			baseiso := pod.Spec.InitContainers[0]
+			if baseiso.Name != "baseiso" {
+				t.Fatalf("first init container = %s", baseiso.Name)
+			}
+			if !containsEnv(baseiso.Env, "DOCKER_CONFIG", seedImageRegistryMount) || !containsMount(baseiso.VolumeMounts, seedImageRegistryVolume, seedImageRegistryMount) {
+				t.Fatalf("baseiso env %v mounts %v", baseiso.Env, baseiso.VolumeMounts)
+			}
+			found := false
+			for _, v := range pod.Spec.Volumes {
+				if v.Name == seedImageRegistryVolume && v.Secret != nil && v.Secret.SecretName == seedImagePullSecret &&
+					len(v.Secret.Items) == 1 && v.Secret.Items[0].Key == corev1.DockerConfigJsonKey && v.Secret.Items[0].Path == "config.json" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("volumes = %v", pod.Spec.Volumes)
+			}
+			if strings.Count(baseiso.Args[0], "--tls-verify=false") != 1 {
+				t.Fatalf("baseiso args = %q, want one --tls-verify=false", baseiso.Args[0])
+			}
 
-	// Run the command: /work and /iso under a temp root, elemental stubbed
-	// to fail on the first endpoint.
-	root := t.TempDir()
-	bin := filepath.Join(root, "bin")
-	if err := os.MkdirAll(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	stub := `#!/bin/bash
+			// Run the command: /work and /iso under a temp root.
+			root := t.TempDir()
+			bin := filepath.Join(root, "bin")
+			if err := os.MkdirAll(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			stub := `#!/bin/bash
 echo "$*" >> ` + root + `/calls
-case "$*" in *harbor.example.com*) exit 1;; esac
-mkdir -p "$5/elemental-iso" && echo iso > "$5/elemental-iso/base.iso"
+mkdir -p "${@: -1}/elemental-iso" && echo iso > "${@: -1}/elemental-iso/base.iso"
 `
-	if err := os.WriteFile(filepath.Join(bin, "elemental"), []byte(stub), 0o755); err != nil {
-		t.Fatal(err)
+			if err := os.WriteFile(filepath.Join(bin, "elemental"), []byte(stub), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(root, "iso"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			script := strings.NewReplacer("/work", root+"/work", "/iso/", root+"/iso/").Replace(baseiso.Args[0])
+			cmd := exec.Command("bash", "-c", script)
+			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("baseiso command failed: %v\n%s", err, out)
+			}
+			calls, _ := os.ReadFile(filepath.Join(root, "calls"))
+			want := "pull-image --tls-verify=false --platform=linux/arm64 harbor.example.com:11443/tkestack/kubeos-iso:alaudaos-44.ku.1-0.aarch64 " + root + "/work\n"
+			if string(calls) != want {
+				t.Fatalf("elemental calls =\n%s\nwant\n%s", calls, want)
+			}
+		})
 	}
-	if err := os.MkdirAll(filepath.Join(root, "iso"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	script := strings.NewReplacer("/work", root+"/work", "/iso/", root+"/iso/").Replace(baseiso.Args[0])
-	cmd := exec.Command("bash", "-c", script)
-	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("baseiso command failed: %v\n%s", err, out)
-	}
-	calls, _ := os.ReadFile(filepath.Join(root, "calls"))
-	want := "pull-image --tls-verify=false --platform=linux/arm64 harbor.example.com:11443/tkestack/kubeos-iso:alaudaos-44.ku.1-0.aarch64 " + root + "/work\n" +
-		"pull-image --tls-verify=false --platform=linux/arm64 backup.example.com/tkestack/kubeos-iso:alaudaos-44.ku.1-0.aarch64 " + root + "/work\n"
-	if string(calls) != want {
-		t.Fatalf("elemental calls =\n%s\nwant\n%s", calls, want)
-	}
-	if b, err := os.ReadFile(filepath.Join(root, "iso/base.iso")); err != nil || string(b) != "iso\n" {
-		t.Fatalf("base.iso = %q, %v", b, err)
+}
+
+// Without a pull Secret the pod is left as the upstream builder makes it.
+func TestApplySeedImagePullAuthWithoutSecret(t *testing.T) {
+	seedImg := &elementalv1.SeedImage{Spec: elementalv1.SeedImageSpec{BaseImage: "registry.example.com/iso:1", TargetPlatform: "linux/amd64"}}
+	pod := fillBuildImagePod(seedImg, "builder:latest", corev1.PullNever, nil, false)
+	before := pod.DeepCopy()
+	applySeedImagePullAuth(pod, "")
+	if len(pod.Spec.Volumes) != len(before.Spec.Volumes) || pod.Spec.InitContainers[0].Args[0] != before.Spec.InitContainers[0].Args[0] {
+		t.Fatalf("pod changed without a pull Secret")
 	}
 }
 

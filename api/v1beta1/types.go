@@ -170,9 +170,11 @@ type Elemental struct {
 	// +optional
 	InstallTarget *InstallTarget `json:"install-target,omitempty" yaml:"install-target,omitempty"`
 	// InstallRegistry is the registry mirror the install pulls the system
-	// image through. The operator sets it from the MachineRegistration's
-	// registryClusterRef in the configuration that starts an install; it is
-	// not taken from MachineRegistration.
+	// image through. The operator sets it in the configuration that starts
+	// an install with a system-uri, from the registry mirror input the
+	// MachineRegistration selects with its cpaas.io/registry-reference label
+	// (public-registry-credential by default); it is not taken from
+	// MachineRegistration.
 	// +optional
 	InstallRegistry *InstallRegistry `json:"install-registry,omitempty" yaml:"install-registry,omitempty"`
 }

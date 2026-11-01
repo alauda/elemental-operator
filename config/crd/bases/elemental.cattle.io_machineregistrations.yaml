@@ -144,9 +144,11 @@ spec:
                       install-registry:
                         description: |-
                           InstallRegistry is the registry mirror the install pulls the system
-                          image through. The operator sets it from the MachineRegistration's
-                          registryClusterRef in the configuration that starts an install; it is
-                          not taken from MachineRegistration.
+                          image through. The operator sets it in the configuration that starts
+                          an install with a system-uri, from the registry mirror input the
+                          MachineRegistration selects with its cpaas.io/registry-reference label
+                          (public-registry-credential by default); it is not taken from
+                          MachineRegistration.
                         properties:
                           docker-config:
                             description: |-
@@ -353,27 +355,6 @@ spec:
                 type: object
               machineName:
                 type: string
-              registryClusterRef:
-                description: |-
-                  RegistryClusterRef names a CAPI Cluster in this namespace that pulls
-                  through the registry mirror. A host that installs from the live ISO
-                  gets the mirror endpoints and credentials of that cluster's registry
-                  bootstrap Secret (cpaas.io/registry-config-secret), so a system-uri
-                  under cpaas-registry.cpaas-system can be pulled without logging in on
-                  the live system. SeedImages registering here pull a baseImage under
-                  that registry the same way. Unset gives neither.
-                properties:
-                  name:
-                    default: ""
-                    description: |-
-                      Name of the referent.
-                      This field is effectively required, but due to backwards compatibility is
-                      allowed to be empty. Instances of this type with an empty value here are
-                      almost certainly wrong.
-                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                    type: string
-                type: object
-                x-kubernetes-map-type: atomic
             type: object
           status:
             properties:
