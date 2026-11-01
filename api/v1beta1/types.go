@@ -23,6 +23,10 @@ import (
 
 const TPMRandomSeedValue = -1
 
+// DeviceSelectionInventory is the Install.DeviceSelection value that has a
+// person pick the install disk on the MachineInventory.
+const DeviceSelectionInventory = "inventory"
+
 type Install struct {
 	// +optional
 	Firmware string `json:"firmware,omitempty" yaml:"firmware,omitempty"`
@@ -30,6 +34,15 @@ type Install struct {
 	Device string `json:"device,omitempty" yaml:"device,omitempty"`
 	// +optional
 	DeviceSelector DeviceSelector `json:"device-selector,omitempty" yaml:"device-selector,omitempty"`
+	// DeviceSelection chooses how the install disk is picked. Empty keeps
+	// device and device-selector. "inventory" makes a host booted from the
+	// live ISO report its disks on its MachineInventory (status.install) and
+	// wait until a person picks one with the
+	// baremetal.alauda.io/install-target-device annotation; device and
+	// device-selector are not used then.
+	// +optional
+	// +kubebuilder:validation:Enum="";inventory
+	DeviceSelection string `json:"device-selection,omitempty" yaml:"device-selection,omitempty"`
 	// +optional
 	NoFormat bool `json:"no-format,omitempty" yaml:"no-format,omitempty"`
 	// +optional
@@ -93,6 +106,11 @@ type Reset struct {
 	DisableBootEntry bool `json:"disable-boot-entry,omitempty" yaml:"disable-boot-entry,omitempty"`
 }
 
+// Registration is the registration section of a MachineRegistration. A
+// tpm-mode that contradicts emulate-tpm is rejected at admission; the
+// MachineRegistration controller reports InvalidTPMConfig as well for
+// objects that bypassed it.
+// +kubebuilder:validation:XValidation:rule="!(has(self.tpm__dash__mode) && self.tpm__dash__mode in ['hardware', 'auto'] && has(self.emulate__dash__tpm) && self.emulate__dash__tpm && (!has(self.auth) || self.auth == 'tpm'))",message="tpm-mode hardware or auto cannot be combined with emulate-tpm: true"
 type Registration struct {
 	// +optional
 	URL string `json:"url,omitempty" yaml:"url,omitempty" mapstructure:"url"`
@@ -102,6 +120,16 @@ type Registration struct {
 	EmulateTPM bool `json:"emulate-tpm,omitempty" yaml:"emulate-tpm,omitempty" mapstructure:"emulate-tpm"`
 	// +optional
 	EmulatedTPMSeed int64 `json:"emulated-tpm-seed,omitempty" yaml:"emulated-tpm-seed,omitempty" mapstructure:"emulated-tpm-seed"`
+	// TPMMode selects the TPM behind auth "tpm". "hardware" requires a usable
+	// TPM 2.0 device, "emulated" uses the software TPM seeded by
+	// emulated-tpm-seed, and "auto" probes the host once at its first
+	// registration and keeps the result. The resolved mode is recorded in the
+	// registration state and never changes afterwards. Empty keeps the
+	// emulate-tpm behaviour. "hardware" and "auto" cannot be combined with
+	// emulate-tpm: true. Ignored for other auth methods.
+	// +optional
+	// +kubebuilder:validation:Enum=hardware;emulated;auto
+	TPMMode string `json:"tpm-mode,omitempty" yaml:"tpm-mode,omitempty" mapstructure:"tpm-mode"`
 	// +optional
 	NoSMBIOS bool `json:"no-smbios,omitempty" yaml:"no-smbios,omitempty" mapstructure:"no-smbios"`
 	// +optional
@@ -136,6 +164,67 @@ type Elemental struct {
 	Registration Registration `json:"registration,omitempty" yaml:"registration,omitempty"`
 	// +optional
 	SystemAgent SystemAgent `json:"system-agent,omitempty" yaml:"system-agent,omitempty"`
+	// InstallTarget pins the disk of one install. The operator sets it in the
+	// configuration it returns to a host it released for installation; it is
+	// not taken from MachineRegistration.
+	// +optional
+	InstallTarget *InstallTarget `json:"install-target,omitempty" yaml:"install-target,omitempty"`
+	// InstallRegistry is the registry mirror the install pulls the system
+	// image through. The operator sets it in the configuration that starts
+	// an install with a system-uri, from the registry mirror input the
+	// MachineRegistration selects with its cpaas.io/registry-reference label
+	// (public-registry-credential by default); it is not taken from
+	// MachineRegistration.
+	// +optional
+	InstallRegistry *InstallRegistry `json:"install-registry,omitempty" yaml:"install-registry,omitempty"`
+}
+
+// InstallRegistry maps the logical registry onto its real endpoints for a
+// live install. Hosts never verify the endpoints' certificates and keep none
+// of it in the installed system.
+type InstallRegistry struct {
+	// Source is the logical registry, cpaas-registry.cpaas-system.
+	Source string `json:"source" yaml:"source"`
+	// Endpoints are the real registries, tried in order.
+	Endpoints []string `json:"endpoints" yaml:"endpoints"`
+	// DockerConfig is a dockerconfigjson document with the endpoints'
+	// credentials; empty auths for an anonymous mirror.
+	// +optional
+	DockerConfig string `json:"docker-config,omitempty" yaml:"docker-config,omitempty"`
+}
+
+// InstallTarget names the disk an install must use by its canonical ID, as
+// elemental-register reports it, and the stale system disks the operator
+// approved for wiping.
+type InstallTarget struct {
+	// DeviceID is the canonical ID of the target disk: wwn:…, nvme-eui:…,
+	// nvme-nguid:… or serial:…. It takes precedence over install.device and
+	// install.device-selector.
+	// +optional
+	DeviceID string `json:"device-id,omitempty" yaml:"device-id,omitempty"`
+	// Expect lists properties the target must still have; empty fields are
+	// not checked.
+	// +optional
+	Expect InstallTargetExpect `json:"expect,omitempty" yaml:"expect,omitempty"`
+	// WipeDeviceIDs lists the stale system disks the operator approved for
+	// wiping. Unset (null) keeps the default of wiping every stale system disk
+	// found. Set, even to an empty list, only the listed disks are wiped and
+	// any other stale system disk stops the install. It is a pointer so an
+	// empty list survives the YAML round trip to the host.
+	// +optional
+	WipeDeviceIDs *[]string `json:"wipe-device-ids,omitempty" yaml:"wipe-device-ids,omitempty"`
+}
+
+// InstallTargetExpect are the properties the operator saw on the target disk.
+type InstallTargetExpect struct {
+	// +optional
+	SizeBytes int64 `json:"size-bytes,omitempty" yaml:"size-bytes,omitempty"`
+	// +optional
+	WWN string `json:"wwn,omitempty" yaml:"wwn,omitempty"`
+	// +optional
+	Serial string `json:"serial,omitempty" yaml:"serial,omitempty"`
+	// +optional
+	Model string `json:"model,omitempty" yaml:"model,omitempty"`
 }
 
 type Config struct {
@@ -151,10 +240,14 @@ type Config struct {
 
 type DeviceSelector []DeviceSelectorRequirement
 
+// DeviceSelectorRequirement narrows the install candidates. All requirements
+// of a selector must hold, and exactly one disk must remain. Name, ID, WWN,
+// Serial, Model and Transport take In or NotIn; Rotational takes In with
+// "true" or "false"; Size takes Gt or Lt with a quantity.
 type DeviceSelectorRequirement struct {
 	// +required
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=Name;Size
+	// +kubebuilder:validation:Enum=Name;Size;ID;WWN;Serial;Model;Transport;Rotational
 	Key DeviceSelectorKey `json:"key"`
 	// +required
 	// +kubebuilder:validation:Required
@@ -175,6 +268,18 @@ const (
 
 	DeviceSelectorKeyName DeviceSelectorKey = "Name"
 	DeviceSelectorKeySize DeviceSelectorKey = "Size"
+	// DeviceSelectorKeyID matches the canonical device ID (wwn:…, nvme-eui:…).
+	DeviceSelectorKeyID DeviceSelectorKey = "ID"
+	// DeviceSelectorKeyWWN matches the WWN lsblk reports, with or without 0x.
+	DeviceSelectorKeyWWN DeviceSelectorKey = "WWN"
+	// DeviceSelectorKeySerial matches the serial number lsblk reports.
+	DeviceSelectorKeySerial DeviceSelectorKey = "Serial"
+	// DeviceSelectorKeyModel matches the model lsblk reports, ignoring case.
+	DeviceSelectorKeyModel DeviceSelectorKey = "Model"
+	// DeviceSelectorKeyTransport matches the lsblk transport: sata, sas, nvme, usb, ...
+	DeviceSelectorKeyTransport DeviceSelectorKey = "Transport"
+	// DeviceSelectorKeyRotational matches "true" for spinning disks, "false" otherwise.
+	DeviceSelectorKeyRotational DeviceSelectorKey = "Rotational"
 )
 
 // NetworkTemplate contains a map of IPAddressPools and a schemaless network config template.

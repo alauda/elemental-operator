@@ -263,7 +263,18 @@ func (r *SeedImageReconciler) reconcileBuildImagePod(ctx context.Context, seedIm
 
 	logger.V(5).Info("Creating pod")
 
+	pullSecret, err := r.seedImagePullAuth(ctx, seedImg)
+	if err != nil {
+		meta.SetStatusCondition(&seedImg.Status.Conditions, metav1.Condition{
+			Type:    elementalv1.SeedImageConditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  elementalv1.SeedImageBuildNotStartedReason,
+			Message: err.Error(),
+		})
+		return err
+	}
 	pod := fillBuildImagePod(seedImg, r.SeedImageImage, r.SeedImageImagePullPolicy, r.SeedImageImagePullSecrets, r.DisableSeedImagePullImageTLSVerify)
+	applySeedImagePullAuth(pod, pullSecret)
 	if err := controllerutil.SetControllerReference(seedImg, pod, r.Scheme()); err != nil {
 		meta.SetStatusCondition(&seedImg.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.SeedImageConditionReady,

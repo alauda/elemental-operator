@@ -439,7 +439,7 @@ func TestObservedStorageLSBLKArgsRemainUtilLinux237Compatible(t *testing.T) {
 			}
 		}
 	}
-	for _, required := range []string{"KNAME", "PARTUUID", "PKNAME", "LOG-SEC"} {
+	for _, required := range []string{"KNAME", "PARTUUID", "PARTLABEL", "PKNAME", "LOG-SEC"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("lsblk columns do not include %s: %s", required, joined)
 		}
@@ -485,11 +485,32 @@ func TestObservedStorageProtocolMessages(t *testing.T) {
 	if MsgObservedStorageConfig <= MsgObservedNetworkConfig || MsgObserveStorage <= MsgObservedStorageConfig {
 		t.Fatalf("unexpected storage protocol ordering: network=%d report=%d observe=%d", MsgObservedNetworkConfig, MsgObservedStorageConfig, MsgObserveStorage)
 	}
-	if MsgLast != MsgObserveStorage {
-		t.Fatalf("MsgLast = %d, want %d", MsgLast, MsgObserveStorage)
+	if MsgLast <= MsgObserveStorage {
+		t.Fatalf("MsgLast = %d, must follow MsgObserveStorage (%d)", MsgLast, MsgObserveStorage)
 	}
 	if MsgObservedStorageConfig.String() != "ObservedStorageConfig" || MsgObserveStorage.String() != "ObserveStorage" {
 		t.Fatalf("unexpected message names: %q %q", MsgObservedStorageConfig, MsgObserveStorage)
+	}
+}
+
+// The fork's message numbers are on the wire: hosts and operators of
+// different releases negotiate by them, so they never move.
+func TestForkProtocolMessageNumbers(t *testing.T) {
+	want := map[MessageType]byte{
+		MsgObservedNetworkConfig: 13,
+		MsgObservedStorageConfig: 14,
+		MsgObserveStorage:        15,
+		MsgLiveInstallSession:    16,
+		MsgInstallHold:           17,
+		MsgInstallReport:         18,
+	}
+	for msg, number := range want {
+		if byte(msg) != number {
+			t.Errorf("%s = %d, want %d", msg, byte(msg), number)
+		}
+	}
+	if MsgLast != MsgInstallReport {
+		t.Errorf("MsgLast = %d, want %d", MsgLast, MsgInstallReport)
 	}
 }
 

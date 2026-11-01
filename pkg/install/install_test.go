@@ -22,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jaypipes/ghw"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/twpayne/go-vfs"
@@ -53,7 +52,7 @@ var (
 			},
 			Install: elementalv1.Install{
 				Firmware:         "a test firmware",
-				Device:           "a test device",
+				Device:           "/dev/sda",
 				NoFormat:         true,
 				ConfigURLs:       []string{"foo", "bar"},
 				ISO:              "a test iso",
@@ -129,9 +128,16 @@ var _ = Describe("installer install elemental", Label("installer", "install"), f
 	var fsCleanup func()
 	var cliRunner *climocks.MockRunner
 	var networkConfigurator *networkmocks.MockConfigurator
+	var host *fakeHost
 	var install Installer
 	BeforeEach(func() {
-		fs, fsCleanup, err = vfst.NewTestFS(map[string]interface{}{"/tmp/init": ""})
+		host = twoDisks()
+	})
+	JustBeforeEach(func() {
+		fs, fsCleanup, err = vfst.NewTestFS(merge(host.files(), map[string]interface{}{
+			"/tmp/init":                     "",
+			"/dev/elemental-install-target": &vfst.Symlink{Target: "disk/by-id/wwn-0x5000c500000000b2"},
+		}))
 		Expect(err).ToNot(HaveOccurred())
 		mockCtrl := gomock.NewController(GinkgoT())
 		cliRunner = climocks.NewMockRunner(mockCtrl)
@@ -140,6 +146,7 @@ var _ = Describe("installer install elemental", Label("installer", "install"), f
 			fs:                  fs,
 			runner:              cliRunner,
 			networkConfigurator: networkConfigurator,
+			disk:                host.diskOptions(),
 		}
 		DeferCleanup(fsCleanup)
 	})
@@ -149,128 +156,52 @@ var _ = Describe("installer install elemental", Label("installer", "install"), f
 		Expect(install.InstallElemental(configFixture, stateFixture, networkConfigFixture)).ToNot(HaveOccurred())
 		compareFiles(fs, filepath.Join(elementalcli.TempCloudInitDir, elementalBeforeHook), "_testdata/before-hook-config-install.yaml")
 	})
-})
-
-var _ = Describe("installer pick device", Label("installer", "install", "device", "disk"), func() {
-	var fs *vfst.TestFS
-	var err error
-	var fsCleanup func()
-	var cliRunner *climocks.MockRunner
-	var install *installer
-	BeforeEach(func() {
-		fs, fsCleanup, err = vfst.NewTestFS(map[string]interface{}{"/tmp/init": ""})
-		Expect(err).ToNot(HaveOccurred())
-		mockCtrl := gomock.NewController(GinkgoT())
-		cliRunner = climocks.NewMockRunner(mockCtrl)
-		DeferCleanup(fsCleanup)
+	It("hands the CLI the kernel path of a linked target", func() {
+		config := configFixture
+		config.Elemental.Install.Device = "/dev/elemental-install-target"
+		want := config.Elemental.Install
+		want.Device = "/dev/sdb"
+		cliRunner.EXPECT().Install(want).Return(nil)
+		networkConfigurator.EXPECT().GetNetworkConfigApplicator(networkConfigFixture).Return(networkConfigApplicatorFixture, nil)
+		Expect(install.InstallElemental(config, stateFixture, networkConfigFixture)).To(Succeed())
 	})
-	It("should pick single device no selectors", func() {
-		install = &installer{
-			fs:     fs,
-			runner: cliRunner,
-			disks:  []*ghw.Disk{{Name: "pickme"}},
-		}
-		actualDevice, err := install.findInstallationDevice(elementalv1.DeviceSelector{})
-		Expect(err).ToNot(HaveOccurred())
-		Expect(actualDevice).To(Equal("/dev/pickme"))
+	It("fails before writing anything when the target cannot be resolved", func() {
+		config := configFixture
+		config.Elemental.Install.Device = "/dev/disk/by-id/wwn-0x5000c5000000ffff"
+		err := install.InstallElemental(config, stateFixture, networkConfigFixture)
+		Expect(err).To(MatchError(ContainSubstring("TargetNotObserved")))
+		_, statErr := fs.Stat(filepath.Join(elementalcli.TempCloudInitDir, elementalBeforeHook))
+		Expect(statErr).To(MatchError(os.ErrNotExist))
 	})
-	It("should pick device based on selector name", func() {
-		install = &installer{
-			fs:     fs,
-			runner: cliRunner,
-			disks: []*ghw.Disk{
-				{Name: "sda"},
-				{Name: "sdb"},
-				{Name: "sdc"},
-				{Name: "sdd"},
-				{Name: "sde"},
-				{Name: "sdf"},
-				{Name: "sdg"},
-			},
-		}
-		selector := elementalv1.DeviceSelector{
-			{
-				Key:      elementalv1.DeviceSelectorKeyName,
-				Operator: elementalv1.DeviceSelectorOpIn,
-				Values:   []string{"/dev/sdd"},
-			},
-		}
-
-		actualDevice, err := install.findInstallationDevice(selector)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(actualDevice).To(Equal("/dev/sdd"))
-	})
-	It("should pick device less than 100Gi", func() {
-		install = &installer{
-			fs:     fs,
-			runner: cliRunner,
-			disks: []*ghw.Disk{
-				{Name: "sda", SizeBytes: 85899345920},
-				{Name: "sdb", SizeBytes: 214748364800},
-			},
-		}
-		selector := elementalv1.DeviceSelector{
-			{
-				Key:      elementalv1.DeviceSelectorKeySize,
-				Operator: elementalv1.DeviceSelectorOpLt,
-				Values:   []string{"100Gi"},
-			},
-		}
-
-		actualDevice, err := install.findInstallationDevice(selector)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(actualDevice).To(Equal("/dev/sda"))
-	})
-	It("should pick device greater than 100Gi", func() {
-		install = &installer{
-			fs:     fs,
-			runner: cliRunner,
-			disks: []*ghw.Disk{
-				{Name: "sda", SizeBytes: 85899345920},
-				{Name: "sdb", SizeBytes: 214748364800},
-			},
-		}
-		selector := elementalv1.DeviceSelector{
-			{
-				Key:      elementalv1.DeviceSelectorKeySize,
-				Operator: elementalv1.DeviceSelectorOpGt,
-				Values:   []string{"100Gi"},
-			},
-		}
-
-		actualDevice, err := install.findInstallationDevice(selector)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(actualDevice).To(Equal("/dev/sdb"))
-	})
-	It("should not error out for 2 matching devices", func() {
-		install = &installer{
-			fs:     fs,
-			runner: cliRunner,
-			disks: []*ghw.Disk{
-				{Name: "sda"},
-				{Name: "sdb"},
-			},
-		}
-		selector := elementalv1.DeviceSelector{
-			{
-				Key:      elementalv1.DeviceSelectorKeyName,
-				Operator: elementalv1.DeviceSelectorOpIn,
-				Values:   []string{"/dev/sda", "/dev/sdb"},
-			},
-		}
-		actualDevice, err := install.findInstallationDevice(selector)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(actualDevice).ToNot(BeEmpty())
-	})
-	It("should error out for no devices", func() {
-		install = &installer{
-			fs:     fs,
-			runner: cliRunner,
-			disks:  []*ghw.Disk{},
-		}
-		actualDevice, err := install.findInstallationDevice(elementalv1.DeviceSelector{})
-		Expect(err).To(HaveOccurred())
-		Expect(actualDevice).To(BeEmpty())
+	Context("in a live environment with a stale system disk", func() {
+		BeforeEach(func() {
+			host.live = true
+			host.disk("sda").elementalLayout()
+		})
+		It("wipes the stale disk and the target before elemental install runs", func() {
+			config := configFixture
+			config.Elemental.Install.Device = "/dev/elemental-install-target"
+			config.Elemental.Install.NoFormat = false
+			want := config.Elemental.Install
+			want.Device = "/dev/sdb"
+			cliRunner.EXPECT().Install(want).DoAndReturn(func(elementalv1.Install) error {
+				commands := destructive(host.calls)
+				Expect(commands).To(ContainElements("blockdev --rereadpt /dev/sda", "blockdev --rereadpt /dev/sdb"))
+				Expect(commands[len(commands)-1]).To(Equal("udevadm settle"))
+				return nil
+			})
+			networkConfigurator.EXPECT().GetNetworkConfigApplicator(networkConfigFixture).Return(networkConfigApplicatorFixture, nil)
+			Expect(install.InstallElemental(config, stateFixture, networkConfigFixture)).To(Succeed())
+		})
+		It("installs nothing when the stale disk cannot be wiped", func() {
+			host.disk("sda").part("xfs", "DATA", "")
+			config := configFixture
+			config.Elemental.Install.Device = "/dev/sdb"
+			err := install.InstallElemental(config, stateFixture, networkConfigFixture)
+			Expect(err).To(MatchError(ContainSubstring("Blocked: stale system disks cannot be wiped safely")))
+			Expect(err).To(MatchError(ContainSubstring("partition /dev/sda6 (xfs, label DATA)")))
+			Expect(destructive(host.calls)).To(BeEmpty())
+		})
 	})
 })
 

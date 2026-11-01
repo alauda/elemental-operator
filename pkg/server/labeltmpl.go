@@ -37,6 +37,7 @@ func updateInventoryWithTemplates(tmpl templater.Templater, inv *elementalv1.Mac
 	if err := updateInventoryName(tmpl, inv); err != nil {
 		return fmt.Errorf("failed to resolve inventory name: %w", err)
 	}
+	ensureGlobalInventoryName(inv, reg)
 	if err := updateInventoryLabels(tmpl, inv, reg); err != nil {
 		return fmt.Errorf("failed to update inventory labels: %w", err)
 	}
@@ -74,6 +75,19 @@ func updateInventoryName(tmpl templater.Templater, inv *elementalv1.MachineInven
 	}
 	inv.Name = strings.ToLower(name)
 	return nil
+}
+
+// ensureGlobalInventoryName starts the name of a new global-scoped inventory
+// with "global-": etcd-sync keeps such inventories, and the plan Secrets named
+// after them, on their own side of a DR pair. Existing inventories keep their
+// names.
+func ensureGlobalInventoryName(inv *elementalv1.MachineInventory, reg *elementalv1.MachineRegistration) {
+	if !isNewInventory(inv) || !elementalv1.IsGlobalSystemAgentAuthScope(reg.Annotations) {
+		return
+	}
+	if !strings.HasPrefix(inv.Name, elementalv1.GlobalNamePrefix) {
+		inv.Name = elementalv1.GlobalNamePrefix + inv.Name
+	}
 }
 
 func updateInventoryLabels(tmpl templater.Templater, inv *elementalv1.MachineInventory, reg *elementalv1.MachineRegistration) error {
@@ -162,7 +176,12 @@ func mergeInventoryAnnotations(data []byte, mInventory *elementalv1.MachineInven
 		mInventory.Annotations = map[string]string{}
 	}
 	for key, val := range annotations {
-		mInventory.Annotations[fmt.Sprintf("elemental.cattle.io/%s", sanitizeUserInput(key))] = sanitizeUserInput(val)
+		annotation := fmt.Sprintf("elemental.cattle.io/%s", sanitizeUserInput(key))
+		if isServerOwnedAnnotation(annotation) {
+			log.Warningf("Ignoring annotation %s sent by the registering host: it is owned by the registration server", annotation)
+			continue
+		}
+		mInventory.Annotations[annotation] = sanitizeUserInput(val)
 	}
 	return nil
 }

@@ -29,10 +29,42 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// State is what elemental-register remembers between registrations. It is
+// carried from the live ISO into the installed system, and an OS rollback can
+// hand it to an older elemental-register: fields are only ever added and the
+// existing ones keep their meaning. (An older binary drops the fields it does
+// not know when it saves the state again.)
 type State struct {
 	InitialRegistration time.Time `yaml:"initialRegistration,omitempty"`
 	EmulatedTPM         bool      `yaml:"emulatedTPM,omitempty"`
 	EmulatedTPMSeed     int64     `yaml:"emulatedTPMSeed,omitempty"`
+	// EmulatedTPMSeedVersion is tpm.SeedVersionV2 for a seed derived with
+	// v2; absent for static seeds and seeds from earlier releases.
+	EmulatedTPMSeedVersion int `yaml:"emulatedTPMSeedVersion,omitempty"`
+	// EmulatedTPMSeedSalt is the salt the v2 seed was derived with; absent
+	// means 0.
+	EmulatedTPMSeedSalt uint32 `yaml:"emulatedTPMSeedSalt,omitempty"`
+	// TPMMode is the TPM the identity is bound to, "hardware" or "emulated".
+	// It is resolved once, at the first registration, and from then on
+	// neither probed again nor taken from the config. EmulatedTPM keeps
+	// mirroring it for older elemental-register binaries.
+	TPMMode string `yaml:"tpmMode,omitempty"`
+	// TPMModeSource tells where TPMMode came from: one of the
+	// TPMModeSource* constants.
+	TPMModeSource string `yaml:"tpmModeSource,omitempty"`
+	// TPMProbe is the hardware TPM check that decided TPMMode, when there
+	// was one.
+	TPMProbe *TPMProbe `yaml:"tpmProbe,omitempty"`
+}
+
+// TPMProbe records the hardware TPM check of the first registration.
+type TPMProbe struct {
+	// Result is TPMProbePassed or TPMProbeFailed.
+	Result string `yaml:"result,omitempty"`
+	// Reason says why the hardware TPM was not usable.
+	Reason string `yaml:"reason,omitempty"`
+	// At is when the check ran.
+	At time.Time `yaml:"at,omitempty"`
 }
 
 func (s *State) IsUpdatable() bool {

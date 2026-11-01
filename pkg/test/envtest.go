@@ -40,9 +40,9 @@ func init() {
 }
 
 func StartEnvTest(testEnv *envtest.Environment) (*rest.Config, client.Client, error) {
-	// Get the root of the current file to use in CRD paths.
+	// CRDs come from this checkout, whatever its directory is called.
 	_, filename, _, _ := goruntime.Caller(0) //nolint:dogsled
-	root := path.Join(path.Dir(filename), "..", "..", "..", "elemental-operator")
+	root := path.Join(path.Dir(filename), "..", "..")
 
 	testEnv.CRDDirectoryPaths = []string{
 		path.Join(root, "config", "crd", "bases"),

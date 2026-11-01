@@ -41,19 +41,22 @@ const (
 	MsgReady
 	MsgSmbios
 	MsgLabels
-	MsgGet                                       // v0.5.0
-	MsgVersion                                   // v1.1.0
-	MsgSystemData                                // v1.1.1 deprecated by MsgSystemDataV2
-	MsgConfig                                    // v1.1.1
-	MsgError                                     // v1.1.1
-	MsgAnnotations                               // v1.1.4
-	MsgUpdate                                    // v1.2.6
-	MsgSystemDataV2                              // v1.6.0
-	MsgNetworkConfig                             // v1.7.0
-	MsgObservedNetworkConfig                     // Alauda fork: live-ISO observed network snapshot
-	MsgObservedStorageConfig                     // Alauda fork: objective storage report
-	MsgObserveStorage                            // Alauda fork: enter periodic read-only observer session
-	MsgLast                  = MsgObserveStorage // MsgLast must point to the last message
+	MsgGet                                      // v0.5.0
+	MsgVersion                                  // v1.1.0
+	MsgSystemData                               // v1.1.1 deprecated by MsgSystemDataV2
+	MsgConfig                                   // v1.1.1
+	MsgError                                    // v1.1.1
+	MsgAnnotations                              // v1.1.4
+	MsgUpdate                                   // v1.2.6
+	MsgSystemDataV2                             // v1.6.0
+	MsgNetworkConfig                            // v1.7.0
+	MsgObservedNetworkConfig                    // Alauda fork: live-ISO observed network snapshot
+	MsgObservedStorageConfig                    // Alauda fork: objective storage report
+	MsgObserveStorage                           // Alauda fork: enter periodic read-only observer session
+	MsgLiveInstallSession                       // Alauda fork: live-ISO install session (boot, installer, disks)
+	MsgInstallHold                              // Alauda fork: MsgGet reply while no install target was chosen
+	MsgInstallReport                            // Alauda fork: install outcome of a released host
+	MsgLast                  = MsgInstallReport // MsgLast must point to the last message
 )
 
 func (mt MessageType) String() string {
@@ -90,14 +93,40 @@ func (mt MessageType) String() string {
 		return "ObservedStorageConfig"
 	case MsgObserveStorage:
 		return "ObserveStorage"
+	case MsgLiveInstallSession:
+		return "LiveInstallSession"
+	case MsgInstallHold:
+		return "InstallHold"
+	case MsgInstallReport:
+		return "InstallReport"
 	default:
 		return "Unknown"
 	}
 }
 
+// ErrorMessage is the payload of MsgError. Code was added after Message and
+// is optional: older peers neither send nor read it, so it never replaces
+// the message.
 type ErrorMessage struct {
 	Message string `json:"message,omitempty" yaml:"message"`
+	Code    string `json:"code,omitempty" yaml:"code,omitempty"`
 }
+
+// Values of ErrorMessage.Code.
+const (
+	// ErrorCodeIdentityConflict: the identity the host authenticated with
+	// belongs to a MachineInventory that other hardware registered, and the
+	// server did not commit anything (it only marks the inventory when the
+	// host had registered before). A host registering an identity it derived
+	// itself (see TPMSeedVersionAnnotation) answers it by deriving the next
+	// one; any other host needs an operator to give it another identity.
+	ErrorCodeIdentityConflict = "IdentityConflict"
+	// ErrorCodeIdentityRebindRequired: the identity is new, but the hardware
+	// fingerprint matches a MachineInventory whose identity the server does
+	// not move by itself (a hardware TPM without the allow-identity-rebind
+	// annotation, or an inventory in identity conflict).
+	ErrorCodeIdentityRebindRequired = "IdentityRebindRequired"
+)
 
 func NewErrorMessage(err error) ErrorMessage {
 	return ErrorMessage{

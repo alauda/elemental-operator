@@ -14,7 +14,17 @@ spec:
     singular: machineinventory
   scope: Namespaced
   versions:
-  - name: v1beta1
+  - additionalPrinterColumns:
+    - jsonPath: .status.install.phase
+      name: Install
+      type: string
+    - jsonPath: .status.install.targetDeviceID
+      name: Target
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1beta1
     schema:
       openAPIV3Schema:
         properties:
@@ -434,6 +444,123 @@ spec:
                   - type
                   type: object
                 type: array
+              install:
+                description: |-
+                  Install is the install session of a host booted from the live ISO with
+                  elemental-register --install, written by the registration server.
+                properties:
+                  bootID:
+                    description: BootID is the boot_id of the live boot the session
+                      belongs to.
+                    type: string
+                  candidates:
+                    description: Candidates are the whole disks the live session reported.
+                    items:
+                      description: InstallCandidate is one whole disk a live session
+                        reported.
+                      properties:
+                        eligible:
+                          description: |-
+                            Eligible says whether the disk may be chosen as the install target;
+                            Reasons explains why not.
+                          type: boolean
+                        hasData:
+                          description: |-
+                            HasData lists signatures of data found on the disk, e.g. LVM2_member.
+                            Automatic selection never picks such a disk.
+                          items:
+                            type: string
+                          type: array
+                        id:
+                          description: |-
+                            ID is the canonical whole-disk ID: wwn:, nvme-eui:, nvme-nguid: or
+                            serial:; unidentified: when the disk has none.
+                          type: string
+                        model:
+                          type: string
+                        path:
+                          description: Path is the kernel device path in the reporting
+                            boot only.
+                          type: string
+                        reasons:
+                          items:
+                            type: string
+                          type: array
+                        rotational:
+                          type: boolean
+                        serial:
+                          type: string
+                        sizeBytes:
+                          format: int64
+                          type: integer
+                        staleSystem:
+                          description: StaleSystem marks a disk that carries an old
+                            system layout.
+                          type: boolean
+                        transport:
+                          type: string
+                        wwn:
+                          type: string
+                      required:
+                      - eligible
+                      - id
+                      type: object
+                    type: array
+                  installer:
+                    description: InstallerKind is status.install.installer, the backend
+                      that installs the OS.
+                    type: string
+                  lastSeenAt:
+                    description: LastSeenAt is refreshed by every registration of
+                      the live session.
+                    format: date-time
+                    type: string
+                  message:
+                    type: string
+                  phase:
+                    description: InstallPhase is status.install.phase.
+                    enum:
+                    - AwaitingTarget
+                    - Installing
+                    - Installed
+                    - Failed
+                    type: string
+                  staleSystemDisks:
+                    description: StaleSystemDisks are the disks found carrying an
+                      old system layout.
+                    items:
+                      description: |-
+                        StaleSystemDisk is a disk, other than the install target, that carries an
+                        old system layout.
+                      properties:
+                        action:
+                          description: |-
+                            StaleSystemDiskAction says what the install does with a disk that carries
+                            an old system layout.
+                          enum:
+                          - Wipe
+                          - Blocked
+                          - Target
+                          type: string
+                        evidence:
+                          items:
+                            type: string
+                          type: array
+                        id:
+                          type: string
+                        reason:
+                          type: string
+                      required:
+                      - id
+                      type: object
+                    type: array
+                  targetDeviceID:
+                    description: |-
+                      TargetDeviceID is the canonical ID of the disk the install was released
+                      to. While an installed host waits in the live ISO again, it is the disk
+                      its installed system is on.
+                    type: string
+                type: object
               observedStorage:
                 description: |-
                   ObservedStorage is objective host state written only by the authenticated

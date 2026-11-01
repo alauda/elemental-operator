@@ -160,3 +160,64 @@ var _ = Describe("save state to filesystem", Label("registration", "state"), fun
 		})
 	})
 })
+
+var _ = Describe("state format compatibility", Label("registration", "state"), func() {
+	var fs vfs.FS
+	var handler StateHandler
+	BeforeEach(func() {
+		var fsCleanup func()
+		var err error
+		fs, fsCleanup, err = vfst.NewTestFS(map[string]interface{}{})
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(fsCleanup)
+		handler = NewFileStateHandler(fs)
+		Expect(handler.Init(testStatePath)).To(Succeed())
+	})
+
+	It("reads a state written by an earlier release", func() {
+		legacy := "initialRegistration: 2025-01-02T03:04:05Z\nemulatedTPM: true\nemulatedTPMSeed: -9198403500847051214\n"
+		Expect(fs.WriteFile(testStatePath, []byte(legacy), 0600)).To(Succeed())
+		Expect(handler.Load()).To(Equal(State{
+			InitialRegistration: time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC),
+			EmulatedTPM:         true,
+			EmulatedTPMSeed:     -9198403500847051214,
+		}))
+	})
+
+	It("writes a state an earlier release still understands", func() {
+		current := State{
+			InitialRegistration:    time.Date(2026, time.October, 27, 8, 0, 0, 0, time.UTC),
+			EmulatedTPM:            true,
+			EmulatedTPMSeed:        -8384082019430403094,
+			EmulatedTPMSeedVersion: 2,
+			EmulatedTPMSeedSalt:    1,
+			TPMMode:                "emulated",
+			TPMModeSource:          TPMModeSourceProbe,
+			TPMProbe:               &TPMProbe{Result: TPMProbeFailed, Reason: "no TPM device", At: time.Date(2026, time.October, 27, 8, 0, 0, 0, time.UTC)},
+		}
+		Expect(handler.Save(current)).To(Succeed())
+		Expect(handler.Load()).To(Equal(current))
+
+		// The State struct and decoder of elemental-register before tpm-mode.
+		type legacyState struct {
+			InitialRegistration time.Time `yaml:"initialRegistration,omitempty"`
+			EmulatedTPM         bool      `yaml:"emulatedTPM,omitempty"`
+			EmulatedTPMSeed     int64     `yaml:"emulatedTPMSeed,omitempty"`
+		}
+		file, err := fs.Open(testStatePath)
+		Expect(err).ToNot(HaveOccurred())
+		defer file.Close()
+		var legacy legacyState
+		Expect(yaml.NewDecoder(file).Decode(&legacy)).To(Succeed())
+		Expect(legacy).To(Equal(legacyState{
+			InitialRegistration: current.InitialRegistration,
+			EmulatedTPM:         true,
+			EmulatedTPMSeed:     -8384082019430403094,
+		}))
+	})
+
+	It("keeps an empty state empty", func() {
+		Expect(handler.Save(State{})).To(Succeed())
+		Expect(fs.ReadFile(testStatePath)).To(Equal([]byte("{}\n")))
+	})
+})
