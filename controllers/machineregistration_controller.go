@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/rancher/wrangler/v3/pkg/randomtoken"
@@ -30,16 +31,19 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 	errorutils "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 	"github.com/rancher/elemental-operator/pkg/log"
@@ -54,7 +58,11 @@ type MachineRegistrationReconciler struct {
 	SystemAgentServiceAccount       string
 	GlobalSystemAgentServiceAccount string
 	SystemAgentSplitAuthEnabled     bool
-	SystemAgentSharedAuthReadOnly   bool
+	// SystemAgentSharedAuthOwnership is one of the SharedAuthOwnership
+	// values; empty is auto.
+	SystemAgentSharedAuthOwnership string
+
+	etcdSync *etcdSyncObserver
 }
 
 type planSecretScopeConflictError struct {
@@ -92,6 +100,12 @@ func NormalizeSystemAgentAuthMode(mode string) string {
 // +kubebuilder:rbac:groups=elemental.cattle.io,resources=machineinventories,verbs=get;list;watch
 
 func (r *MachineRegistrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	ownership, err := NormalizeSharedAuthOwnership(r.SystemAgentSharedAuthOwnership)
+	if err != nil {
+		return err
+	}
+	r.etcdSync = newEtcdSyncObserver(mgr.GetAPIReader())
+
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&elementalv1.MachineRegistration{}).
 		Owns(&corev1.ServiceAccount{}).
@@ -101,6 +115,26 @@ func (r *MachineRegistrationReconciler) SetupWithManager(mgr ctrl.Manager) error
 			&elementalv1.MachineInventory{},
 			handler.EnqueueRequestsFromMapFunc(r.machineInventoryToMachineRegistrations),
 		)
+	}
+	if r.sharedAuthEnabled() && ownership == SharedAuthOwnershipAuto {
+		// A cache of its own for the one etcd-sync ConfigMap, so the manager
+		// does not start a cluster-wide ConfigMap informer.
+		etcdSyncCache, err := cache.New(mgr.GetConfig(), cache.Options{
+			Scheme:            mgr.GetScheme(),
+			Mapper:            mgr.GetRESTMapper(),
+			DefaultNamespaces: map[string]cache.Config{etcdSyncNamespace: {}},
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.ConfigMap{}: {Field: fields.OneTermEqualSelector("metadata.name", etcdSyncConfigMapName)},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create the %s/%s cache: %w", etcdSyncNamespace, etcdSyncConfigMapName, err)
+		}
+		if err := mgr.Add(etcdSyncCache); err != nil {
+			return fmt.Errorf("failed to add the %s/%s cache: %w", etcdSyncNamespace, etcdSyncConfigMapName, err)
+		}
+		builder = builder.WatchesRawSource(source.Kind(etcdSyncCache, &corev1.ConfigMap{},
+			handler.TypedEnqueueRequestsFromMapFunc(r.etcdSyncToMachineRegistrations)))
 	}
 	return builder.Complete(r)
 }
@@ -189,7 +223,8 @@ func (r *MachineRegistrationReconciler) reconcile(ctx context.Context, mRegistra
 		return ctrl.Result{}, fmt.Errorf("failed to set registration token and url: %w", err)
 	}
 
-	if err := r.createRBACObjects(ctx, mRegistration); err != nil {
+	recheckAfter, err := r.createRBACObjects(ctx, mRegistration)
+	if err != nil {
 		meta.SetStatusCondition(&mRegistration.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.ReadyCondition,
 			Status:  metav1.ConditionFalse,
@@ -205,7 +240,7 @@ func (r *MachineRegistrationReconciler) reconcile(ctx context.Context, mRegistra
 		Status: metav1.ConditionTrue,
 	})
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: recheckAfter}, nil
 }
 
 // validateRegistrationTPMConfig rejects a tpm-mode that elemental-register
@@ -275,18 +310,21 @@ func (r *MachineRegistrationReconciler) getServerURL() (string, error) {
 	return serverURL, nil
 }
 
-func (r *MachineRegistrationReconciler) createRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration) error {
+// createRBACObjects reconciles the system-agent identity of mRegistration. A
+// non-zero duration asks for another reconcile then, when the shared identity
+// is read-only only for the moment.
+func (r *MachineRegistrationReconciler) createRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration) (time.Duration, error) {
 	if r.sharedAuthEnabled() {
 		if !r.splitAuthEnabled() {
 			return r.createScopedRBACObjects(ctx, mRegistration, elementalv1.SystemAgentAuthScopeShared)
 		}
 		scope, err := elementalv1.ResolveSystemAgentAuthScope(mRegistration.Annotations)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		return r.createScopedRBACObjects(ctx, mRegistration, scope)
 	}
-	return r.createRegistrationRBACObjects(ctx, mRegistration)
+	return 0, r.createRegistrationRBACObjects(ctx, mRegistration)
 }
 
 func (r *MachineRegistrationReconciler) createRegistrationRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration) error {
@@ -387,7 +425,7 @@ func (r *MachineRegistrationReconciler) createRegistrationRBACObjects(ctx contex
 	return nil
 }
 
-func (r *MachineRegistrationReconciler) createScopedRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration, scope string) error {
+func (r *MachineRegistrationReconciler) createScopedRBACObjects(ctx context.Context, mRegistration *elementalv1.MachineRegistration, scope string) (time.Duration, error) {
 	logger := ctrl.LoggerFrom(ctx)
 	logger.Info("Reconciling scoped system-agent RBAC resources", "scope", scope)
 
@@ -399,8 +437,10 @@ func (r *MachineRegistrationReconciler) createScopedRBACObjects(ctx context.Cont
 		Name:      saName,
 	}
 
-	if scope == elementalv1.SystemAgentAuthScopeShared && r.SystemAgentSharedAuthReadOnly {
-		return r.validateExternallyManagedSystemAgentAuth(ctx, mRegistration.Namespace, saName)
+	if scope == elementalv1.SystemAgentAuthScopeShared {
+		if verdict := r.sharedAuthVerdict(ctx); verdict.readOnly {
+			return verdict.recheckAfter, r.validateExternallyManagedSystemAgentAuth(ctx, mRegistration.Namespace, saName)
+		}
 	}
 
 	labels := map[string]string{
@@ -418,7 +458,7 @@ func (r *MachineRegistrationReconciler) createScopedRBACObjects(ctx context.Cont
 		sa.OwnerReferences = nil
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile %s system-agent service account: %w", scope, err)
+		return 0, fmt.Errorf("failed to reconcile %s system-agent service account: %w", scope, err)
 	}
 
 	secret := &corev1.Secret{
@@ -437,13 +477,13 @@ func (r *MachineRegistrationReconciler) createScopedRBACObjects(ctx context.Cont
 		secret.Type = corev1.SecretTypeServiceAccountToken
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile %s system-agent token secret: %w", scope, err)
+		return 0, fmt.Errorf("failed to reconcile %s system-agent token secret: %w", scope, err)
 	}
 
 	planSecretNames, planSecretErr := r.planSecretNames(ctx, mRegistration.Namespace, scope)
 	var scopeConflict *planSecretScopeConflictError
 	if planSecretErr != nil && !errors.As(planSecretErr, &scopeConflict) {
-		return planSecretErr
+		return 0, planSecretErr
 	}
 	// A scope conflict still returns a safe set with every conflicting name
 	// removed. Reconcile that set first so stale Roles cannot retain cross-scope
@@ -460,7 +500,7 @@ func (r *MachineRegistrationReconciler) createScopedRBACObjects(ctx context.Cont
 		role.Rules = systemAgentRules(planSecretNames)
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile %s system-agent role: %w", scope, err)
+		return 0, fmt.Errorf("failed to reconcile %s system-agent role: %w", scope, err)
 	}
 
 	roleBinding := &rbacv1.RoleBinding{
@@ -484,10 +524,10 @@ func (r *MachineRegistrationReconciler) createScopedRBACObjects(ctx context.Cont
 		}
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile %s system-agent role binding: %w", scope, err)
+		return 0, fmt.Errorf("failed to reconcile %s system-agent role binding: %w", scope, err)
 	}
 
-	return planSecretErr
+	return 0, planSecretErr
 }
 
 func (r *MachineRegistrationReconciler) validateExternallyManagedSystemAgentAuth(ctx context.Context, namespace, saName string) error {
@@ -550,6 +590,45 @@ func (r *MachineRegistrationReconciler) sharedAuthEnabled() bool {
 
 func (r *MachineRegistrationReconciler) splitAuthEnabled() bool {
 	return r.sharedAuthEnabled() && r.SystemAgentSplitAuthEnabled
+}
+
+// sharedAuthVerdict tells whether the shared system-agent identity is
+// maintained here or only checked, logging when that changes.
+func (r *MachineRegistrationReconciler) sharedAuthVerdict(ctx context.Context) sharedAuthVerdict {
+	ownership, err := NormalizeSharedAuthOwnership(r.SystemAgentSharedAuthOwnership)
+	if err != nil {
+		return sharedAuthVerdict{readOnly: true, reason: err.Error()}
+	}
+	switch ownership {
+	case SharedAuthOwnershipOwner:
+		return sharedAuthVerdict{reason: "ownership is owner"}
+	case SharedAuthOwnershipReadOnly:
+		return sharedAuthVerdict{readOnly: true, reason: "ownership is readonly"}
+	}
+	if r.etcdSync == nil {
+		r.etcdSync = newEtcdSyncObserver(r.Client)
+	}
+	verdict := r.etcdSync.observe(ctx)
+	if from, changed := r.etcdSync.transition(verdict.readOnly); changed {
+		ctrl.LoggerFrom(ctx).Info("Shared system-agent auth ownership changed",
+			"from", from, "to", sharedAuthRole(verdict.readOnly), "reason", verdict.reason)
+	}
+	return verdict
+}
+
+// etcdSyncToMachineRegistrations reconciles every MachineRegistration when
+// the etcd-sync ConfigMap appears or disappears.
+func (r *MachineRegistrationReconciler) etcdSyncToMachineRegistrations(ctx context.Context, _ *corev1.ConfigMap) []reconcile.Request {
+	registrations := &elementalv1.MachineRegistrationList{}
+	if err := r.List(ctx, registrations); err != nil {
+		log.Errorf("failed to list MachineRegistrations after an etcd-sync change: %s", err.Error())
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(registrations.Items))
+	for i := range registrations.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&registrations.Items[i])})
+	}
+	return requests
 }
 
 func (r *MachineRegistrationReconciler) sharedServiceAccountName() string {
