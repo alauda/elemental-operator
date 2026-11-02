@@ -130,7 +130,9 @@ func (i *InventoryServer) unauthenticatedResponse(registration *elementalv1.Mach
 		Encode(config)
 }
 
-func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration, netConf elementalv1.NetworkConfig) error {
+// writeMachineInventoryCloudConfig sends the configuration of the inventory;
+// adjust, when set, changes it first.
+func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration, netConf elementalv1.NetworkConfig, adjust func(*elementalv1.Config)) error {
 	sa := &corev1.ServiceAccount{}
 
 	if err := i.Get(i, types.NamespacedName{
@@ -168,12 +170,18 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 		URL:             systemAgentURL,
 		CACert:          systemAgentCACert,
 		Token:           string(secret.Data["token"]),
-		SecretName:      inventory.Name,
+		SecretName:      elementalv1.PlanSecretName(inventory),
 		SecretNamespace: inventory.Namespace,
 	}
 	config.Elemental.Install = registration.Spec.Config.Elemental.Install
 	config.Elemental.Reset = registration.Spec.Config.Elemental.Reset
 	config.CloudConfig = registration.Spec.Config.CloudConfig
+	if adjust != nil {
+		adjust(config)
+	}
+	if err := i.addInstallRegistry(registration, config); err != nil {
+		return err
+	}
 
 	// If client does not support MsgConfig we send back the config as a
 	// byte-stream without a message-type to keep backwards-compatibility.
@@ -235,6 +243,7 @@ func (i *InventoryServer) getSystemAgentCACert(endpointMode string, secret *core
 func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration) error { //nolint: gocyclo
 	protoVersion := register.MsgUndefined
 	tmpl := templater.NewTemplater()
+	sess := newRegistrationSession(inventory, registration)
 
 	for {
 		var data []byte
@@ -261,6 +270,7 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 				return fmt.Errorf("failed to extract labels from SMBIOS data: %w", err)
 			}
 			tmpl.Fill(smbiosData)
+			sess.smbios = smbiosData
 		case register.MsgLabels:
 			if err := mergeInventoryLabels(inventory, data); err != nil {
 				return err
@@ -270,18 +280,36 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 			if err != nil {
 				return fmt.Errorf("failed to decode dynamic data: %w", err)
 			}
+			sess.setAnnotations(data)
 		case register.MsgGet:
 			// Final call: here we commit the MachineInventory, send the Elemental config data
-			// and close the connection.
-			if err := updateInventoryWithTemplates(tmpl, inventory, registration); err != nil {
+			// and close the connection. The hardware has to match the
+			// inventory first; on a conflict nothing is committed.
+			inventory, err = i.checkHardwareIdentity(conn, protoVersion, sess, inventory)
+			if err != nil {
 				return err
 			}
-			return i.handleGet(conn, protoVersion, inventory, registration)
+			if err := updateInventoryWithTemplates(tmpl, inventory, registration); err != nil {
+				if writeErr := writeError(conn, protoVersion, register.NewErrorMessage(err)); writeErr != nil {
+					log.Errorf("Error reporting back error to client: %v", writeErr)
+				}
+				return err
+			}
+			sess.applyIdentityAnnotations(inventory)
+			sess.applyInstallSelection(inventory)
+			setRegistrationIPLabel(inventory)
+			if sess.liveInstall != nil {
+				return i.handleLiveInstallGet(conn, protoVersion, inventory, registration, sess)
+			}
+			return i.handleGet(conn, protoVersion, inventory, registration, sess.afterCommit, func(committed *elementalv1.MachineInventory) {
+				i.settleInstall(committed, sess.update)
+			})
 		case register.MsgUpdate:
 			err = i.handleUpdate(conn, protoVersion, inventory)
 			if err != nil {
 				return fmt.Errorf("failed to negotiate registration update: %w", err)
 			}
+			sess.update = true
 		case register.MsgSystemData:
 			systemData, err := hostinfo.FillData(data)
 			if err != nil {
@@ -300,6 +328,18 @@ func (i *InventoryServer) serveLoop(conn *websocket.Conn, inventory *elementalv1
 				return fmt.Errorf("failed to parse observed network config: %w", err)
 			}
 			inventory.Spec.ObservedNetwork = observed
+			sess.observedNetwork = observed
+		case register.MsgLiveInstallSession:
+			session, err := decodeLiveInstallSession(data)
+			if err != nil {
+				if writeErr := writeError(conn, protoVersion, register.NewErrorMessage(err)); writeErr != nil {
+					log.Errorf("Error reporting back error to client: %v", writeErr)
+				}
+				return err
+			}
+			sess.liveInstall = session
+		case register.MsgInstallReport:
+			return i.handleInstallReport(conn, protoVersion, inventory, data)
 		case register.MsgObserveStorage:
 			if isNewInventory(inventory) || inventory.UID == "" {
 				return errors.New("storage observer requires an existing MachineInventory UID")
@@ -504,9 +544,10 @@ func (i *InventoryServer) handleGetNetworkConfig(inventory *elementalv1.MachineI
 	return observedNetworkConfig(inventory), nil
 }
 
-func (i *InventoryServer) handleGet(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration) error {
+// handleGet commits the inventory and sends the configuration back.
+// committed run right after the inventory is stored.
+func (i *InventoryServer) handleGet(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration, committed ...func(*elementalv1.MachineInventory)) error {
 	var err error
-	var netConf elementalv1.NetworkConfig
 
 	inventory, err = i.commitMachineInventory(inventory)
 	if err != nil {
@@ -516,6 +557,19 @@ func (i *InventoryServer) handleGet(conn *websocket.Conn, protoVersion register.
 
 		return err
 	}
+	for _, f := range committed {
+		f(inventory)
+	}
+
+	return i.sendConfig(conn, protoVersion, inventory, registration, withoutInstallRelease(registration))
+}
+
+// sendConfig sends the configuration of a committed inventory, once its
+// network configuration is ready when the client takes one. adjust, when set,
+// changes the configuration first.
+func (i *InventoryServer) sendConfig(conn *websocket.Conn, protoVersion register.MessageType, inventory *elementalv1.MachineInventory, registration *elementalv1.MachineRegistration, adjust func(*elementalv1.Config)) error {
+	var err error
+	var netConf elementalv1.NetworkConfig
 
 	if protoVersion >= register.MsgNetworkConfig {
 		netConf, err = i.handleGetNetworkConfig(inventory)
@@ -527,7 +581,7 @@ func (i *InventoryServer) handleGet(conn *websocket.Conn, protoVersion register.
 		}
 	}
 
-	if err := i.writeMachineInventoryCloudConfig(conn, protoVersion, inventory, registration, netConf); err != nil {
+	if err := i.writeMachineInventoryCloudConfig(conn, protoVersion, inventory, registration, netConf, adjust); err != nil {
 		if writeErr := writeError(conn, protoVersion, register.NewErrorMessage(err)); writeErr != nil {
 			log.Errorf("Error reporting back error to client: %v", writeErr)
 		}

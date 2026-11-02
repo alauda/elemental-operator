@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 	. "github.com/onsi/ginkgo/v2"
@@ -214,4 +215,28 @@ var _ = Describe("authenticator", Label("registration", "core"), func() {
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("unsupported authentication"))
 	})
+
+	DescribeTable("keeps an installed host's EK hash now that the seed defaults to -1",
+		func(stateSeed int64) {
+			// The hash the host registered with, computed straight from the
+			// seed in its state.
+			registered := tpm.NewAuthClient(stateSeed)
+			Expect(registered.Init(elementalv1.Registration{EmulateTPM: true})).To(Succeed())
+			want, err := registered.GetPubHash()
+			Expect(err).ToNot(HaveOccurred())
+
+			for _, configSeed := range []int64{-1, 1} {
+				state := &State{InitialRegistration: time.Now(), EmulatedTPM: true, EmulatedTPMSeed: stateSeed}
+				reg := elementalv1.Registration{Auth: "tpm", EmulateTPM: true, EmulatedTPMSeed: configSeed}
+				auth, err := getAuthenticator(reg, state)
+				Expect(err).ToNot(HaveOccurred())
+				got, err := auth.GetPubHash()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(got).To(Equal(want), "config seed %d", configSeed)
+				Expect(state.EmulatedTPMSeed).To(Equal(stateSeed))
+			}
+		},
+		Entry("seed 1, the old default", int64(1)),
+		Entry("v1 seed derived from a Dell UUID", int64(-9198403500847051214)),
+	)
 })

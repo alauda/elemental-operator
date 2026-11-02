@@ -205,7 +205,7 @@ var _ = Describe("createRBACObjects", func() {
 	})
 
 	It("should successfully create RBAC objects", func() {
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(Succeed())
 		objKey := types.NamespacedName{Namespace: mRegistration.Namespace, Name: mRegistration.Name}
 		role := &rbacv1.Role{}
 		Expect(r.Get(ctx, objKey, role)).To(Succeed())
@@ -270,7 +270,7 @@ var _ = Describe("createRBACObjects", func() {
 		Expect(r.Create(ctx, sa)).To(Succeed())
 		Expect(r.Create(ctx, roleBinding)).To(Succeed())
 		Expect(r.Create(ctx, secret)).To(Succeed())
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(Succeed())
 		Expect(mRegistration.Status.ServiceAccountRef.Kind).To(Equal("ServiceAccount"))
 		Expect(mRegistration.Status.ServiceAccountRef.Name).To(Equal(mRegistration.Name))
 		Expect(mRegistration.Status.ServiceAccountRef.Namespace).To(Equal(mRegistration.Namespace))
@@ -321,13 +321,13 @@ var _ = Describe("createRBACObjects", func() {
 			)).To(Succeed())
 		}()
 
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(Succeed())
 		Expect(mRegistration.Status.ServiceAccountRef.Name).To(Equal(DefaultSharedSystemAgentServiceAccountName))
 		Expect(r.Get(ctx, client.ObjectKeyFromObject(sharedRole), sharedRole)).To(Succeed())
 		Expect(sharedRole.Rules).To(Equal(systemAgentRules([]string{"plan-global", "plan-invalid", "plan-shared", "same-plan"})))
 
 		mRegistration.Annotations[elementalv1.SystemAgentAuthScopeAnnotation] = "invalid"
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(Succeed())
 		Expect(mRegistration.Status.ServiceAccountRef.Name).To(Equal(DefaultSharedSystemAgentServiceAccountName))
 
 		globalKey := types.NamespacedName{Namespace: mRegistration.Namespace, Name: globalServiceAccountName}
@@ -339,7 +339,7 @@ var _ = Describe("createRBACObjects", func() {
 
 	It("should validate the single shared identity in read-only mode while split auth is disabled", func() {
 		r.SystemAgentAuthMode = SystemAgentAuthModeShared
-		r.SystemAgentSharedAuthReadOnly = true
+		r.SystemAgentSharedAuthOwnership = SharedAuthOwnershipReadOnly
 		mRegistration.Annotations = map[string]string{
 			elementalv1.SystemAgentAuthScopeAnnotation: elementalv1.SystemAgentAuthScopeGlobal,
 		}
@@ -400,7 +400,7 @@ var _ = Describe("createRBACObjects", func() {
 			)).To(Succeed())
 		}()
 
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(Succeed())
 		Expect(mRegistration.Status.ServiceAccountRef.Name).To(Equal(DefaultSharedSystemAgentServiceAccountName))
 		Expect(r.Get(ctx, types.NamespacedName{Namespace: mRegistration.Namespace, Name: DefaultGlobalSystemAgentServiceAccountName}, &rbacv1.Role{})).To(MatchError(ContainSubstring("not found")))
 	})
@@ -469,7 +469,7 @@ var _ = Describe("createRBACObjects", func() {
 			)).To(Succeed())
 		}()
 
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(Succeed())
 		sharedKey := types.NamespacedName{Namespace: mRegistration.Namespace, Name: DefaultSharedSystemAgentServiceAccountName}
 
 		role := &rbacv1.Role{}
@@ -500,7 +500,7 @@ var _ = Describe("createRBACObjects", func() {
 		originalTokenUID := tokenSecret.UID
 		tokenSecret.Data = map[string][]byte{"token": []byte("preserved-token")}
 		Expect(r.Update(ctx, tokenSecret)).To(Succeed())
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(Succeed())
 		Expect(r.Get(ctx, types.NamespacedName{Namespace: mRegistration.Namespace, Name: tokenSecret.Name}, tokenSecret)).To(Succeed())
 		Expect(tokenSecret.UID).To(Equal(originalTokenUID))
 		Expect(tokenSecret.Data).To(HaveKeyWithValue("token", []byte("preserved-token")))
@@ -509,7 +509,7 @@ var _ = Describe("createRBACObjects", func() {
 		globalRegistration.Annotations = map[string]string{
 			elementalv1.SystemAgentAuthScopeAnnotation: elementalv1.SystemAgentAuthScopeGlobal,
 		}
-		Expect(r.createRBACObjects(ctx, globalRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, globalRegistration)).To(Succeed())
 		Expect(globalRegistration.Status.ServiceAccountRef.Name).To(Equal(globalServiceAccountName))
 
 		globalKey := types.NamespacedName{Namespace: mRegistration.Namespace, Name: globalServiceAccountName}
@@ -520,7 +520,7 @@ var _ = Describe("createRBACObjects", func() {
 
 		sharedInventory.Status.Plan = nil
 		Expect(r.Status().Update(ctx, sharedInventory)).To(Succeed())
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(Succeed())
 		Expect(r.Get(ctx, sharedKey, role)).To(Succeed())
 		Expect(role.Rules[0].ResourceNames).To(Equal([]string{"plan-legacy-shared"}))
 	})
@@ -532,7 +532,7 @@ var _ = Describe("createRBACObjects", func() {
 			elementalv1.SystemAgentAuthScopeAnnotation: "invalid",
 		}
 
-		err := r.createRBACObjects(ctx, mRegistration)
+		err := createRBACObjectsErr(r, ctx, mRegistration)
 		Expect(err).To(MatchError(ContainSubstring("invalid system-agent auth scope")))
 	})
 
@@ -587,7 +587,7 @@ var _ = Describe("createRBACObjects", func() {
 			)).To(Succeed())
 		}()
 
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(MatchError(ContainSubstring("referenced by both global and shared")))
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(MatchError(ContainSubstring("referenced by both global and shared")))
 		Expect(r.Get(ctx, client.ObjectKeyFromObject(sharedRole), sharedRole)).To(Succeed())
 		Expect(sharedRole.Rules).To(Equal(systemAgentRules([]string{"same-shared-plan"})))
 
@@ -595,7 +595,7 @@ var _ = Describe("createRBACObjects", func() {
 		globalRegistration.Annotations = map[string]string{
 			elementalv1.SystemAgentAuthScopeAnnotation: elementalv1.SystemAgentAuthScopeGlobal,
 		}
-		Expect(r.createRBACObjects(ctx, globalRegistration)).To(MatchError(ContainSubstring("referenced by both global and shared")))
+		Expect(createRBACObjectsErr(r, ctx, globalRegistration)).To(MatchError(ContainSubstring("referenced by both global and shared")))
 		Expect(r.Get(ctx, client.ObjectKeyFromObject(globalRole), globalRole)).To(Succeed())
 		Expect(globalRole.Rules).To(Equal(systemAgentRules([]string{"same-global-plan"})))
 	})
@@ -603,12 +603,12 @@ var _ = Describe("createRBACObjects", func() {
 	It("should leave shared auth untouched in read-only mode while reconciling global auth", func() {
 		r.SystemAgentAuthMode = SystemAgentAuthModeShared
 		r.SystemAgentSplitAuthEnabled = true
-		r.SystemAgentSharedAuthReadOnly = true
+		r.SystemAgentSharedAuthOwnership = SharedAuthOwnershipReadOnly
 
 		mRegistration.Annotations = map[string]string{
 			elementalv1.SystemAgentAuthScopeAnnotation: elementalv1.SystemAgentAuthScopeShared,
 		}
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(MatchError(ContainSubstring("externally managed shared system-agent ServiceAccount")))
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(MatchError(ContainSubstring("externally managed shared system-agent ServiceAccount")))
 		Expect(mRegistration.Status.ServiceAccountRef.Name).To(Equal(DefaultSharedSystemAgentServiceAccountName))
 
 		sharedKey := types.NamespacedName{Namespace: mRegistration.Namespace, Name: DefaultSharedSystemAgentServiceAccountName}
@@ -664,7 +664,7 @@ var _ = Describe("createRBACObjects", func() {
 			Expect(test.CleanupAndWait(ctx, cl, sharedInventory, sharedSA, sharedTokenSecret, sharedRole, sharedRoleBinding)).To(Succeed())
 		}()
 
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(Succeed())
 		Expect(r.Get(ctx, sharedKey, sharedRole)).To(Succeed())
 		Expect(sharedRole.Rules).To(Equal(systemAgentRules([]string{"synced-plan"})))
 		Expect(r.Get(ctx, types.NamespacedName{Namespace: sharedKey.Namespace, Name: sharedTokenSecret.Name}, sharedTokenSecret)).To(Succeed())
@@ -672,22 +672,22 @@ var _ = Describe("createRBACObjects", func() {
 
 		sharedTokenSecret.Annotations["kubernetes.io/service-account.uid"] = "wrong-uid"
 		Expect(r.Update(ctx, sharedTokenSecret)).To(Succeed())
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(MatchError(ContainSubstring("references ServiceAccount UID")))
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(MatchError(ContainSubstring("references ServiceAccount UID")))
 		sharedTokenSecret.Annotations["kubernetes.io/service-account.uid"] = string(sharedSA.UID)
 		Expect(r.Update(ctx, sharedTokenSecret)).To(Succeed())
 
 		sharedRole.Rules = []rbacv1.PolicyRule{{APIGroups: []string{"*"}, Resources: []string{"*"}, Verbs: []string{"*"}}}
 		Expect(r.Update(ctx, sharedRole)).To(Succeed())
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(MatchError(ContainSubstring("rules do not match")))
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(MatchError(ContainSubstring("rules do not match")))
 		sharedRole.Rules = systemAgentRules([]string{"synced-plan"})
 		Expect(r.Update(ctx, sharedRole)).To(Succeed())
 
 		sharedRoleBinding.Subjects = append(sharedRoleBinding.Subjects, rbacv1.Subject{Kind: "ServiceAccount", Name: "extra", Namespace: sharedKey.Namespace})
 		Expect(r.Update(ctx, sharedRoleBinding)).To(Succeed())
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(MatchError(ContainSubstring("must have exactly one subject")))
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(MatchError(ContainSubstring("must have exactly one subject")))
 		sharedRoleBinding.Subjects = sharedRoleBinding.Subjects[:1]
 		Expect(r.Update(ctx, sharedRoleBinding)).To(Succeed())
-		Expect(r.createRBACObjects(ctx, mRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, mRegistration)).To(Succeed())
 
 		globalRegistration := mRegistration.DeepCopy()
 		globalRegistration.Annotations[elementalv1.SystemAgentAuthScopeAnnotation] = elementalv1.SystemAgentAuthScopeGlobal
@@ -699,14 +699,14 @@ var _ = Describe("createRBACObjects", func() {
 			Expect(test.CleanupAndWait(ctx, cl, globalRole, globalSA, globalRoleBinding, globalTokenSecret)).To(Succeed())
 		}()
 
-		Expect(r.createRBACObjects(ctx, globalRegistration)).To(Succeed())
+		Expect(createRBACObjectsErr(r, ctx, globalRegistration)).To(Succeed())
 		Expect(globalRegistration.Status.ServiceAccountRef.Name).To(Equal(DefaultGlobalSystemAgentServiceAccountName))
 		Expect(r.Get(ctx, client.ObjectKeyFromObject(globalRole), globalRole)).To(Succeed())
 	})
 
 	It("should error when RBAC fails to be created", func() {
 		r.Client = machineRegistrationFailingClient{}
-		err := r.createRBACObjects(ctx, mRegistration)
+		err := createRBACObjectsErr(r, ctx, mRegistration)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("failed to create"))
 	})
@@ -722,4 +722,11 @@ func (cl machineRegistrationFailingClient) Create(ctx context.Context, obj clien
 
 func (cl machineRegistrationFailingClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
 	return errors.New("failed to delete")
+}
+
+// createRBACObjectsErr drops the recheck duration for the tests that only
+// look at the error.
+func createRBACObjectsErr(r *MachineRegistrationReconciler, ctx context.Context, m *elementalv1.MachineRegistration) error {
+	_, err := r.createRBACObjects(ctx, m)
+	return err
 }

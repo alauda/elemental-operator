@@ -31,6 +31,10 @@ const (
 
 	// RbacCreationFailureReason documents a machine registration object that has RBAC creation failures.
 	RbacCreationFailureReason = "RbacCreationFailure"
+
+	// InvalidGlobalRegistrationNameReason documents a global-scoped machine
+	// registration whose name is neither "global" nor starts with "global-".
+	InvalidGlobalRegistrationNameReason = "InvalidGlobalRegistrationName"
 )
 
 // Machine Inventory conditions

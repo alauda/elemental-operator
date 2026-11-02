@@ -64,6 +64,16 @@ const (
 	SystemAgentAuthScopeGlobal = "global"
 	SystemAgentAuthScopeShared = "shared"
 
+	// GlobalNamePrefix starts the name of every global-scoped
+	// MachineRegistration (or the name is exactly "global") and
+	// MachineInventory. etcd-sync keeps objects with these names on their own
+	// side of a disaster-recovery pair.
+	GlobalNamePrefix = "global-"
+	// GlobalPlanSecretPrefix starts the name of the plan Secret of every
+	// global-scoped MachineInventory, so etcd-sync can keep these Secrets on
+	// their own side with one prefix rule.
+	GlobalPlanSecretPrefix = "global-bm-plan-"
+
 	// TimeoutEnvVar is the environment variable key passed to pods to express a timeout
 	TimeoutEnvVar = "ELEMENTAL_TIMEOUT"
 )
@@ -92,4 +102,20 @@ func ResolveSystemAgentAuthScope(annotations map[string]string) (string, error) 
 		return "", fmt.Errorf("invalid system-agent auth scope %q, valid values: %q, %q",
 			scope, SystemAgentAuthScopeGlobal, SystemAgentAuthScopeShared)
 	}
+}
+
+// IsGlobalSystemAgentAuthScope reports whether annotations select the global
+// system-agent auth scope.
+func IsGlobalSystemAgentAuthScope(annotations map[string]string) bool {
+	if annotations == nil {
+		return false
+	}
+	raw, found := annotations[SystemAgentAuthScopeAnnotation]
+	return found && NormalizeSystemAgentAuthScope(raw) == SystemAgentAuthScopeGlobal
+}
+
+// IsGlobalRegistrationName reports whether name is allowed for a
+// global-scoped MachineRegistration.
+func IsGlobalRegistrationName(name string) bool {
+	return name == "global" || strings.HasPrefix(name, GlobalNamePrefix)
 }

@@ -29,6 +29,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/twpayne/go-vfs"
+
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 	"github.com/rancher/elemental-operator/pkg/log"
 )
@@ -42,14 +44,15 @@ var (
 		"/run/elemental/live_mode",
 	}
 	// Keep the column set compatible with util-linux 2.37 shipped in the
-	// Elemental image. PARTN is deliberately not used.
+	// Elemental image. PARTN is deliberately not used. PARTLABEL (the GPT
+	// partition name) is what the install path matches old system layouts on.
 	lsblkStorageArgs = []string{
 		"--json",
 		"--bytes",
 		"--paths",
 		"--tree",
 		"--output",
-		"NAME,KNAME,PATH,TYPE,SIZE,LOG-SEC,RO,ROTA,RM,MODEL,SERIAL,WWN,TRAN,FSTYPE,UUID,LABEL,MOUNTPOINTS,PTTYPE,PARTTYPE,PARTUUID,PKNAME",
+		"NAME,KNAME,PATH,TYPE,SIZE,LOG-SEC,RO,ROTA,RM,MODEL,SERIAL,WWN,TRAN,FSTYPE,UUID,LABEL,MOUNTPOINTS,PTTYPE,PARTTYPE,PARTUUID,PARTLABEL,PKNAME",
 	}
 	findmntStorageArgs = []string{
 		"--json",
@@ -93,7 +96,18 @@ func collectObservedStorage() *elementalv1.ObservedStorage {
 	return observed
 }
 
-func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, error) {
+// blockInventory is the lsblk tree with each device's canonical identity.
+// The storage observer and the install path (CollectBlockDevices) both start
+// from it, so a disk carries the same ID wherever it is reported.
+type blockInventory struct {
+	records   map[string]*blockRecord
+	byIDPaths map[string][]string
+	ids       map[string]string
+	buses     map[string]string
+	probes    map[string]busProbe
+}
+
+func (c *observedStorageCollector) inventory() (*blockInventory, error) {
 	data, err := c.run("lsblk", lsblkStorageArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("running lsblk: %w", err)
@@ -109,6 +123,34 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 		log.Warningf("failed to enumerate /dev/disk/by-id: %v", err)
 		byIDPaths = map[string][]string{}
 	}
+
+	records := flattenBlockTopology(topology.BlockDevices)
+	inventory := &blockInventory{
+		records:   records,
+		byIDPaths: byIDPaths,
+		ids:       make(map[string]string, len(records)),
+		buses:     make(map[string]string, len(records)),
+		probes:    make(map[string]busProbe, len(records)),
+	}
+	for path, record := range records {
+		stable := stablePathsForDevice(record.device, byIDPaths)
+		if c.busProbe != nil {
+			inventory.probes[path] = c.busProbe(record.device)
+		}
+		inventory.buses[path] = localBus(record.device, stable, inventory.probes[path])
+		inventory.ids[path] = canonicalDeviceID(record.device, stable, inventory.buses[path])
+	}
+	return inventory, nil
+}
+
+func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, error) {
+	inventory, err := c.inventory()
+	if err != nil {
+		return nil, err
+	}
+	records, byIDPaths := inventory.records, inventory.byIDPaths
+	ids, buses, probes := inventory.ids, inventory.buses, inventory.probes
+
 	mountOptions := map[string][]string{}
 	if c.mountOptions != nil {
 		mountOptions, err = c.mountOptions()
@@ -116,19 +158,6 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 			log.Warningf("failed to collect mount options: %v", err)
 			mountOptions = map[string][]string{}
 		}
-	}
-
-	records := flattenBlockTopology(topology.BlockDevices)
-	ids := make(map[string]string, len(records))
-	buses := make(map[string]string, len(records))
-	probes := make(map[string]busProbe, len(records))
-	for path, record := range records {
-		stable := stablePathsForDevice(record.device, byIDPaths)
-		if c.busProbe != nil {
-			probes[path] = c.busProbe(record.device)
-		}
-		buses[path] = localBus(record.device, stable, probes[path])
-		ids[path] = canonicalDeviceID(record.device, stable, buses[path])
 	}
 
 	systemPaths, systemEvidence := classifySystemClosure(records)
@@ -179,7 +208,7 @@ func (c *observedStorageCollector) collect() (*elementalv1.ObservedStorage, erro
 		if deviceID == "" {
 			// Preserve visibility for diagnostics while making the record
 			// impossible to select through provider admission.
-			deviceID = "unidentified:" + sanitizeDiagnosticID(devicePath)
+			deviceID = UnidentifiedDeviceID(devicePath)
 		}
 
 		role := elementalv1.ObservedStorageSystemRoleData
@@ -362,8 +391,15 @@ func stablePathsForDevice(device lsblkDevice, byIDPaths map[string][]string) []s
 }
 
 func isLiveEnvironment() bool {
+	return LiveEnvironment(vfs.OSFS)
+}
+
+// LiveEnvironment reports whether fs carries the markers of a live (ISO or
+// PXE) boot. The install path asks through its own filesystem so tests can
+// fake it; the storage observer asks the real one.
+func LiveEnvironment(fs vfs.FS) bool {
 	for _, path := range liveEnvironmentPaths {
-		if _, err := os.Stat(path); err == nil {
+		if _, err := fs.Stat(path); err == nil {
 			return true
 		}
 	}
@@ -425,6 +461,7 @@ type lsblkDevice struct {
 	PTType        string              `json:"pttype"`
 	PartType      string              `json:"parttype"`
 	PartUUID      string              `json:"partuuid"`
+	PartLabel     string              `json:"partlabel"`
 	PKName        string              `json:"pkname"`
 	Children      []lsblkDevice       `json:"children"`
 }

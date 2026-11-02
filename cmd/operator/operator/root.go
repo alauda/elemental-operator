@@ -96,6 +96,7 @@ type rootConfig struct {
 	systemAgentGlobalServiceAccount string
 	systemAgentSplitAuthEnabled     bool
 	systemAgentSharedAuthReadOnly   bool
+	systemAgentSharedAuthOwnership  string
 }
 
 func init() {
@@ -153,6 +154,18 @@ func NewOperatorCommand() *cobra.Command {
 				config.caCert = string(caCert)
 			}
 			config.systemAgentAuthMode = controllers.NormalizeSystemAgentAuthMode(config.systemAgentAuthMode)
+			ownership, err := controllers.NormalizeSharedAuthOwnership(config.systemAgentSharedAuthOwnership)
+			if err != nil {
+				return err
+			}
+			if config.systemAgentSharedAuthReadOnly {
+				// The older flag predates ownership detection and keeps its meaning.
+				if ownership == controllers.SharedAuthOwnershipOwner {
+					return fmt.Errorf("system-agent-shared-auth-read-only conflicts with system-agent-shared-auth-ownership=%s", ownership)
+				}
+				ownership = controllers.SharedAuthOwnershipReadOnly
+			}
+			config.systemAgentSharedAuthOwnership = ownership
 			switch config.systemAgentAuthMode {
 			case controllers.SystemAgentAuthModeRegistration:
 				if config.systemAgentSplitAuthEnabled {
@@ -160,6 +173,9 @@ func NewOperatorCommand() *cobra.Command {
 				}
 				if config.systemAgentSharedAuthReadOnly {
 					return fmt.Errorf("system-agent-shared-auth-read-only requires system-agent-auth-mode=%s", controllers.SystemAgentAuthModeShared)
+				}
+				if config.systemAgentSharedAuthOwnership != controllers.SharedAuthOwnershipAuto {
+					return fmt.Errorf("system-agent-shared-auth-ownership=%s requires system-agent-auth-mode=%s", config.systemAgentSharedAuthOwnership, controllers.SystemAgentAuthModeShared)
 				}
 			case controllers.SystemAgentAuthModeShared:
 				if strings.TrimSpace(config.systemAgentServiceAccount) == "" {
@@ -291,8 +307,11 @@ func NewOperatorCommand() *cobra.Command {
 	cmd.PersistentFlags().BoolVar(&config.systemAgentSplitAuthEnabled, "system-agent-split-auth-enabled", false, "Split shared system-agent authorization into DR-synchronized shared and cluster-local global scopes.")
 	_ = viper.BindPFlag("system-agent-split-auth-enabled", cmd.PersistentFlags().Lookup("system-agent-split-auth-enabled"))
 
-	cmd.PersistentFlags().BoolVar(&config.systemAgentSharedAuthReadOnly, "system-agent-shared-auth-read-only", false, "Treat shared system-agent ServiceAccount, token and RBAC as externally managed; with split auth enabled, global-scoped auth remains locally reconciled.")
+	cmd.PersistentFlags().BoolVar(&config.systemAgentSharedAuthReadOnly, "system-agent-shared-auth-read-only", false, "Deprecated, use --system-agent-shared-auth-ownership=readonly. Treat shared system-agent ServiceAccount, token and RBAC as externally managed; with split auth enabled, global-scoped auth remains locally reconciled.")
 	_ = viper.BindPFlag("system-agent-shared-auth-read-only", cmd.PersistentFlags().Lookup("system-agent-shared-auth-read-only"))
+
+	cmd.PersistentFlags().StringVar(&config.systemAgentSharedAuthOwnership, "system-agent-shared-auth-ownership", controllers.SharedAuthOwnershipAuto, "Who maintains the shared system-agent ServiceAccount, token and RBAC: auto (read-only while kube-public/etcd-sync exists, that is while etcd-sync mirrors another Global into this one), owner or readonly. Global-scoped auth is always reconciled locally.")
+	_ = viper.BindPFlag("system-agent-shared-auth-ownership", cmd.PersistentFlags().Lookup("system-agent-shared-auth-ownership"))
 
 	cmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
@@ -387,6 +406,7 @@ func runRegistration(ctx context.Context, mgr ctrl.Manager, namespace, httpBindA
 		SystemAgentServerURL:        systemAgentServerURL,
 		SystemAgentEndpointMode:     systemAgentEndpointMode,
 		SystemAgentSplitAuthEnabled: systemAgentSplitAuthEnabled,
+		EventRecorder:               mgr.GetEventRecorderFor("elemental-registration"),
 	})
 
 	if httpBindAddr != "" {
@@ -456,7 +476,7 @@ func setupReconcilers(mgr ctrl.Manager, config *rootConfig) {
 		SystemAgentServiceAccount:       config.systemAgentServiceAccount,
 		GlobalSystemAgentServiceAccount: config.systemAgentGlobalServiceAccount,
 		SystemAgentSplitAuthEnabled:     config.systemAgentSplitAuthEnabled,
-		SystemAgentSharedAuthReadOnly:   config.systemAgentSharedAuthReadOnly,
+		SystemAgentSharedAuthOwnership:  config.systemAgentSharedAuthOwnership,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create reconciler", "controller", "MachineRegistration")
 		os.Exit(1)

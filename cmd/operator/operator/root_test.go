@@ -89,3 +89,41 @@ func TestSplitAndReadOnlyRequireSharedAuthMode(t *testing.T) {
 		})
 	}
 }
+
+func TestSharedAuthOwnershipDefaultsToAuto(t *testing.T) {
+	cmd := NewOperatorCommand()
+	flag := cmd.PersistentFlags().Lookup("system-agent-shared-auth-ownership")
+	assert.Assert(t, flag != nil)
+	assert.Equal(t, flag.DefValue, "auto")
+}
+
+func TestSharedAuthOwnershipFlagValidation(t *testing.T) {
+	shared := []string{
+		"--server-url=https://elemental.example.com",
+		"--system-agent-auth-mode=shared",
+		"--system-agent-service-account=baremetal-system-agent",
+	}
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{name: "owner", args: append(shared[:3:3], "--system-agent-shared-auth-ownership=owner")},
+		{name: "legacy read-only flag", args: append(shared[:3:3], "--system-agent-shared-auth-read-only")},
+		{name: "legacy flag with readonly", args: append(shared[:3:3], "--system-agent-shared-auth-read-only", "--system-agent-shared-auth-ownership=readonly")},
+		{name: "unknown value", args: append(shared[:3:3], "--system-agent-shared-auth-ownership=read-only"), wantErr: `invalid shared system-agent auth ownership "read-only"`},
+		{name: "legacy flag with owner", args: append(shared[:3:3], "--system-agent-shared-auth-read-only", "--system-agent-shared-auth-ownership=owner"), wantErr: "conflicts with system-agent-shared-auth-ownership=owner"},
+		{name: "registration auth mode", args: []string{"--server-url=https://elemental.example.com", "--system-agent-auth-mode=registration", "--system-agent-shared-auth-ownership=readonly"}, wantErr: "requires system-agent-auth-mode=shared"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := NewOperatorCommand()
+			assert.NilError(t, cmd.ParseFlags(tc.args))
+			err := cmd.Args(cmd, nil)
+			if tc.wantErr == "" {
+				assert.NilError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}

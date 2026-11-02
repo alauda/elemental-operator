@@ -114,6 +114,22 @@ func (mr *MockInstallerMockRecorder) ResetElementalNetwork() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ResetElementalNetwork", reflect.TypeOf((*MockInstaller)(nil).ResetElementalNetwork))
 }
 
+// SurveyInstallDisks mocks base method.
+func (m *MockInstaller) SurveyInstallDisks() ([]v1beta1.InstallCandidate, []v1beta1.StaleSystemDisk, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SurveyInstallDisks")
+	ret0, _ := ret[0].([]v1beta1.InstallCandidate)
+	ret1, _ := ret[1].([]v1beta1.StaleSystemDisk)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// SurveyInstallDisks indicates an expected call of SurveyInstallDisks.
+func (mr *MockInstallerMockRecorder) SurveyInstallDisks() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SurveyInstallDisks", reflect.TypeOf((*MockInstaller)(nil).SurveyInstallDisks))
+}
+
 // WriteLocalSystemAgentConfig mocks base method.
 func (m *MockInstaller) WriteLocalSystemAgentConfig(arg0 v1beta1.Elemental) error {
 	m.ctrl.T.Helper()

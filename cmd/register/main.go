@@ -23,7 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jaypipes/ghw"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/twpayne/go-vfs"
@@ -68,13 +67,8 @@ var (
 
 func main() {
 	fs := vfs.OSFS
-	blockInfo, err := ghw.Block(ghw.WithDisableWarnings())
-	if err != nil {
-		log.Warningf("error probing disks: %s", err)
-	}
-
 	networkConfigurator := network.NewConfigurator(fs)
-	installer := install.NewInstaller(fs, blockInfo.Disks, networkConfigurator)
+	installer := install.NewInstaller(fs, networkConfigurator)
 	stateHandler := register.NewFileStateHandler(fs)
 	client := register.NewClient()
 	cmd := newCommand(fs, client, stateHandler, installer)
@@ -123,8 +117,16 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 			if observeStorage {
 				return register.ObserveStorage(cfg.Elemental.Registration, caCert, &registrationState, observeInterval)
 			}
-			// Register (and fetch the remote MachineRegistration)
-			data, err := client.Register(cfg.Elemental.Registration, caCert, &registrationState)
+			// Register (and fetch the remote MachineRegistration). Installing
+			// from the live ISO waits until the operator releases the host.
+			var data []byte
+			var live *liveInstall
+			if installation && !cfg.Elemental.Registration.NoToolkit {
+				live = newLiveInstall(fs, client, cfg.Elemental.Registration, caCert)
+				data, err = live.registerUntilReleased(stateHandler, installer, &registrationState)
+			} else {
+				data, err = client.Register(cfg.Elemental.Registration, caCert, &registrationState)
+			}
 			if err != nil {
 				return fmt.Errorf("registering machine: %w", err)
 			}
@@ -150,14 +152,20 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 					}
 				} else if osInstaller == install.KubeOSInstaller {
 					log.Info("Installing KubeOS")
+					power := live.takePowerAction(&cfg.Elemental.Install)
 					if err := installer.InstallKubeOS(cfg, registrationState, netCfg); err != nil {
+						live.reportFailure(&registrationState, cfg.Elemental.InstallTarget, err)
 						return fmt.Errorf("installing kubeos: %w", err)
 					}
+					return live.finish(&registrationState, cfg.Elemental.InstallTarget, power)
 				} else {
 					log.Info("Installing elemental")
+					power := live.takePowerAction(&cfg.Elemental.Install)
 					if err := installer.InstallElemental(cfg, registrationState, netCfg); err != nil {
+						live.reportFailure(&registrationState, cfg.Elemental.InstallTarget, err)
 						return fmt.Errorf("installing elemental: %w", err)
 					}
+					return live.finish(&registrationState, cfg.Elemental.InstallTarget, power)
 				}
 				return nil
 			}
@@ -190,8 +198,13 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 	_ = viper.BindPFlag("elemental.registration.ca-cert", cmd.Flags().Lookup("registration-ca-cert"))
 	cmd.Flags().BoolVar(&cfg.Elemental.Registration.EmulateTPM, "emulate-tpm", false, "Emulate /dev/tpm")
 	_ = viper.BindPFlag("elemental.registration.emulate-tpm", cmd.Flags().Lookup("emulate-tpm"))
-	cmd.Flags().Int64Var(&cfg.Elemental.Registration.EmulatedTPMSeed, "emulated-tpm-seed", 1, "Seed for /dev/tpm emulation")
+	// -1 derives the seed from the hardware. The default used to be 1, which
+	// gave every host without an explicit seed the same identity. Hosts that
+	// registered already keep the seed recorded in their state.
+	cmd.Flags().Int64Var(&cfg.Elemental.Registration.EmulatedTPMSeed, "emulated-tpm-seed", elementalv1.TPMRandomSeedValue, "Seed for /dev/tpm emulation (-1: derive from the hardware identity)")
 	_ = viper.BindPFlag("elemental.registration.emulated-tpm-seed", cmd.Flags().Lookup("emulated-tpm-seed"))
+	cmd.Flags().StringVar(&cfg.Elemental.Registration.TPMMode, "tpm-mode", "", "TPM for --auth tpm: hardware, emulated or auto (probe once, then keep the result); empty follows --emulate-tpm")
+	_ = viper.BindPFlag("elemental.registration.tpm-mode", cmd.Flags().Lookup("tpm-mode"))
 	cmd.Flags().BoolVar(&cfg.Elemental.Registration.NoSMBIOS, "no-smbios", false, "Disable the use of dmidecode to get SMBIOS")
 	_ = viper.BindPFlag("elemental.registration.no-smbios", cmd.Flags().Lookup("no-smbios"))
 	cmd.Flags().StringVar(&cfg.Elemental.Registration.Auth, "auth", "tpm", "Registration authentication method")

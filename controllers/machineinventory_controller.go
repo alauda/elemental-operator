@@ -23,7 +23,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/rancher/yip/pkg/schema"
@@ -84,9 +86,22 @@ func planSecretToMachineInventoryRequests(_ context.Context, obj client.Object) 
 	return []reconcile.Request{{
 		NamespacedName: types.NamespacedName{
 			Namespace: obj.GetNamespace(),
-			Name:      obj.GetName(),
+			Name:      planSecretInventoryName(obj),
 		},
 	}}
+}
+
+// planSecretInventoryName returns the MachineInventory a plan Secret belongs
+// to: its controlling owner, otherwise the Secret name without the global
+// plan prefix. A global-scoped inventory's plan Secret is not named after it.
+func planSecretInventoryName(obj client.Object) string {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.Kind == "MachineInventory" && ref.Controller != nil && *ref.Controller && ref.Name != "" &&
+			strings.HasPrefix(ref.APIVersion, elementalv1.GroupVersion.Group+"/") {
+			return ref.Name
+		}
+	}
+	return strings.TrimPrefix(obj.GetName(), elementalv1.GlobalPlanSecretPrefix)
 }
 
 func planSecretPredicate() predicate.Predicate {
@@ -207,6 +222,11 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 		return ctrl.Result{}, nil
 	}
 
+	// Whatever the plan says, an inventory whose identity other hardware
+	// presented must not look ready: providers only allocate ready ones.
+	previousReady := meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.ReadyCondition).DeepCopy()
+	defer setIdentityConflictCondition(mInventory, previousReady)
+
 	if err := r.createPlanSecret(ctx, mInventory); err != nil {
 		meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
 			Type:    elementalv1.ReadyCondition,
@@ -237,6 +257,47 @@ func (r *MachineInventoryReconciler) reconcile(ctx context.Context, mInventory *
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// maxIdentityConflictMessage bounds the condition message taken from the
+// identity-conflict annotation.
+const maxIdentityConflictMessage = 1024
+
+// setIdentityConflictCondition turns Ready false while the registration
+// server's identity-conflict annotation is present. Removing the annotation
+// hands Ready back to the plan status at the next reconcile. previous is the
+// Ready condition the reconcile started with.
+func setIdentityConflictCondition(mInventory *elementalv1.MachineInventory, previous *metav1.Condition) {
+	detail, conflict := mInventory.Annotations[elementalv1.IdentityConflictAnnotation]
+	if !conflict {
+		return
+	}
+	if ready := meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.ReadyCondition); ready != nil && ready.Reason == elementalv1.PlanCreationFailureReason {
+		// Not ready anyway, and createPlanSecret only retries on this reason.
+		return
+	}
+	message := strings.TrimSpace(detail)
+	if message == "" {
+		message = "hardware fingerprint does not match the registered host"
+	}
+	if len(message) > maxIdentityConflictMessage {
+		cut := maxIdentityConflictMessage
+		for cut > 0 && !utf8.RuneStart(message[cut]) {
+			cut--
+		}
+		message = message[:cut]
+	}
+	meta.SetStatusCondition(&mInventory.Status.Conditions, metav1.Condition{
+		Type:    elementalv1.ReadyCondition,
+		Reason:  elementalv1.IdentityConflictReason,
+		Status:  metav1.ConditionFalse,
+		Message: message + "; remove annotation " + elementalv1.IdentityConflictAnnotation + " once resolved",
+	})
+	// The plan status may have flipped Ready within this reconcile; Ready was
+	// false before and is false now, so it did not transition.
+	if previous != nil && previous.Status == metav1.ConditionFalse {
+		meta.FindStatusCondition(mInventory.Status.Conditions, elementalv1.ReadyCondition).LastTransitionTime = previous.LastTransitionTime
+	}
 }
 
 func isNetworkConfigReadyWithoutReconciliation(mInventory *elementalv1.MachineInventory) bool {
@@ -458,11 +519,13 @@ func (r *MachineInventoryReconciler) createPlanSecret(ctx context.Context, mInve
 		return nil
 	}
 
+	// A global-scoped inventory gets the global-bm-plan- prefix, which
+	// etcd-sync keeps on its own side of a DR pair.
 	planSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{elementalv1.PlanTypeAnnotation: elementalv1.PlanTypeEmpty},
 			Namespace:   mInventory.Namespace,
-			Name:        mInventory.Name,
+			Name:        elementalv1.PlanSecretName(mInventory),
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: elementalv1.GroupVersion.String(),
@@ -506,17 +569,12 @@ func (r *MachineInventoryReconciler) createPlanSecret(ctx context.Context, mInve
 func (r *MachineInventoryReconciler) updateInventoryWithPlanStatus(ctx context.Context, mInventory *elementalv1.MachineInventory) error {
 	logger := ctrl.LoggerFrom(ctx)
 
-	planSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: mInventory.Namespace,
-			Name:      mInventory.Name,
-		},
-	}
+	planSecret := &corev1.Secret{}
 
 	logger.V(log.DebugDepth).Info("Attempting to set plan status")
 	if err := r.Get(ctx, types.NamespacedName{
 		Namespace: mInventory.Namespace,
-		Name:      mInventory.Name,
+		Name:      elementalv1.PlanSecretName(mInventory),
 	}, planSecret); err != nil {
 		return fmt.Errorf("failed to get secret: %w", err)
 	}

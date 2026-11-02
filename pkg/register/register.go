@@ -44,6 +44,13 @@ import (
 
 type Client interface {
 	Register(reg elementalv1.Registration, caCert []byte, state *State) ([]byte, error)
+	// RegisterForInstall is Register that also sends the live install
+	// session of a host booted from the live ISO with --install; the
+	// operator may hold the host instead (*InstallHoldError). See
+	// install_client.go.
+	RegisterForInstall(reg elementalv1.Registration, caCert []byte, state *State, session *LiveInstallSession) ([]byte, error)
+	// ReportInstall reports the install outcome of a released host.
+	ReportInstall(reg elementalv1.Registration, caCert []byte, state *State, report InstallReport) error
 }
 
 type authClient interface {
@@ -56,20 +63,85 @@ type authClient interface {
 
 var _ Client = (*client)(nil)
 
-type client struct{}
+type client struct {
+	// sessionUnsupportedLogged is set once RegisterForInstall said that the
+	// operator has no live install session.
+	sessionUnsupportedLogged bool
+}
 
 func NewClient() Client {
 	return &client{}
 }
 
+// MaxSeedSaltRetries bounds how often a new emulated TPM identity is derived
+// again with the next salt after the server reported an identity conflict.
+const MaxSeedSaltRetries = 8
+
+// RegistrationError is an error the registration server reported in a
+// MsgError reply.
+type RegistrationError struct {
+	// Code is one of the ErrorCode constants, empty from older servers.
+	Code    string
+	Message string
+}
+
+func (e *RegistrationError) Error() string {
+	return e.Message
+}
+
 // Register attempts to register the machine with the elemental-operator.
 // Registration updates will fetch and apply new labels, and update Machine annotations such as the IP address.
 func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *State) ([]byte, error) {
-	auth, err := getAuthenticator(reg, state)
-	if err != nil {
-		return nil, fmt.Errorf("initializing authenticator: %w", err)
-	}
+	return registerWithSaltRetries(state, func() ([]byte, *tpmIdentity, error) {
+		return r.register(reg, caCert, state, nil)
+	})
+}
 
+// registerWithSaltRetries answers an identity conflict on the first
+// registration of an emulated TPM identity derived with seed v2 by deriving
+// the seed again with the next salt, at most MaxSeedSaltRetries times. The
+// state the caller saves after a success keeps the salt that worked. Static
+// seeds, inherited seeds, hardware TPMs and registered hosts never retry:
+// their identity is what it is and stays refused until an operator acts
+// (the server marks the inventory when a registered host conflicts).
+func registerWithSaltRetries(state *State, attempt func() ([]byte, *tpmIdentity, error)) ([]byte, error) {
+	loaded := *state
+	for retry := 0; ; retry++ {
+		data, tpmID, err := attempt()
+		if err == nil {
+			return data, nil
+		}
+		var regErr *RegistrationError
+		if !errors.As(err, &regErr) || regErr.Code != ErrorCodeIdentityConflict || tpmID == nil || !tpmID.saltRetry {
+			return nil, err
+		}
+		if retry == MaxSeedSaltRetries {
+			return nil, fmt.Errorf("identity still in conflict after %d seed salts, giving up: %w", retry+1, err)
+		}
+		// Start again from the state as loaded, keeping only the TPM mode
+		// decision (no second probe) and moving to the next salt.
+		next := loaded
+		next.TPMMode, next.TPMModeSource, next.TPMProbe = state.TPMMode, state.TPMModeSource, state.TPMProbe
+		next.EmulatedTPMSeedSalt = state.EmulatedTPMSeedSalt + 1
+		log.Warningf("Identity conflict with emulated TPM seed salt %d: %v; deriving the seed again with salt %d",
+			state.EmulatedTPMSeedSalt, err, next.EmulatedTPMSeedSalt)
+		*state = next
+	}
+}
+
+// register is one registration attempt, with the live install session when
+// there is one. It also returns how the TPM identity was resolved, which
+// decides about retrying.
+func (r *client) register(reg elementalv1.Registration, caCert []byte, state *State, session *LiveInstallSession) ([]byte, *tpmIdentity, error) {
+	auth, tpmID, err := newAuthenticator(reg, state)
+	if err != nil {
+		return nil, nil, fmt.Errorf("initializing authenticator: %w", err)
+	}
+	data, err := r.registerWith(reg, caCert, state, auth, tpmID, session)
+	return data, tpmID, err
+}
+
+func (r *client) registerWith(reg elementalv1.Registration, caCert []byte, state *State, auth authClient, tpmID *tpmIdentity, session *LiveInstallSession) ([]byte, error) {
 	log.Infof("Connect to %s", reg.URL)
 
 	conn, err := initWebsocketConn(reg.URL, caCert, auth)
@@ -114,7 +186,7 @@ func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *St
 
 	if protoVersion >= MsgAnnotations {
 		log.Info("Send elemental annotations")
-		if err := sendAnnotations(conn, reg); err != nil {
+		if err := sendAnnotations(conn, reg, state, tpmID); err != nil {
 			return nil, fmt.Errorf("failed to send dynamic data: %w", err)
 		}
 	}
@@ -124,6 +196,12 @@ func (r *client) Register(reg elementalv1.Registration, caCert []byte, state *St
 		if err := sendObservedNetwork(conn); err != nil {
 			// Informational data: warn but continue registration.
 			log.Warningf("failed to send observed network snapshot: %v", err)
+		}
+	}
+
+	if session != nil {
+		if err := r.sendLiveInstallSession(conn, protoVersion, session); err != nil {
+			return nil, err
 		}
 	}
 
@@ -221,24 +299,38 @@ func refreshObserverDeadline(conn *websocket.Conn, interval time.Duration) {
 }
 
 func getAuthenticator(reg elementalv1.Registration, state *State) (authClient, error) {
+	auth, _, err := newAuthenticator(reg, state)
+	return auth, err
+}
+
+// newAuthenticator also returns, for auth "tpm", how the TPM identity was
+// resolved; the TPM mode is recorded in the state.
+func newAuthenticator(reg elementalv1.Registration, state *State) (authClient, *tpmIdentity, error) {
 	var auth authClient
+	var tpmID *tpmIdentity
 	switch reg.Auth {
 	case "tpm":
-		state.EmulatedTPMSeed = tpm.GetTPMSeed(reg, state.EmulatedTPM, state.EmulatedTPMSeed)
-		state.EmulatedTPM = reg.EmulateTPM
+		id, err := resolveTPMIdentity(reg, state)
+		if err != nil {
+			return nil, nil, err
+		}
+		tpmID = &id
+		// The resolved mode, not the config, decides about emulation.
+		reg.EmulateTPM = id.mode == elementalv1.TPMModeEmulated
 		auth = tpm.NewAuthClient(state.EmulatedTPMSeed)
-	case "mac":
-		auth = &plainauth.AuthClient{}
-	case "sys-uuid":
+	case "mac", "sys-uuid":
+		if reg.TPMMode != "" {
+			log.Warningf("Ignoring tpm-mode %q: it only applies to auth tpm, not %s", reg.TPMMode, reg.Auth)
+		}
 		auth = &plainauth.AuthClient{}
 	default:
-		return nil, fmt.Errorf("unsupported authentication: %s", reg.Auth)
+		return nil, nil, fmt.Errorf("unsupported authentication: %s", reg.Auth)
 	}
 
 	if err := auth.Init(reg); err != nil {
-		return nil, fmt.Errorf("init %s authentication: %w", auth.GetName(), err)
+		return nil, nil, fmt.Errorf("init %s authentication: %w", auth.GetName(), err)
 	}
-	return auth, nil
+	return auth, tpmID, nil
 }
 
 func initWebsocketConn(url string, caCert []byte, auth authClient) (*websocket.Conn, error) {
@@ -379,16 +471,9 @@ func sendSystemData(conn *websocket.Conn, protoVersion MessageType) error {
 	return nil
 }
 
-func sendAnnotations(conn *websocket.Conn, reg elementalv1.Registration) error {
-	data := map[string]string{
-		"reg-version": version.Version,
-	}
-
-	if reg.EmulateTPM {
-		data["auth"] = "emulated-tpm"
-	} else {
-		data["auth"] = reg.Auth
-	}
+func sendAnnotations(conn *websocket.Conn, reg elementalv1.Registration, state *State, tpmID *tpmIdentity) error {
+	data := registrationAnnotations(reg, state, tpmID)
+	data["reg-version"] = version.Version
 	if reg.NoToolkit {
 		data["os.unmanaged"] = "true"
 	}
@@ -497,9 +582,11 @@ func getConfig(conn *websocket.Conn) ([]byte, error) {
 		if err = yaml.Unmarshal(data, &msg); err != nil {
 			return nil, fmt.Errorf("unmarshalling error message: %w", err)
 		}
-		return nil, errors.New(msg.Message)
+		return nil, &RegistrationError{Code: msg.Code, Message: msg.Message}
 	case MsgConfig:
 		return data, nil
+	case MsgInstallHold:
+		return nil, installHoldError(data)
 	default:
 		return nil, fmt.Errorf("unexpected response message: %s", msgType)
 	}

@@ -413,3 +413,50 @@ func TestUpdateInventoryAnnotations(t *testing.T) {
 	assert.Equal(t, len(inventory.Annotations["elemental.cattle.io/Random02"]), len("e511d5ca-a765-42f2-82b7-264f37ffb329"))
 	assert.Equal(t, len(inventory.Annotations["elemental.cattle.io/Random03"]), len("my-random-value-12345"))
 }
+
+func TestUpdateInventoryWithTemplatesPrefixesGlobalInventories(t *testing.T) {
+	tmpl := templater.NewTemplater()
+	tmpl.Fill(map[string]interface{}{
+		"System Information": map[string]interface{}{"UUID": "4c4c4544-0042-3510-8051-b4c04f4d4e32"},
+	})
+	globalReg := &elementalv1.MachineRegistration{}
+	globalReg.Annotations = map[string]string{elementalv1.SystemAgentAuthScopeAnnotation: elementalv1.SystemAgentAuthScopeGlobal}
+	sharedReg := &elementalv1.MachineRegistration{}
+
+	for _, tc := range []struct {
+		name     string
+		reg      *elementalv1.MachineRegistration
+		invName  string
+		existing bool
+		want     string
+		wantPlan string
+	}{
+		{name: "global gets the prefix", reg: globalReg, invName: "${System Information/UUID}",
+			want: "global-4c4c4544-0042-3510-8051-b4c04f4d4e32", wantPlan: "global-bm-plan-global-4c4c4544-0042-3510-8051-b4c04f4d4e32"},
+		{name: "global keeps a prefix it already has", reg: globalReg, invName: "global-${System Information/UUID}",
+			want: "global-4c4c4544-0042-3510-8051-b4c04f4d4e32", wantPlan: "global-bm-plan-global-4c4c4544-0042-3510-8051-b4c04f4d4e32"},
+		{name: "shared is left alone", reg: sharedReg, invName: "m-${System Information/UUID}",
+			want: "m-4c4c4544-0042-3510-8051-b4c04f4d4e32", wantPlan: "m-4c4c4544-0042-3510-8051-b4c04f4d4e32"},
+		{name: "an existing global inventory keeps its name", reg: globalReg, invName: "m-1", existing: true,
+			want: "m-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inv := &elementalv1.MachineInventory{}
+			inv.Name = tc.invName
+			if tc.existing {
+				inv.CreationTimestamp.Time = time.Now()
+			}
+			assert.NilError(t, updateInventoryWithTemplates(tmpl, inv, tc.reg))
+			assert.Equal(t, inv.Name, tc.want)
+			if tc.wantPlan != "" {
+				assert.Equal(t, elementalv1.PlanSecretName(inv), tc.wantPlan)
+			}
+		})
+	}
+
+	// A name the templater cannot resolve falls back to m-<UUID>, prefixed too.
+	inv := &elementalv1.MachineInventory{}
+	inv.Name = "${Missing/Value}"
+	assert.NilError(t, updateInventoryWithTemplates(tmpl, inv, globalReg))
+	assert.Assert(t, len(inv.Name) > len("global-m-") && inv.Name[:len("global-m-")] == "global-m-", inv.Name)
+}
