@@ -26,7 +26,7 @@ import (
 
 // BlockDevice is one node of the lsblk tree as the install path needs it: the
 // raw facts plus the management identity canonicalDeviceID derives, so the
-// installer, the storage observer and the operator call a disk the same name.
+// installer and the operator call a disk the same name.
 type BlockDevice struct {
 	// Path is lsblk PATH (/dev/sdb, /dev/mapper/…); KernelPath is
 	// /dev/<kernel name> (/dev/sdb, /dev/dm-0).
@@ -97,7 +97,7 @@ func (s *BlockSnapshot) Find(path string) *BlockDevice {
 }
 
 // BlockCollectorOptions replaces probes of the collector. Nil members keep the
-// defaults the storage observer uses.
+// defaults that probe the host.
 type BlockCollectorOptions struct {
 	// Run executes lsblk and wipefs. The default bounds each command with a
 	// timeout.
@@ -109,10 +109,9 @@ type BlockCollectorOptions struct {
 	BusProbe func(kernelName string) (bus, driver string)
 }
 
-// CollectBlockDevices takes one snapshot of the host's block devices with the
-// storage observer's collector.
+// CollectBlockDevices takes one snapshot of the host's block devices.
 func CollectBlockDevices(opts BlockCollectorOptions) (*BlockSnapshot, error) {
-	c := newObservedStorageCollector()
+	c := newBlockCollector()
 	if opts.Run != nil {
 		c.run = opts.Run
 	}
@@ -129,7 +128,7 @@ func CollectBlockDevices(opts BlockCollectorOptions) (*BlockSnapshot, error) {
 	return c.blockSnapshot()
 }
 
-func (c *observedStorageCollector) blockSnapshot() (*BlockSnapshot, error) {
+func (c *blockCollector) blockSnapshot() (*BlockSnapshot, error) {
 	inventory, err := c.inventory()
 	if err != nil {
 		return nil, err
@@ -140,10 +139,10 @@ func (c *observedStorageCollector) blockSnapshot() (*BlockSnapshot, error) {
 	}
 	sort.Strings(paths)
 
-	// An identity two devices share identifies neither. Unlike the observer
-	// report, multipath backing paths are counted: in a live environment they
-	// are disks an install could touch, and a LUN seen through two paths must
-	// not look like two identified disks.
+	// An identity two devices share identifies neither. Multipath backing
+	// paths are counted: in a live environment they are disks an install could
+	// touch, and a LUN seen through two paths must not look like two
+	// identified disks.
 	counts := map[string]int{}
 	for _, path := range paths {
 		if id := inventory.ids[path]; id != "" && isObservableLogicalDevice(inventory.records[path].device.Type) {
@@ -212,7 +211,7 @@ func newBlockDevice(path string, record *blockRecord, inventory *blockInventory)
 
 // wipefsSignatures lists the signatures wipefs would erase from path, without
 // erasing them.
-func (c *observedStorageCollector) wipefsSignatures(path string) ([]BlockSignature, string) {
+func (c *blockCollector) wipefsSignatures(path string) ([]BlockSignature, string) {
 	data, err := c.run("wipefs", "--json", "--no-act", path)
 	if err != nil {
 		return nil, err.Error()

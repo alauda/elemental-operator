@@ -26,14 +26,6 @@ import (
 
 const RegistrationDeadlineSeconds = 10
 
-// StorageObserverDeadlineSeconds bounds a single read on an established
-// storage observer session. Unlike registration, that session is long lived:
-// the agent reports once per --observe-interval (60s by default) and the
-// server must survive the idle gap between two reports. The value has to
-// exceed the client side refresh budget (interval + 30s) while still
-// reclaiming sessions whose host disappeared.
-const StorageObserverDeadlineSeconds = 300
-
 type MessageType byte
 
 const (
@@ -51,8 +43,8 @@ const (
 	MsgSystemDataV2                             // v1.6.0
 	MsgNetworkConfig                            // v1.7.0
 	MsgObservedNetworkConfig                    // Alauda fork: live-ISO observed network snapshot
-	MsgObservedStorageConfig                    // Alauda fork: objective storage report
-	MsgObserveStorage                           // Alauda fork: enter periodic read-only observer session
+	_                                           // Alauda fork: reserved, was the storage observer report
+	_                                           // Alauda fork: reserved, was the storage observer session
 	MsgLiveInstallSession                       // Alauda fork: live-ISO install session (boot, installer, disks)
 	MsgInstallHold                              // Alauda fork: MsgGet reply while no install target was chosen
 	MsgInstallReport                            // Alauda fork: install outcome of a released host
@@ -89,10 +81,6 @@ func (mt MessageType) String() string {
 		return "NetworkConfig"
 	case MsgObservedNetworkConfig:
 		return "ObservedNetworkConfig"
-	case MsgObservedStorageConfig:
-		return "ObservedStorageConfig"
-	case MsgObserveStorage:
-		return "ObserveStorage"
 	case MsgLiveInstallSession:
 		return "LiveInstallSession"
 	case MsgInstallHold:

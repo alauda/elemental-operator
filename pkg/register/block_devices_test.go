@@ -26,7 +26,7 @@ import (
 	"github.com/twpayne/go-vfs/vfst"
 )
 
-func TestCollectBlockDevicesSharesTheObserverIdentity(t *testing.T) {
+func TestCollectBlockDevicesReportsEveryNodeWithItsIdentity(t *testing.T) {
 	const (
 		system  = "/dev/sda"
 		pathA   = "/dev/sdb"

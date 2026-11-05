@@ -19,197 +19,14 @@ package register
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
-
-	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 )
 
-func TestObservedStorageReportsObjectiveTopology(t *testing.T) {
-	const (
-		dataDisk = "/dev/sdb"
-		dataPart = "/dev/sdb1"
-		system   = "/dev/vda"
-		sysPart  = "/dev/vda4"
-		pathA    = "/dev/sdc"
-		pathB    = "/dev/sdd"
-		mpath    = "/dev/mapper/3600508b400105e210000900000490000"
-	)
-
-	data := diskFixture(dataDisk)
-	data["wwn"] = "0x5000c50000000001"
-	data["pttype"] = "gpt"
-	data["children"] = []any{partitionFixture(dataPart, "cb6a04b2-01", "ext4", "59e82e0a-1111-2222-3333-444444444444", []any{"/data/application"})}
-
-	osDisk := diskFixture(system)
-	osDisk["wwn"] = "0x5000c50000000002"
-	osPartition := partitionFixture(sysPart, "system-part", "btrfs", "system-uuid", []any{"/run/elemental/persistent"})
-	osPartition["label"] = "COS_PERSISTENT"
-	osDisk["children"] = []any{osPartition}
-
-	memberA := diskFixture(pathA)
-	memberA["wwn"] = "0x5000c50000000003"
-	memberA["tran"] = "fc"
-	memberB := diskFixture(pathB)
-	memberB["wwn"] = "0x5000c50000000004"
-	memberB["tran"] = "fc"
-	mapFixture := map[string]any{
-		"name": mpath, "path": mpath, "type": "mpath", "size": int64(4 << 40),
-		"wwn": "3600508b400105e210000900000490000", "fstype": "xfs",
-		"uuid": "79288fcb-1111-2222-3333-444444444444", "mountpoints": []any{nil},
-	}
-	memberA["children"] = []any{mapFixture}
-	memberB["children"] = []any{mapFixture}
-
-	lsblk, err := json.Marshal(map[string]any{"blockdevices": []any{data, osDisk, memberA, memberB}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	collector := &observedStorageCollector{
-		run: func(name string, args ...string) ([]byte, error) {
-			switch name {
-			case "lsblk":
-				return lsblk, nil
-			case "wipefs":
-				if len(args) > 0 && args[len(args)-1] == dataDisk {
-					return []byte(`{"signatures":[{"type":"gpt","usage":"partition-table"}]}`), nil
-				}
-				return []byte(`{"signatures":[]}`), nil
-			case "multipathd":
-				return []byte("3600508b400105e210000900000490000|sdc|active\n3600508b400105e210000900000490000|sdd|ready\n"), nil
-			default:
-				return nil, fmt.Errorf("unexpected command %s %s", name, strings.Join(args, " "))
-			}
-		},
-		byIDPaths: func() (map[string][]string, error) {
-			return map[string][]string{
-				dataDisk: {"/dev/disk/by-id/wwn-0x5000c50000000001"},
-				dataPart: {"/dev/disk/by-id/wwn-0x5000c50000000001-part1"},
-				system:   {"/dev/disk/by-id/wwn-0x5000c50000000002"},
-				pathA:    {"/dev/disk/by-id/scsi-path-a"},
-				pathB:    {"/dev/disk/by-id/scsi-path-b"},
-				mpath:    {"/dev/disk/by-id/dm-uuid-mpath-3600508b400105e210000900000490000"},
-			}, nil
-		},
-		mountOptions: func() (map[string][]string, error) {
-			return map[string][]string{"/data/application": {"noatime", "rw"}}, nil
-		},
-		liveEnvironment: func() bool { return false },
-		bootID:          func() string { return "boot-1" },
-	}
-
-	observed, err := collector.collect()
-	if err != nil {
-		t.Fatalf("collect observed storage: %v", err)
-	}
-	if observed.BootID != "boot-1" {
-		t.Fatalf("BootID = %q", observed.BootID)
-	}
-	if len(observed.Devices) != 5 {
-		t.Fatalf("got %d logical devices, want disk, partition, system disk, system partition and map: %#v", len(observed.Devices), observed.Devices)
-	}
-
-	byID := observedDevicesByID(observed.Devices)
-	disk := byID["wwn:5000c50000000001"]
-	if disk == nil || disk.Kind != elementalv1.ObservedStorageDeviceDirectDisk || disk.SystemRole != elementalv1.ObservedStorageSystemRoleData {
-		t.Fatalf("unexpected direct disk: %#v", disk)
-	}
-	if !reflect.DeepEqual(disk.Signatures, []elementalv1.ObservedStorageSignature{{Type: "partition-table", Value: "gpt"}}) {
-		t.Fatalf("direct disk signatures = %#v", disk.Signatures)
-	}
-	if len(disk.Consumers) != 1 || disk.Consumers[0].Type != "part" || disk.Consumers[0].Path != dataPart || !reflect.DeepEqual(disk.Consumers[0].Mounts, []string{"/data/application"}) {
-		t.Fatalf("direct disk consumers = %#v", disk.Consumers)
-	}
-
-	partition := byID["partuuid:cb6a04b2-01"]
-	if partition == nil || partition.ParentID != disk.ID || partition.StartBytes != 1024*512 {
-		t.Fatalf("unexpected partition topology: %#v", partition)
-	}
-	if partition.Filesystem == nil || partition.Filesystem.Type != "ext4" || partition.Filesystem.UUID == "" {
-		t.Fatalf("unexpected partition filesystem: %#v", partition.Filesystem)
-	}
-	if len(partition.Mounts) != 1 || partition.Mounts[0].Path != "/data/application" || !reflect.DeepEqual(partition.Mounts[0].Options, []string{"noatime", "rw"}) {
-		t.Fatalf("unexpected partition mounts: %#v", partition.Mounts)
-	}
-
-	if got := byID["wwn:5000c50000000002"]; got == nil || got.SystemRole != elementalv1.ObservedStorageSystemRoleSystem {
-		t.Fatalf("system closure did not reach parent disk: %#v", got)
-	}
-	mapDevice := byID["wwid:3600508b400105e210000900000490000"]
-	if mapDevice == nil || mapDevice.Kind != elementalv1.ObservedStorageDeviceMultipath {
-		t.Fatalf("unexpected multipath map: %#v", mapDevice)
-	}
-	if mapDevice.Health == nil || mapDevice.Health.ActivePaths != 2 || mapDevice.Health.TotalPaths != 2 {
-		t.Fatalf("unexpected multipath health: %#v", mapDevice.Health)
-	}
-	if len(mapDevice.MemberIDs) != 2 {
-		t.Fatalf("member IDs = %#v", mapDevice.MemberIDs)
-	}
-	if byID["wwn:5000c50000000003"] != nil || byID["wwn:5000c50000000004"] != nil {
-		t.Fatal("multipath member disks must not be exposed as selectable DirectDisk records")
-	}
-}
-
-func TestObservedStorageHidesRawMultipathPartitionAliases(t *testing.T) {
-	const (
-		member       = "/dev/sda"
-		rawPartition = "/dev/sda1"
-		mapPath      = "/dev/mapper/3600508b400105e210000900000490000"
-		mapPartition = "/dev/mapper/3600508b400105e210000900000490000-part1"
-		partUUID     = "153c602f-2f96-4797-8785-fcb1572c19d4"
-	)
-
-	rawPart := partitionFixture(rawPartition, partUUID, "btrfs", "shared-filesystem", nil)
-	mapPart := partitionFixture(mapPartition, partUUID, "btrfs", "shared-filesystem", nil)
-	mapDevice := map[string]any{
-		"name": mapPath, "path": mapPath, "type": "mpath", "size": int64(100 << 30),
-		"wwn": "3600508b400105e210000900000490000", "mountpoints": []any{nil},
-		"children": []any{mapPart},
-	}
-	memberDevice := diskFixture(member)
-	memberDevice["children"] = []any{rawPart, mapDevice}
-	lsblk, err := json.Marshal(map[string]any{"blockdevices": []any{memberDevice}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	collector := &observedStorageCollector{
-		run: func(name string, _ ...string) ([]byte, error) {
-			if name == "lsblk" {
-				return lsblk, nil
-			}
-			return []byte(`{"signatures":[]}`), nil
-		},
-		byIDPaths: func() (map[string][]string, error) {
-			return map[string][]string{
-				member:  {"/dev/disk/by-id/scsi-member"},
-				mapPath: {"/dev/disk/by-id/dm-uuid-mpath-3600508b400105e210000900000490000"},
-			}, nil
-		},
-		liveEnvironment: func() bool { return false },
-		bootID:          func() string { return "boot-multipath-alias" },
-	}
-
-	observed, err := collector.collect()
-	if err != nil {
-		t.Fatal(err)
-	}
-	byID := observedDevicesByID(observed.Devices)
-	partition := byID["partuuid:"+partUUID]
-	if partition == nil || partition.Path != mapPartition {
-		t.Fatalf("aggregate partition not preserved: %#v", observed.Devices)
-	}
-	for _, device := range observed.Devices {
-		if device.Path == member || device.Path == rawPartition {
-			t.Fatalf("raw Multipath backing alias was exposed: %#v", device)
-		}
-	}
-}
-
-func TestObservedStorageResolvesMultipathStableIDThroughKernelName(t *testing.T) {
+func TestBlockCollectorResolvesMultipathStableIDThroughKernelName(t *testing.T) {
 	const (
 		mapPath    = "/dev/mapper/mpatha"
 		kernelPath = "/dev/dm-0"
@@ -225,7 +42,7 @@ func TestObservedStorageResolvesMultipathStableIDThroughKernelName(t *testing.T)
 		t.Fatal(err)
 	}
 	stablePath := "/dev/disk/by-id/dm-uuid-mpath-" + wwid
-	collector := &observedStorageCollector{
+	collector := &blockCollector{
 		run: func(name string, _ ...string) ([]byte, error) {
 			if name == "lsblk" {
 				return lsblk, nil
@@ -235,19 +52,17 @@ func TestObservedStorageResolvesMultipathStableIDThroughKernelName(t *testing.T)
 		byIDPaths: func() (map[string][]string, error) {
 			return map[string][]string{kernelPath: {stablePath}}, nil
 		},
-		liveEnvironment: func() bool { return false },
-		bootID:          func() string { return "boot-mapper-kname" },
 	}
 
-	observed, err := collector.collect()
+	snapshot, err := collector.blockSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(observed.Devices) != 1 {
-		t.Fatalf("devices = %#v", observed.Devices)
+	if len(snapshot.Devices) != 1 {
+		t.Fatalf("devices = %#v", snapshot.Devices)
 	}
-	device := observed.Devices[0]
-	if device.ID != "wwid:"+wwid || device.SystemRole != elementalv1.ObservedStorageSystemRoleData {
+	device := snapshot.Devices[0]
+	if device.Path != mapPath || device.ID != "wwid:"+wwid || device.IDProblem != "" {
 		t.Fatalf("multipath map did not resolve through KNAME: %#v", device)
 	}
 	if !reflect.DeepEqual(device.StablePaths, []string{stablePath}) {
@@ -255,48 +70,7 @@ func TestObservedStorageResolvesMultipathStableIDThroughKernelName(t *testing.T)
 	}
 }
 
-func TestObservedStorageReportsLayeredConsumersAndSystemClosure(t *testing.T) {
-	pv := diskFixture("/dev/sdb")
-	pv["wwn"] = "0x5000c50000000009"
-	lv := map[string]any{
-		"name": "/dev/mapper/vg-data", "path": "/dev/mapper/vg-data", "type": "lvm", "size": int64(100 << 30),
-		"fstype": "xfs", "uuid": "lv-uuid", "mountpoints": []any{"/srv/data"}, "options": []any{"rw"},
-	}
-	pv["children"] = []any{lv}
-	lsblk, err := json.Marshal(map[string]any{"blockdevices": []any{pv}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	collector := &observedStorageCollector{
-		run: func(name string, _ ...string) ([]byte, error) {
-			if name == "lsblk" {
-				return lsblk, nil
-			}
-			return []byte(`{"signatures":[]}`), nil
-		},
-		byIDPaths: func() (map[string][]string, error) {
-			return map[string][]string{"/dev/sdb": {"/dev/disk/by-id/wwn-0x5000c50000000009"}}, nil
-		},
-		liveEnvironment: func() bool { return false },
-		bootID:          func() string { return "boot-layered" },
-	}
-	observed, err := collector.collect()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(observed.Devices) != 1 {
-		t.Fatalf("devices = %#v", observed.Devices)
-	}
-	device := observed.Devices[0]
-	if len(device.Consumers) != 1 || device.Consumers[0].Type != "lvm" || device.Consumers[0].FilesystemType != "xfs" || !reflect.DeepEqual(device.Consumers[0].Mounts, []string{"/srv/data"}) {
-		t.Fatalf("layered consumers = %#v", device.Consumers)
-	}
-	if device.SystemRole != elementalv1.ObservedStorageSystemRoleData {
-		t.Fatalf("ordinary business LVM should remain an objective Data fact, got %#v", device)
-	}
-}
-
-func TestObservedStorageFailsClosedWhenIdentityOrInspectionIsUnknown(t *testing.T) {
+func TestBlockCollectorFailsClosedWhenIdentityOrInspectionIsUnknown(t *testing.T) {
 	disk := diskFixture("/dev/sdb")
 	disk["wwn"] = nil
 	disk["serial"] = "SHARED"
@@ -306,27 +80,28 @@ func TestObservedStorageFailsClosedWhenIdentityOrInspectionIsUnknown(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	collector := &observedStorageCollector{
+	collector := &blockCollector{
 		run: func(name string, _ ...string) ([]byte, error) {
 			if name == "lsblk" {
 				return lsblk, nil
 			}
 			return nil, errors.New("wipefs failed")
 		},
-		byIDPaths:       func() (map[string][]string, error) { return nil, errors.New("udev unavailable") },
-		liveEnvironment: func() bool { return false },
-		bootID:          func() string { return "boot-2" },
+		byIDPaths: func() (map[string][]string, error) { return nil, errors.New("udev unavailable") },
 	}
-	observed, err := collector.collect()
+	snapshot, err := collector.blockSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	device := observed.Devices[0]
-	if device.ID != "unidentified:dev_sdb" || device.SystemRole != elementalv1.ObservedStorageSystemRoleUnknown {
+	device := snapshot.Devices[0]
+	// A serial behind a fabric transport is no identity, and the problem says
+	// which fact is missing.
+	if device.ID != "" || !strings.Contains(device.IDProblem, `bus not proven local (transport="fc", driver="")`) {
 		t.Fatalf("unexpected fail-closed device: %#v", device)
 	}
-	if !containsText(device.SystemEvidence, "no supported stable device identity") || !containsText(device.SystemEvidence, "wipefs signature inspection failed") {
-		t.Fatalf("missing uncertainty evidence: %#v", device.SystemEvidence)
+	// A wipefs failure is reported, never read as "no signatures".
+	if device.Signatures != nil || device.SignatureError != "wipefs failed" {
+		t.Fatalf("wipefs failure was not reported: %#v", device)
 	}
 }
 
@@ -371,7 +146,7 @@ func TestCanonicalDeviceIdentity(t *testing.T) {
 	}
 }
 
-func TestObservedStorageFlexibleLSBLKValuesAndLiveRole(t *testing.T) {
+func TestBlockCollectorFlexibleLSBLKValues(t *testing.T) {
 	disk := diskFixture("/dev/nvme0n1")
 	disk["size"] = "1099511627776"
 	disk["rota"] = "1"
@@ -381,7 +156,7 @@ func TestObservedStorageFlexibleLSBLKValuesAndLiveRole(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	collector := &observedStorageCollector{
+	collector := &blockCollector{
 		run: func(name string, _ ...string) ([]byte, error) {
 			if name == "lsblk" {
 				return lsblk, nil
@@ -391,23 +166,18 @@ func TestObservedStorageFlexibleLSBLKValuesAndLiveRole(t *testing.T) {
 		byIDPaths: func() (map[string][]string, error) {
 			return map[string][]string{"/dev/nvme0n1": {"/dev/disk/by-id/nvme-eui.0000000000000099"}}, nil
 		},
-		liveEnvironment: func() bool { return true },
-		bootID:          func() string { return "boot-live" },
 	}
-	observed, err := collector.collect()
+	snapshot, err := collector.blockSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	device := observed.Devices[0]
+	device := snapshot.Devices[0]
 	if device.SizeBytes != 1099511627776 || !device.Rotational || device.Removable {
 		t.Fatalf("unexpected flexible values: %#v", device)
 	}
-	if device.SystemRole != elementalv1.ObservedStorageSystemRoleUnknown || !containsText(device.SystemEvidence, "live environment") {
-		t.Fatalf("live device must be Unknown: %#v", device)
-	}
 }
 
-func TestObservedStorageCollectionErrors(t *testing.T) {
+func TestBlockCollectorCollectionErrors(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		data []byte
@@ -417,20 +187,18 @@ func TestObservedStorageCollectionErrors(t *testing.T) {
 		{name: "invalid lsblk JSON", data: []byte("not-json")},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			collector := &observedStorageCollector{
-				run:             func(string, ...string) ([]byte, error) { return tt.data, tt.err },
-				byIDPaths:       func() (map[string][]string, error) { return nil, nil },
-				liveEnvironment: func() bool { return false },
-				bootID:          func() string { return "boot" },
+			collector := &blockCollector{
+				run:       func(string, ...string) ([]byte, error) { return tt.data, tt.err },
+				byIDPaths: func() (map[string][]string, error) { return nil, nil },
 			}
-			if _, err := collector.collect(); err == nil {
+			if _, err := collector.blockSnapshot(); err == nil {
 				t.Fatal("expected collection error")
 			}
 		})
 	}
 }
 
-func TestObservedStorageLSBLKArgsRemainUtilLinux237Compatible(t *testing.T) {
+func TestBlockCollectorLSBLKArgsRemainUtilLinux237Compatible(t *testing.T) {
 	joined := strings.Join(lsblkStorageArgs, ",")
 	for _, unsupported := range []string{"PARTN", "START", "OPTIONS"} {
 		for _, column := range strings.Split(joined, ",") {
@@ -446,60 +214,11 @@ func TestObservedStorageLSBLKArgsRemainUtilLinux237Compatible(t *testing.T) {
 	}
 }
 
-func TestObservedStorageCollectsMountOptionsWithFindmnt(t *testing.T) {
-	collector := &observedStorageCollector{run: func(name string, args ...string) ([]byte, error) {
-		if name != "findmnt" || !reflect.DeepEqual(args, findmntStorageArgs) {
-			return nil, fmt.Errorf("unexpected command %s %v", name, args)
-		}
-		return []byte(`{"filesystems":[{"target":"/data/application","options":"rw,noatime,nodev"},{"target":null,"options":null}]}`), nil
-	}}
-	got, err := collector.collectMountOptions()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(got, map[string][]string{"/data/application": {"noatime", "nodev", "rw"}}) {
-		t.Fatalf("mount options = %#v", got)
-	}
-}
-
-func TestPartitionStartBytesFromUtilLinux237SysfsFallback(t *testing.T) {
-	sysfsRoot := t.TempDir()
-	deviceDir := filepath.Join(sysfsRoot, "sda1")
-	if err := os.MkdirAll(deviceDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(deviceDir, "start"), []byte("2048\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	device := lsblkDevice{KName: "/dev/sda1", Type: "part", LogicalSector: 512}
-	if got := partitionStartBytesFromSysfsRoot(device, sysfsRoot); got != 1048576 {
-		t.Fatalf("partition start bytes = %d, want 1048576", got)
-	}
-	device.KName = "/dev/../sda1"
-	if got := partitionStartBytesFromSysfsRoot(device, sysfsRoot); got != 0 {
-		t.Fatalf("unsafe kernel name returned %d", got)
-	}
-}
-
-func TestObservedStorageProtocolMessages(t *testing.T) {
-	if MsgObservedStorageConfig <= MsgObservedNetworkConfig || MsgObserveStorage <= MsgObservedStorageConfig {
-		t.Fatalf("unexpected storage protocol ordering: network=%d report=%d observe=%d", MsgObservedNetworkConfig, MsgObservedStorageConfig, MsgObserveStorage)
-	}
-	if MsgLast <= MsgObserveStorage {
-		t.Fatalf("MsgLast = %d, must follow MsgObserveStorage (%d)", MsgLast, MsgObserveStorage)
-	}
-	if MsgObservedStorageConfig.String() != "ObservedStorageConfig" || MsgObserveStorage.String() != "ObserveStorage" {
-		t.Fatalf("unexpected message names: %q %q", MsgObservedStorageConfig, MsgObserveStorage)
-	}
-}
-
 // The fork's message numbers are on the wire: hosts and operators of
 // different releases negotiate by them, so they never move.
 func TestForkProtocolMessageNumbers(t *testing.T) {
 	want := map[MessageType]byte{
 		MsgObservedNetworkConfig: 13,
-		MsgObservedStorageConfig: 14,
-		MsgObserveStorage:        15,
 		MsgLiveInstallSession:    16,
 		MsgInstallHold:           17,
 		MsgInstallReport:         18,
@@ -512,9 +231,16 @@ func TestForkProtocolMessageNumbers(t *testing.T) {
 	if MsgLast != MsgInstallReport {
 		t.Errorf("MsgLast = %d, want %d", MsgLast, MsgInstallReport)
 	}
+	// 14 and 15 carried the removed storage observer. Peers of older releases
+	// may still send them, so no message may ever be given those numbers again.
+	for _, number := range []byte{14, 15} {
+		if name := MessageType(number).String(); name != "Unknown" {
+			t.Errorf("message %d is reserved for the removed storage observer, but is named %q", number, name)
+		}
+	}
 }
 
-func TestObservedStorageEnumeratesStablePathsForDisksAndPartitions(t *testing.T) {
+func TestBlockCollectorEnumeratesStablePathsForDisksAndPartitions(t *testing.T) {
 	root := t.TempDir()
 	deviceDir := filepath.Join(root, "dev")
 	byIDDir := filepath.Join(deviceDir, "disk", "by-id")
@@ -576,14 +302,6 @@ func partitionFixture(path, partUUID, filesystem, uuid string, mounts []any) map
 	}
 }
 
-func observedDevicesByID(devices []elementalv1.ObservedStorageDevice) map[string]*elementalv1.ObservedStorageDevice {
-	out := make(map[string]*elementalv1.ObservedStorageDevice, len(devices))
-	for i := range devices {
-		out[devices[i].ID] = &devices[i]
-	}
-	return out
-}
-
 func containsText(values []string, needle string) bool {
 	for _, value := range values {
 		if strings.Contains(value, needle) {
@@ -593,7 +311,16 @@ func containsText(values []string, needle string) bool {
 	return false
 }
 
-// TestObservedStorageReproducesCustomerQEMUEnvironment replays a customer's real
+func findBlockDevice(t *testing.T, snapshot *BlockSnapshot, path string) *BlockDevice {
+	t.Helper()
+	device := snapshot.Find(path)
+	if device == nil {
+		t.Fatalf("%s is missing from the snapshot: %#v", path, snapshot.Devices)
+	}
+	return device
+}
+
+// TestBlockCollectorReproducesCustomerQEMUEnvironment replays a customer's real
 // device tree, captured from lsblk, /dev/disk/by-id and multipathd. It is the
 // local stand-in for that environment so identity behaviour is pinned without a VM.
 //
@@ -601,7 +328,7 @@ func containsText(values []string, needle string) bool {
 // virtio-blk publishing nothing but a serial, single-path disks that
 // find_multipaths no wrapped into maps, and udev minting wwn-0x aliases by
 // chopping the first character off a WWID that has no designator-type digit.
-func TestObservedStorageReproducesCustomerQEMUEnvironment(t *testing.T) {
+func TestBlockCollectorReproducesCustomerQEMUEnvironment(t *testing.T) {
 	virtioDisk := func(path, serial string, sizeGiB int64) map[string]any {
 		return map[string]any{
 			"name": path, "path": path, "kname": path, "type": "disk",
@@ -679,61 +406,49 @@ func TestObservedStorageReproducesCustomerQEMUEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	collector := &observedStorageCollector{
+	collector := &blockCollector{
 		run: func(name string, _ ...string) ([]byte, error) {
 			if name == "lsblk" {
 				return lsblk, nil
 			}
 			return []byte(`{"signatures":[]}`), nil
 		},
-		byIDPaths:       func() (map[string][]string, error) { return byIDPaths, nil },
-		liveEnvironment: func() bool { return false },
-		bootID:          func() string { return "boot-customer-qemu" },
+		byIDPaths: func() (map[string][]string, error) { return byIDPaths, nil },
 	}
 
-	observed, err := collector.collect()
+	snapshot, err := collector.blockSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	byID := observedDevicesByID(observed.Devices)
 
 	// Both virtio disks resolve through their by-id serial alias.
 	for path, want := range map[string]string{
 		"/dev/vda": "serial:virtio:5000c500142b3c4d",
 		"/dev/vdb": "serial:virtio:90a775711a809a8a75e5",
 	} {
-		device := byID[want]
-		if device == nil || device.Path != path {
-			t.Fatalf("%s was not identified as %s: %#v", path, want, observed.Devices)
+		if device := findBlockDevice(t, snapshot, path); device.ID != want {
+			t.Fatalf("%s was not identified as %s: %#v", path, want, device)
 		}
 	}
 
-	// Every map still fails closed, and no member path is exposed. mpathc is the
-	// one that would slip through a rule keyed only on "not hexadecimal": udev's
-	// wwn-0xEMU_HARDDISK_... alias must not be mistaken for a usable WWN.
+	// Every map still fails closed. mpathc is the one that would slip through a
+	// rule keyed only on "not hexadecimal": udev's wwn-0xEMU_HARDDISK_... alias
+	// must not be mistaken for a usable WWN.
 	for _, m := range qemuMaps {
-		mapped := byID["unidentified:dev_mapper_"+m.alias]
-		if mapped == nil || mapped.Path != "/dev/mapper/"+m.alias {
-			t.Fatalf("map %s was expected to fail closed: %#v", m.alias, observed.Devices)
-		}
-		if mapped.SystemRole != elementalv1.ObservedStorageSystemRoleUnknown {
-			t.Fatalf("map %s role = %q, want Unknown", m.alias, mapped.SystemRole)
-		}
-		for _, device := range observed.Devices {
-			if device.Path == m.member {
-				t.Fatalf("multipath member %s was exposed: %#v", m.member, device)
-			}
+		mapped := findBlockDevice(t, snapshot, "/dev/mapper/"+m.alias)
+		if mapped.ID != "" || !strings.Contains(mapped.IDProblem, "multipath WWID is not hexadecimal") {
+			t.Fatalf("map %s was expected to fail closed: %#v", m.alias, mapped)
 		}
 	}
 }
 
-// TestObservedStorageCustomerEnvironmentWithoutFakeMultipathMaps replays the same
+// TestBlockCollectorCustomerEnvironmentWithoutFakeMultipathMaps replays the same
 // customer disks as they appear once the OS image stops shipping
 // find_multipaths no, so single-path QEMU disks are no longer wrapped into maps.
 //
 // The three disks differ only in the transport lsblk manages to derive, and that
 // alone decides whether the serial fallback is admissible.
-func TestObservedStorageCustomerEnvironmentWithoutFakeMultipathMaps(t *testing.T) {
+func TestBlockCollectorCustomerEnvironmentWithoutFakeMultipathMaps(t *testing.T) {
 	disks := []struct {
 		path, serial, transport string
 		aliases                 []string
@@ -771,56 +486,46 @@ func TestObservedStorageCustomerEnvironmentWithoutFakeMultipathMaps(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	collector := &observedStorageCollector{
+	collector := &blockCollector{
 		run: func(name string, _ ...string) ([]byte, error) {
 			if name == "lsblk" {
 				return lsblk, nil
 			}
 			return []byte(`{"signatures":[]}`), nil
 		},
-		byIDPaths:       func() (map[string][]string, error) { return byIDPaths, nil },
-		liveEnvironment: func() bool { return false },
-		bootID:          func() string { return "boot-customer-no-maps" },
+		byIDPaths: func() (map[string][]string, error) { return byIDPaths, nil },
 	}
 
-	observed, err := collector.collect()
+	snapshot, err := collector.blockSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	byID := observedDevicesByID(observed.Devices)
 
 	for id, wantPath := range map[string]string{
 		"serial:qemu_harddisk:07a8489045cc024d75ee": "/dev/sdb",
 		"serial:qemu_harddisk:c2793cff25c3aba3d4b7": "/dev/sdc",
 	} {
-		device := byID[id]
-		if device == nil || device.Path != wantPath {
-			t.Fatalf("%s was not identified as %s: %#v", wantPath, id, observed.Devices)
-		}
-		if device.SystemRole != elementalv1.ObservedStorageSystemRoleData {
-			t.Fatalf("%s role = %q, want Data", wantPath, device.SystemRole)
+		if device := findBlockDevice(t, snapshot, wantPath); device.ID != id || device.IDProblem != "" {
+			t.Fatalf("%s was not identified as %s: %#v", wantPath, id, device)
 		}
 	}
 
 	// sda publishes the same kind of serial, but nothing proves its bus is not a
 	// shared fabric, so it must not become selectable on serial alone.
-	sda := byID["unidentified:dev_sda"]
-	if sda == nil || sda.Path != "/dev/sda" {
-		t.Fatalf("sda was expected to fail closed without transport evidence: %#v", observed.Devices)
+	sda := findBlockDevice(t, snapshot, "/dev/sda")
+	if sda.ID != "" {
+		t.Fatalf("sda was expected to fail closed without transport evidence: %#v", sda)
 	}
-	if sda.SystemRole != elementalv1.ObservedStorageSystemRoleUnknown {
-		t.Fatalf("sda role = %q, want Unknown", sda.SystemRole)
-	}
-	// The evidence must say which fact is missing, not only that one is.
-	if !containsText(sda.SystemEvidence, `bus not proven local (transport="", driver="")`) {
-		t.Fatalf("sda evidence = %v", sda.SystemEvidence)
+	// The problem must say which fact is missing, not only that one is.
+	if !strings.Contains(sda.IDProblem, `bus not proven local (transport="", driver="")`) {
+		t.Fatalf("sda IDProblem = %q", sda.IDProblem)
 	}
 }
 
-// TestObservedStorageIdentifiesVirtioSCSIDiskThroughSysfs is the customer's
+// TestBlockCollectorIdentifiesVirtioSCSIDiskThroughSysfs is the customer's
 // /dev/sda: a QEMU disk behind a virtio-scsi controller. lsblk derives no
 // transport for it, so only the sysfs bus probe can prove the bus is local.
-func TestObservedStorageIdentifiesVirtioSCSIDiskThroughSysfs(t *testing.T) {
+func TestBlockCollectorIdentifiesVirtioSCSIDiskThroughSysfs(t *testing.T) {
 	sda := map[string]any{
 		"name": "/dev/sda", "path": "/dev/sda", "kname": "/dev/sda", "type": "disk",
 		"size": int64(500 << 30), "start": 0, "log-sec": 512,
@@ -832,7 +537,7 @@ func TestObservedStorageIdentifiesVirtioSCSIDiskThroughSysfs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	collector := &observedStorageCollector{
+	collector := &blockCollector{
 		run: func(name string, _ ...string) ([]byte, error) {
 			if name == "lsblk" {
 				return lsblk, nil
@@ -842,21 +547,16 @@ func TestObservedStorageIdentifiesVirtioSCSIDiskThroughSysfs(t *testing.T) {
 		byIDPaths: func() (map[string][]string, error) {
 			return map[string][]string{"/dev/sda": {"/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_50014ee01a2b3c4d"}}, nil
 		},
-		busProbe:        func(lsblkDevice) busProbe { return busProbe{bus: "virtio", driver: "virtio_scsi"} },
-		liveEnvironment: func() bool { return false },
-		bootID:          func() string { return "boot-virtio-scsi" },
+		busProbe: func(lsblkDevice) busProbe { return busProbe{bus: "virtio", driver: "virtio_scsi"} },
 	}
 
-	observed, err := collector.collect()
+	snapshot, err := collector.blockSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	device := observedDevicesByID(observed.Devices)["serial:qemu_harddisk:50014ee01a2b3c4d"]
-	if device == nil || device.Path != "/dev/sda" {
-		t.Fatalf("virtio-scsi disk was not identified: %#v", observed.Devices)
-	}
-	if device.SystemRole != elementalv1.ObservedStorageSystemRoleData {
-		t.Fatalf("role = %q, want Data", device.SystemRole)
+	device := findBlockDevice(t, snapshot, "/dev/sda")
+	if device.ID != "serial:qemu_harddisk:50014ee01a2b3c4d" || device.IDProblem != "" {
+		t.Fatalf("virtio-scsi disk was not identified: %#v", device)
 	}
 }
 
@@ -923,7 +623,7 @@ func TestProbeBusFromSysfsRoot(t *testing.T) {
 	}
 }
 
-// TestObservedStorageMeasuredQEMUBusEvidence replays facts measured on a real
+// TestBlockCollectorMeasuredQEMUBusEvidence replays facts measured on a real
 // QEMU/KVM guest booted from this image, one data disk per bus class, none of
 // them publishing a WWN. Every string below — lsblk transport, by-id alias,
 // sysfs device path, SCSI host driver — is copied from that guest rather than
@@ -932,9 +632,9 @@ func TestProbeBusFromSysfsRoot(t *testing.T) {
 //
 // The guest also confirmed the premise: multipathd was active and created no
 // map at all for these four single-path SCSI disks. Under find_multipaths no
-// every one of them would have become mpatha..mpathd with a WWID the observer
+// every one of them would have become mpatha..mpathd with a WWID the collector
 // cannot use.
-func TestObservedStorageMeasuredQEMUBusEvidence(t *testing.T) {
+func TestBlockCollectorMeasuredQEMUBusEvidence(t *testing.T) {
 	sysfsRoot := t.TempDir()
 	mkdir := func(rel string) string {
 		dir := filepath.Join(sysfsRoot, rel)
@@ -1027,24 +727,21 @@ func TestObservedStorageMeasuredQEMUBusEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	collector := &observedStorageCollector{
+	collector := &blockCollector{
 		run: func(name string, _ ...string) ([]byte, error) {
 			if name == "lsblk" {
 				return lsblk, nil
 			}
 			return []byte(`{"signatures":[]}`), nil
 		},
-		byIDPaths:       func() (map[string][]string, error) { return byIDPaths, nil },
-		busProbe:        func(d lsblkDevice) busProbe { return probeBusFromSysfsRoot(d, sysfsRoot) },
-		liveEnvironment: func() bool { return false },
-		bootID:          func() string { return "boot-measured-qemu" },
+		byIDPaths: func() (map[string][]string, error) { return byIDPaths, nil },
+		busProbe:  func(d lsblkDevice) busProbe { return probeBusFromSysfsRoot(d, sysfsRoot) },
 	}
 
-	observed, err := collector.collect()
+	snapshot, err := collector.blockSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	byID := observedDevicesByID(observed.Devices)
 
 	for _, want := range []struct{ id, path, note string }{
 		{"serial:virtio:5000c500142b3c4d", "/dev/vda", "virtio-blk via its by-id serial alias"},
@@ -1053,26 +750,19 @@ func TestObservedStorageMeasuredQEMUBusEvidence(t *testing.T) {
 		{"serial:qemu_harddisk:07a8489045cc024d75ee", "/dev/sdc", "SPI: proven by lsblk transport"},
 		{"serial:qemu_harddisk:c2793cff25c3aba3d4b7", "/dev/sdd", "AHCI: proven by transport, ata ancestor and ata- alias alike"},
 	} {
-		device := byID[want.id]
-		if device == nil || device.Path != want.path {
-			t.Fatalf("%s (%s) was not identified as %s: %#v", want.path, want.note, want.id, observed.Devices)
-		}
-		if device.SystemRole != elementalv1.ObservedStorageSystemRoleData {
-			t.Fatalf("%s role = %q, want Data", want.path, device.SystemRole)
+		if device := findBlockDevice(t, snapshot, want.path); device.ID != want.id || device.IDProblem != "" {
+			t.Fatalf("%s (%s) was not identified as %s: %#v", want.path, want.note, want.id, device)
 		}
 	}
 
 	// The MegaRAID SAS disk is the control. Its serial is just as good, but a
 	// SAS HBA may front storage another host can also reach, so nothing here
 	// proves the bus is local and the disk must stay unmanageable.
-	sda := byID["unidentified:dev_sda"]
-	if sda == nil || sda.Path != "/dev/sda" {
-		t.Fatalf("the SAS-fronted disk was expected to fail closed: %#v", observed.Devices)
+	sda := findBlockDevice(t, snapshot, "/dev/sda")
+	if sda.ID != "" {
+		t.Fatalf("the SAS-fronted disk was expected to fail closed: %#v", sda)
 	}
-	if sda.SystemRole != elementalv1.ObservedStorageSystemRoleUnknown {
-		t.Fatalf("sda role = %q, want Unknown", sda.SystemRole)
-	}
-	if !containsText(sda.SystemEvidence, `bus not proven local (transport="", driver="megaraid_sas")`) {
-		t.Fatalf("sda evidence must name the driver that failed the check: %v", sda.SystemEvidence)
+	if !strings.Contains(sda.IDProblem, `bus not proven local (transport="", driver="megaraid_sas")`) {
+		t.Fatalf("sda IDProblem must name the driver that failed the check: %q", sda.IDProblem)
 	}
 }

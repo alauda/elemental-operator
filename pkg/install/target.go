@@ -42,8 +42,8 @@ import (
 // stale.go) and hands the backend the disk's kernel path (/dev/sdb). The
 // toolkit CLI would resolve a symlink on its own; kbimg would not: it matches
 // the literal path against parted's output and derives partition nodes by
-// appending numbers to it. Disk facts come from the storage observer's lsblk
-// collector, so a disk has the same ID here, in the observer and on the
+// appending numbers to it. Disk facts come from register's block collector
+// (register.CollectBlockDevices), so a disk has the same ID here and on the
 // MachineInventory.
 
 const (
