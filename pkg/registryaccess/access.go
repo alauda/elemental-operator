@@ -109,6 +109,11 @@ func invalid(format string, args ...any) error {
 	return &InvalidError{Message: fmt.Sprintf(format, args...)}
 }
 
+// secretReference names the credential Secret of a registry input. Only the
+// UID is checked: the Secret is versioned, so the UID tells a replaced Secret
+// apart. The resourceVersion that the input may also record is ignored,
+// because etcd-sync copies the Secret to the standby Global with a different
+// one.
 type secretReference struct {
 	Name            string `json:"name"`
 	UID             string `json:"uid,omitempty"`
@@ -222,8 +227,8 @@ func parseInput(ctx context.Context, reader client.Reader, secret *corev1.Secret
 			}
 			return nil, fmt.Errorf("read Secret %s/%s: %w", namespace, cref.Name, err)
 		}
-		if (cref.UID != "" && string(creds.UID) != cref.UID) || (cref.ResourceVersion != "" && creds.ResourceVersion != cref.ResourceVersion) {
-			return nil, invalid("Secret %s/%s changed after %s referenced it (uid/resourceVersion mismatch)", namespace, cref.Name, ref)
+		if cref.UID != "" && string(creds.UID) != cref.UID {
+			return nil, invalid("Secret %s/%s was replaced after %s referenced it (uid mismatch)", namespace, cref.Name, ref)
 		}
 		a.CredentialsSecret = namespace + "/" + cref.Name
 		var err error
