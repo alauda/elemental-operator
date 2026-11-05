@@ -23,9 +23,9 @@ import (
 const (
 	// InstallTargetDeviceAnnotation picks the install disk of a host that
 	// waits in the live ISO with install.device-selection: inventory. The
-	// value is the canonical ID of one of status.install.candidates. It is
-	// one-shot: the registration server removes it when it releases the
-	// host, and discards one that was set before the live session started.
+	// value is the ID of one of status.install.candidates. It is one-shot:
+	// the registration server removes it when it releases the host, and
+	// discards one that was set before the live session started.
 	InstallTargetDeviceAnnotation = "baremetal.alauda.io/install-target-device"
 	// RegistrationIPLabel carries the source IP the host registered from,
 	// refreshed on every registration, so an inventory can be found by the
@@ -102,7 +102,8 @@ type InstallStatus struct {
 // InstallCandidate is one whole disk a live session reported.
 type InstallCandidate struct {
 	// ID is the canonical whole-disk ID: wwn:, nvme-eui:, nvme-nguid: or
-	// serial:; unidentified: when the disk has none.
+	// serial:; unidentified: when the disk has none. An unidentified: ID is
+	// derived from the kernel path and names the disk in this live boot only.
 	ID string `json:"id"`
 	// Path is the kernel device path in the reporting boot only.
 	// +optional

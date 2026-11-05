@@ -121,7 +121,7 @@ func TestCollectBlockDevicesSharesTheObserverIdentity(t *testing.T) {
 
 	for _, member := range []string{pathA, pathB} {
 		device := snapshot.Find(member)
-		if device.ID != "" || device.IDProblem != "identity is shared with another device on this host" {
+		if device.ID != "" || !device.IDShared || device.IDProblem != "identity is shared with another device on this host" {
 			t.Fatalf("multipath path %s must not keep the LUN's WWN as its own identity: %#v", member, device)
 		}
 		if !reflect.DeepEqual(device.Children, []string{mapPath}) {

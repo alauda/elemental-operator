@@ -158,13 +158,24 @@ type diskFacts struct {
 	data []string
 }
 
-// displayID is the canonical ID, or a diagnostic placeholder nothing can
-// select.
+// displayID is the canonical ID, or the unidentified ID that names a disk
+// without one by its kernel path, in this boot only.
 func (d *diskFacts) displayID() string {
 	if d.dev.ID != "" {
 		return d.dev.ID
 	}
 	return register.UnidentifiedDeviceID(d.path)
+}
+
+// sharedIDProblem says why the operator may not release an install to the
+// disk: another device on the host carries the same identity, typically the
+// other path of one LUN without multipath, which would show the installed
+// system a second time. It is "" for every other disk.
+func (d *diskFacts) sharedIDProblem() string {
+	if !d.dev.IDShared {
+		return ""
+	}
+	return "no unique stable ID: " + d.dev.IDProblem
 }
 
 func (d *diskFacts) describe() string {
@@ -584,7 +595,9 @@ func targetByID(inv *diskInventory, want *elementalv1.InstallTarget) (*installTa
 	id := register.NormalizeDeviceID(want.DeviceID)
 	var matches []*diskFacts
 	for _, d := range inv.disks {
-		if d.dev.Type == blockTypeDisk && d.dev.ID != "" && d.dev.ID == id {
+		// A disk without a canonical ID matches its unidentified ID: the
+		// operator releases one only to the live boot that reported it.
+		if d.dev.Type == blockTypeDisk && d.displayID() == id {
 			matches = append(matches, d)
 		}
 	}
@@ -595,6 +608,9 @@ func targetByID(inv *diskInventory, want *elementalv1.InstallTarget) (*installTa
 		return nil, diskErrorf(reasonTargetAmbiguous, "%d disks have ID %s; disks: %s", len(matches), id, inv.describeDisks())
 	}
 	d := matches[0]
+	if problem := d.sharedIDProblem(); problem != "" {
+		return nil, diskErrorf(reasonTargetIneligible, "%s cannot be the install target: %s", d.describe(), problem)
+	}
 	if mismatch := expectMismatch(d, want.Expect); mismatch != "" {
 		return nil, diskErrorf(reasonTargetMismatch, "disk %s (%s) no longer looks as the operator saw it: %s", id, d.path, mismatch)
 	}
