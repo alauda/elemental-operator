@@ -817,7 +817,7 @@ func TestInstalledSystemSettlesTheInstall(t *testing.T) {
 }
 
 func TestLegacyRegistrationWithoutSessionIsUnchanged(t *testing.T) {
-	for _, protoVersion := range []register.MessageType{register.MsgObserveStorage, register.MsgLast} {
+	for _, protoVersion := range []register.MessageType{register.MsgObservedNetworkConfig, register.MsgLast} {
 		t.Run(protoVersion.String(), func(t *testing.T) {
 			g := NewWithT(t)
 			env := newInstallTestEnv(t, installEnvOptions{legacy: true}, liveInventory("node-a"))

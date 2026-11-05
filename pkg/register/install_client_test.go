@@ -220,7 +220,7 @@ var _ = Describe("live install session", Label("registration", "install-session"
 	})
 
 	It("registers without the session with an operator that predates it", func() {
-		server, ws := newInstallServer(MsgObserveStorage)
+		server, ws := newInstallServer(MsgObservedNetworkConfig)
 		data, err := NewClient().RegisterForInstall(registration(ws.URL), nil, &State{}, session)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(data)).To(ContainSubstring("/dev/sda"))
@@ -355,7 +355,7 @@ var _ = Describe("install report", Label("registration", "install-session", "sim
 	})
 
 	It("is skipped with an operator that predates it", func() {
-		server, ws := newInstallServer(MsgObserveStorage)
+		server, ws := newInstallServer(MsgObservedNetworkConfig)
 		Expect(NewClient().ReportInstall(registration(ws.URL), nil, registered(), report)).To(Succeed())
 		conns := server.connections(1)
 		Expect(conns[0].messages).To(Equal([]MessageType{MsgVersion}))

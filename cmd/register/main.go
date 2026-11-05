@@ -52,8 +52,6 @@ var (
 	resetNetwork     bool
 	installation     bool
 	disableBootEntry bool
-	observeStorage   bool
-	observeInterval  time.Duration
 	configPath       string
 	statePath        string
 	// osInstaller selects the install backend: "toolkit" (elemental install)
@@ -113,9 +111,6 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 			caCert, err := getRegistrationCA(fs, cfg)
 			if err != nil {
 				return fmt.Errorf("validating CA: %w", err)
-			}
-			if observeStorage {
-				return register.ObserveStorage(cfg.Elemental.Registration, caCert, &registrationState, observeInterval)
 			}
 			// Register (and fetch the remote MachineRegistration). Installing
 			// from the live ISO waits until the operator releases the host.
@@ -220,8 +215,6 @@ func newCommand(fs vfs.FS, client register.Client, stateHandler register.StateHa
 	cmd.Flags().BoolVar(&cfg.Elemental.Registration.NoToolkit, "no-toolkit", false, "No OS management via elemental-toolkit, only Install agent config files to local filesystem (for pre-installed hosts)")
 	cmd.Flags().StringVar(&osInstaller, "installer", install.ToolkitInstaller, "Install backend: toolkit (elemental install) or kubeos (kbimg install disk)")
 	cmd.Flags().BoolVar(&disableBootEntry, "disable-boot-entry", false, "Don't create an EFI entry for the system during install/reset")
-	cmd.Flags().BoolVar(&observeStorage, "observe-storage", false, "Continuously report objective block-device state without updating MachineInventory spec")
-	cmd.Flags().DurationVar(&observeInterval, "observe-interval", time.Minute, "Storage observation interval")
 	return cmd
 }
 
