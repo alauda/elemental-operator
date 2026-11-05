@@ -135,6 +135,21 @@ func TestResolveReferencedCredential(t *testing.T) {
 	}
 }
 
+// etcd-sync copies the credential Secret to the standby Global with a
+// resourceVersion of its own while the UID stays. After a failover the
+// reference must still resolve.
+func TestResolveIgnoresResourceVersionAfterCopy(t *testing.T) {
+	auth := credsSecret("team-auth", `{"auths":{"team.example.com":{"auth":"`+testAuth+`"}}}`)
+	auth.ResourceVersion = "4711"
+	a, err := resolve(t, map[string]string{ReferenceLabel: "team-registry"},
+		cloudCredential("team-registry", map[string][]byte{"config.json": configJSON(inputPayload([]string{"team.example.com"}, "team-auth"))}),
+		auth,
+	)
+	if err != nil || a.CredentialsSecret != testNamespace+"/team-auth" {
+		t.Fatalf("ResolveDefault() with a different resourceVersion = %v, %v", a, err)
+	}
+}
+
 func TestResolvePreparedFallback(t *testing.T) {
 	prepared := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: PreparedInput},
@@ -206,11 +221,11 @@ func TestResolveInvalid(t *testing.T) {
 			p["endpoints"] = []string{"a.example.com\"\n[[registry]]"}
 			return []client.Object{cloudCredential(DefaultCredential, map[string][]byte{"config.json": configJSON(p)}), auth()}
 		}, "invalid"},
-		{"credential rotated", nil, func() []client.Object {
+		{"credential replaced", nil, func() []client.Object {
 			s := auth()
 			s.UID = "new-uid"
 			return []client.Object{cloudCredential(DefaultCredential, map[string][]byte{"config.json": configJSON(good())}), s}
-		}, "uid/resourceVersion mismatch"},
+		}, "uid mismatch"},
 		{"credential missing an endpoint", nil, func() []client.Object {
 			return []client.Object{cloudCredential(DefaultCredential, map[string][]byte{"config.json": configJSON(good())}),
 				credsSecret("auth", `{"auths":{"harbor.example.com:11443":{"auth":"`+testAuth+`"}}}`)}
