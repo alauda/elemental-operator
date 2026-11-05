@@ -346,7 +346,8 @@ spec:
                         id:
                           description: |-
                             ID is the canonical whole-disk ID: wwn:, nvme-eui:, nvme-nguid: or
-                            serial:; unidentified: when the disk has none.
+                            serial:; unidentified: when the disk has none. An unidentified: ID is
+                            derived from the kernel path and names the disk in this live boot only.
                           type: string
                         model:
                           type: string

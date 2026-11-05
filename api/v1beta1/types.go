@@ -193,13 +193,14 @@ type InstallRegistry struct {
 	DockerConfig string `json:"docker-config,omitempty" yaml:"docker-config,omitempty"`
 }
 
-// InstallTarget names the disk an install must use by its canonical ID, as
+// InstallTarget names the disk an install must use by its ID, as
 // elemental-register reports it, and the stale system disks the operator
 // approved for wiping.
 type InstallTarget struct {
 	// DeviceID is the canonical ID of the target disk: wwn:…, nvme-eui:…,
-	// nvme-nguid:… or serial:…. It takes precedence over install.device and
-	// install.device-selector.
+	// nvme-nguid:… or serial:…; for a disk without one, the unidentified:…
+	// ID the live boot that is released reported. It takes precedence over
+	// install.device and install.device-selector.
 	// +optional
 	DeviceID string `json:"device-id,omitempty" yaml:"device-id,omitempty"`
 	// Expect lists properties the target must still have; empty fields are

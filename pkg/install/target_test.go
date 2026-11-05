@@ -230,6 +230,29 @@ var _ = Describe("install target resolution", Label("installer", "install", "tar
 			Expect(reasonOf(err)).To(Equal(reasonTargetNotObserved))
 			Expect(err.Error()).To(ContainSubstring("unidentified:dev_sda"))
 		})
+
+		It("selects a disk without a stable ID by its unidentified ID", func() {
+			host.disk("sdb").byID, host.disk("sdb").wwn, host.disk("sdb").serial = nil, "", ""
+			env := newDiskTestEnv(host, nil)
+			expect := elementalv1.InstallTargetExpect{SizeBytes: 2000 * gib, Model: "ST2000NM"}
+			target, err := env.resolve(installRequest{target: &elementalv1.InstallTarget{DeviceID: "unidentified:dev_sdb", Expect: expect}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(target.disk.path).To(Equal("/dev/sdb"))
+			Expect(target.requested).To(Equal("install-target unidentified:dev_sdb"))
+
+			expect.SizeBytes = 480 * gib
+			_, err = env.resolve(installRequest{target: &elementalv1.InstallTarget{DeviceID: "unidentified:dev_sdb", Expect: expect}})
+			Expect(reasonOf(err)).To(Equal(reasonTargetMismatch))
+		})
+
+		It("refuses the unidentified ID of a disk whose ID another device shares", func() {
+			host.disk("sdb").byID = nil
+			host.disk("sdb").wwn = host.disk("sda").wwn
+			env := newDiskTestEnv(host, nil)
+			_, err := env.resolve(installRequest{target: &elementalv1.InstallTarget{DeviceID: "unidentified:dev_sda"}})
+			Expect(reasonOf(err)).To(Equal(reasonTargetIneligible))
+			Expect(err.Error()).To(ContainSubstring("identity is shared with another device on this host"))
+		})
 	})
 
 	Context("device-selector", func() {

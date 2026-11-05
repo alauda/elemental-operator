@@ -36,9 +36,11 @@ type BlockDevice struct {
 	// mpath, raid1, ...
 	Type string
 	// ID is the canonical identity. It is empty when the device has none or
-	// shares it with another device on the host; IDProblem then says why.
+	// shares it with another device on the host; IDProblem then says why,
+	// and IDShared tells the second case.
 	ID          string
 	IDProblem   string
+	IDShared    bool
 	StablePaths []string
 	SizeBytes   int64
 	ReadOnly    bool
@@ -158,6 +160,7 @@ func (c *blockCollector) blockSnapshot() (*BlockSnapshot, error) {
 		case device.ID != "" && counts[device.ID] > 1:
 			device.ID = ""
 			device.IDProblem = "identity is shared with another device on this host"
+			device.IDShared = true
 		case device.ID == "":
 			device.IDProblem = unidentifiedReason(record.device, inventory.buses[path], inventory.probes[path])
 		}
@@ -270,7 +273,9 @@ func NormalizeDeviceID(id string) string {
 }
 
 // UnidentifiedDeviceID is the diagnostic ID reported for a device without a
-// canonical identity. Nothing can select a device by it.
+// canonical identity. It is derived from the kernel path, so it names the
+// device only in the boot that reported it: an install released in that live
+// boot is the one thing that selects a disk by it.
 func UnidentifiedDeviceID(path string) string {
 	return "unidentified:" + sanitizeDiagnosticID(path)
 }

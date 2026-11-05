@@ -433,6 +433,26 @@ func TestLiveInstallMatchesAHandWrittenID(t *testing.T) {
 	g.Expect(env.inventory("node-a").Status.Install.TargetDeviceID).To(Equal(diskA))
 }
 
+// A disk without a stable ID is released under the unidentified ID the host
+// reported: the selection holds for this live boot only, where the kernel
+// name it carries still names the same disk.
+func TestLiveInstallReleasesADiskWithoutAStableID(t *testing.T) {
+	g := NewWithT(t)
+	env := newInstallTestEnv(t, installEnvOptions{}, liveInventory("node-a"))
+	session := liveSession("boot-1")
+	session.Candidates = []elementalv1.InstallCandidate{{ID: "unidentified:dev_vda", Path: "/dev/vda", SizeBytes: 107374182400, Eligible: true}}
+	session.StaleSystemDisks = nil
+	env.hold(hostA.with(session))
+	env.selectDisk("node-a", "unidentified:dev_vda")
+
+	config, raw := env.config(hostA.with(session))
+	target := config.Elemental.InstallTarget
+	g.Expect(target).ToNot(BeNil(), raw)
+	g.Expect(target.DeviceID).To(Equal("unidentified:dev_vda"))
+	g.Expect(target.Expect).To(Equal(elementalv1.InstallTargetExpect{SizeBytes: 107374182400}))
+	g.Expect(env.inventory("node-a").Status.Install.TargetDeviceID).To(Equal("unidentified:dev_vda"))
+}
+
 func TestLiveInstallReleaseApprovesNoWipeBeyondTheList(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -484,9 +504,10 @@ func TestLiveInstallDiscardsInvalidSelection(t *testing.T) {
 		{name: "reported twice", pick: diskA, reason: elementalv1.TargetNotObservedReason, message: "reported 2 disks",
 			session: func(s *register.LiveInstallSession) { s.Candidates[1].ID = diskA }},
 		{name: "ineligible", pick: diskC, reason: elementalv1.TargetIneligibleReason, message: "removable"},
-		{name: "no stable ID", pick: "unidentified:sdd", reason: elementalv1.TargetIneligibleReason, message: "no stable ID",
+		{name: "ID shared with another device", pick: "unidentified:dev_sdd", reason: elementalv1.TargetIneligibleReason, message: "identity is shared",
 			session: func(s *register.LiveInstallSession) {
-				s.Candidates = append(s.Candidates, elementalv1.InstallCandidate{ID: "unidentified:sdd", Path: "/dev/sdd", Eligible: true})
+				s.Candidates = append(s.Candidates, elementalv1.InstallCandidate{ID: "unidentified:dev_sdd", Path: "/dev/sdd",
+					Reasons: []string{"no unique stable ID: identity is shared with another device on this host"}})
 			}},
 		{name: "allocated", pick: diskA, reason: elementalv1.TargetIneligibleReason, message: "baremetal.alauda.io/owner-machine=workers-0",
 			inventory: func(i *elementalv1.MachineInventory) {
