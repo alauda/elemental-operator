@@ -107,6 +107,30 @@ var _ = Describe("disk survey for the operator", Label("installer", "install", "
 		Expect(destructive(host.calls)).To(BeEmpty())
 	})
 
+	It("offers a disk without a stable ID under its unidentified ID", func() {
+		host.disks = append(host.disks, &fakeDisk{name: "vda", major: 252, size: 100 * gib})
+		env := newDiskTestEnv(host, nil)
+		candidates, _, err := env.inst.SurveyInstallDisks()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(candidates).To(ContainElement(elementalv1.InstallCandidate{ID: "unidentified:dev_vda", Path: "/dev/vda", SizeBytes: 100 * gib, Eligible: true}))
+	})
+
+	It("does not offer disks whose ID another device shares", func() {
+		path := sataDisk("sdc", 32, 2000, "5000c500000000b2")
+		path.byID = nil
+		host.disks = append(host.disks, path)
+		env := newDiskTestEnv(host, nil)
+		candidates, _, err := env.inst.SurveyInstallDisks()
+		Expect(err).NotTo(HaveOccurred())
+		for _, c := range candidates {
+			if c.Path == "/dev/sdb" || c.Path == "/dev/sdc" {
+				Expect(c.ID).To(HavePrefix("unidentified:"))
+				Expect(c.Eligible).To(BeFalse(), c.Path)
+				Expect(c.Reasons).To(ContainElement("no unique stable ID: identity is shared with another device on this host"), c.Path)
+			}
+		}
+	})
+
 	It("fails when the disks cannot be listed", func() {
 		host.missing = map[string]bool{"lsblk": true}
 		env := newDiskTestEnv(host, nil)

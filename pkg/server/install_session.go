@@ -421,16 +421,16 @@ func checkSelection(inventory *elementalv1.MachineInventory, session *register.L
 	default:
 		return nil, elementalv1.TargetNotObservedReason, fmt.Sprintf("live boot %s reported %d disks with this ID", session.BootID, len(matches))
 	}
+	// An unidentified: ID names the disk by its kernel path. The candidates
+	// are this registration's, and the release goes back to this live boot,
+	// where the path still names the same disk.
 	candidate := matches[0]
-	switch {
-	case !candidate.Eligible:
+	if !candidate.Eligible {
 		why := "the disk cannot be the install target"
 		if len(candidate.Reasons) > 0 {
 			why += ": " + strings.Join(candidate.Reasons, "; ")
 		}
 		return nil, elementalv1.TargetIneligibleReason, why
-	case strings.HasPrefix(id, "unidentified:"):
-		return nil, elementalv1.TargetIneligibleReason, "the disk has no stable ID"
 	}
 	if owners := allocationOf(inventory); owners != "" {
 		return nil, elementalv1.TargetIneligibleReason, fmt.Sprintf("the inventory is allocated (%s): an allocated host is never installed over", owners)

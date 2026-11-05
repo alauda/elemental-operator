@@ -131,8 +131,8 @@ type diskCandidate struct {
 	Transport   string
 	Rotational  bool
 	StaleSystem bool
-	// Eligible is set when the disk passes the safety gates, so it may be
-	// named as the target explicitly.
+	// Eligible is set when the disk passes the safety gates, so the operator
+	// may release an install to it by ID.
 	Eligible bool
 	Problems []string
 	// HasData lists what makes the disk look like someone's data;
@@ -170,6 +170,10 @@ func (i *installer) inspectInstallDisks(inv *diskInventory, target string, wipeI
 		if d.dev.Type != blockTypeDisk || d.virtual {
 			continue
 		}
+		problems := d.problems
+		if problem := d.sharedIDProblem(); problem != "" {
+			problems = append(append([]string(nil), problems...), problem)
+		}
 		survey.Candidates = append(survey.Candidates, diskCandidate{
 			ID:          d.displayID(),
 			Path:        d.path,
@@ -180,8 +184,8 @@ func (i *installer) inspectInstallDisks(inv *diskInventory, target string, wipeI
 			Transport:   d.dev.Transport,
 			Rotational:  d.dev.Rotational,
 			StaleSystem: d.layout.stale(),
-			Eligible:    len(d.problems) == 0,
-			Problems:    d.problems,
+			Eligible:    len(problems) == 0,
+			Problems:    problems,
 			HasData:     d.data,
 		})
 	}
