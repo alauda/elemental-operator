@@ -75,7 +75,12 @@ func NewConfigurator(fs vfs.FS) Configurator {
 	}
 }
 
+// GetNetworkConfigApplicator returns the yip config that puts the host's
+// NetworkManager profiles in place. Whatever configurator produced them, the
+// profiles are applied once and then left to the host; see applyOnce.
 func (c *configurator) GetNetworkConfigApplicator(networkConfig elementalv1.NetworkConfig) (schema.YipConfig, error) {
+	var applicator schema.YipConfig
+	var err error
 	switch networkConfig.Configurator {
 	case "":
 		return schema.YipConfig{}, nil
@@ -83,16 +88,20 @@ func (c *configurator) GetNetworkConfigApplicator(networkConfig elementalv1.Netw
 		return schema.YipConfig{}, nil
 	case ConfiguratorNmc:
 		nc := nmcConfigurator{fs: c.fs, runner: c.runner}
-		return nc.GetNetworkConfigApplicator(networkConfig)
+		applicator, err = nc.GetNetworkConfigApplicator(networkConfig)
 	case ConfiguratorNmstate:
 		nc := nmstateConfigurator{fs: c.fs, runner: c.runner}
-		return nc.GetNetworkConfigApplicator(networkConfig)
+		applicator, err = nc.GetNetworkConfigApplicator(networkConfig)
 	case ConfiguratorNmconnections:
 		nc := networkManagerConfigurator{fs: c.fs, runner: c.runner}
-		return nc.GetNetworkConfigApplicator(networkConfig)
+		applicator, err = nc.GetNetworkConfigApplicator(networkConfig)
 	default:
 		return schema.YipConfig{}, fmt.Errorf("using configurator '%s': %w", networkConfig.Configurator, ErrUnknownConfigurator)
 	}
+	if err != nil {
+		return applicator, err
+	}
+	return applyOnce(applicator), nil
 }
 
 // ResetNetworkConfig is a common reset procedure that works for all NetworkManager based installations.
@@ -108,6 +117,14 @@ func (c *configurator) GetNetworkConfigApplicator(networkConfig elementalv1.Netw
 // before the elemental-system-agent has time to recover from the connection change and confirm the application of the reset-trigger plan.
 // Potentially this can lead to an infinite reset loop.
 func (c *configurator) ResetNetworkConfig() error {
+	// Forget that a configuration was applied, so that the one written for
+	// the reset is applied on the next boot even when the reset keeps the
+	// persistent partition. Done before the check below, which returns early
+	// on a host that has no profile left.
+	if err := c.fs.Remove(appliedMarkerPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("deleting file '%s': %w", appliedMarkerPath, err)
+	}
+
 	// If there are no /etc/NetworkManager/system-connections/*.nmconnection files,
 	// then this is the second time we invoke this method, or we never configured any
 	// network config so we have nothing to do.
