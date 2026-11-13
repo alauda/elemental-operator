@@ -41,6 +41,8 @@ type fakeHost struct {
 	stuck map[string]bool
 	// missing lists commands that are not installed.
 	missing map[string]bool
+	// settled runs on every `udevadm settle`.
+	settled func()
 	calls   [][]string
 }
 
@@ -286,7 +288,11 @@ func (h *fakeHost) Output(name string, args ...string) ([]byte, error) {
 		if d := h.byPath(last); d != nil && !h.stuck[last] && d.pttype == "" {
 			d.partitions = nil
 		}
-	case name == "dd", name == "udevadm":
+	case name == "udevadm":
+		if len(args) > 0 && args[0] == "settle" && h.settled != nil {
+			h.settled()
+		}
+	case name == "dd":
 	default:
 		return nil, fmt.Errorf("fake host: unexpected command %s %s", name, strings.Join(args, " "))
 	}
