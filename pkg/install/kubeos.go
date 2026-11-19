@@ -233,6 +233,16 @@ func (i *installer) InstallKubeOS(config elementalv1.Config, state register.Stat
 	if runErr != nil {
 		return fmt.Errorf("kbimg install disk failed: %w", runErr)
 	}
+	// kbimg runs mkfs right after parted without waiting for udev. When udev
+	// probes a partition while mkfs is still writing it, the udev database
+	// keeps that partition without a filesystem, and nothing later in kbimg
+	// makes udev look again: ROOT-A is on the disk but lsblk does not list it.
+	// The checks below and the PERSIST copy all find partitions through lsblk,
+	// so refresh the database first. A failure here is only logged: the
+	// checks still decide whether the install is good.
+	if err := i.settleBlockDevices(); err != nil {
+		log.Warningf("refreshing udev before checking %s: %v", device, err)
+	}
 	if err := i.verifyKubeOSInstall(device, out); err != nil {
 		return err
 	}

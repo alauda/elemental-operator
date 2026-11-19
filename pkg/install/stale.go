@@ -231,12 +231,23 @@ func (i *installer) wipeInstallDisks(plan *diskPlan) ([]*diskFacts, error) {
 			return nil, &installDiskError{Reason: reasonWipeFailed, Message: fmt.Sprintf("wiping %s: %v", d.path, err), Stale: plan.survey.Stale}
 		}
 	}
-	for _, args := range [][]string{{"trigger", "--subsystem-match=block"}, {"settle"}} {
-		if err := i.runDiskCommand("udevadm", args...); err != nil {
-			return nil, &installDiskError{Reason: reasonWipeFailed, Message: err.Error(), Stale: plan.survey.Stale}
-		}
+	if err := i.settleBlockDevices(); err != nil {
+		return nil, &installDiskError{Reason: reasonWipeFailed, Message: err.Error(), Stale: plan.survey.Stale}
 	}
 	return disks, nil
+}
+
+// settleBlockDevices has udev probe every block device again and waits for
+// it to finish. lsblk reads labels and filesystem types from the udev
+// database, not from the disk, so after a tool rewrote partitions without
+// waiting for udev, that database can still describe them as they were.
+func (i *installer) settleBlockDevices() error {
+	for _, args := range [][]string{{"trigger", "--subsystem-match=block"}, {"settle"}} {
+		if err := i.runDiskCommand("udevadm", args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // wipeDisk removes every signature from a disk and its partitions, the

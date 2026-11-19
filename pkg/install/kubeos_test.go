@@ -285,12 +285,14 @@ var _ = Describe("installer install kubeos", Label("installer", "install", "kube
 			}
 			names = append(names, c[0])
 		}
-		Expect(names).To(Equal([]string{"skopeo", "kbimg", "lsblk", "grubcheck", "persist", "eject", "systemctl"}))
+		Expect(names).To(Equal([]string{"skopeo", "kbimg", "udevadm", "udevadm", "lsblk", "grubcheck", "persist", "eject", "systemctl"}))
 		Expect(calls[0]).To(Equal([]string{"skopeo", "inspect", "--raw", "docker://reg.internal/tkestack/kubeos-rootfs:alaudaos-44.ku.1-0.x86_64"}))
 		Expect(calls[1][2]).To(ContainSubstring("yes | kbimg install disk"))
 		Expect(calls[1]).To(ContainElement("/tmp/elemental/kubeos/kbimg.toml"))
-		Expect(calls[2]).To(Equal([]string{"lsblk", "-rno", "LABEL", "/dev/sda"}))
-		Expect(calls[6]).To(Equal([]string{"systemctl", "reboot"}))
+		Expect(calls[2]).To(Equal([]string{"udevadm", "trigger", "--subsystem-match=block"}))
+		Expect(calls[3]).To(Equal([]string{"udevadm", "settle"}))
+		Expect(calls[4]).To(Equal([]string{"lsblk", "-rno", "LABEL", "/dev/sda"}))
+		Expect(calls[8]).To(Equal([]string{"systemctl", "reboot"}))
 	})
 
 	It("pulls through the install registry and keeps it out of the installed system", func() {
@@ -365,6 +367,36 @@ insecure = true
 		runner.results["kbimg"] = fakeResult{out: "ERROR kbimg: rootfs.tar: Cannot open\n"}
 		err := inst.InstallKubeOS(config, stateFixture, networkConfigFixture)
 		Expect(err).To(MatchError(ContainSubstring("never printed")))
+		Expect(runner.called("systemctl")).To(BeFalse())
+	})
+
+	It("has udev look at the disk again before trusting lsblk", func() {
+		// kbimg formats ROOT-A while udev is still busy with the events of its
+		// parted calls; until udev probes the disk again, lsblk lists no label
+		// for that partition although ROOT-A is on the disk.
+		installed := false
+		runner.results["kbimg"] = fakeResult{out: healthyResults()["kbimg"].out, do: func() { installed = true }}
+		runner.results["lsblk"] = fakeResult{out: "BOOT\n\nROOT-B\nPERSIST\n"}
+		host.settled = func() {
+			if installed {
+				runner.results["lsblk"] = healthyResults()["lsblk"]
+			}
+		}
+		Expect(inst.InstallKubeOS(config, stateFixture, networkConfigFixture)).To(Succeed())
+		Expect(runner.calls[len(runner.calls)-1]).To(Equal([]string{"systemctl", "reboot"}))
+	})
+
+	It("goes on to the checks when udev cannot be refreshed", func() {
+		host.missing = map[string]bool{"udevadm": true}
+		Expect(inst.InstallKubeOS(config, stateFixture, networkConfigFixture)).To(Succeed())
+		Expect(runner.called("systemctl")).To(BeTrue())
+	})
+
+	It("leaves the verdict to the checks when udev cannot be refreshed", func() {
+		host.missing = map[string]bool{"udevadm": true}
+		runner.results["lsblk"] = fakeResult{out: "BOOT\n\nROOT-B\nPERSIST\n"}
+		err := inst.InstallKubeOS(config, stateFixture, networkConfigFixture)
+		Expect(err).To(MatchError(ContainSubstring("partition ROOT-A not found on /dev/sda")))
 		Expect(runner.called("systemctl")).To(BeFalse())
 	})
 
@@ -522,6 +554,7 @@ insecure = true
 			Expect(order).To(Equal([]string{
 				"skopeo", "blockdev --rereadpt /dev/nvme0n1", "blockdev --rereadpt /dev/sda",
 				"udevadm trigger --subsystem-match=block", "udevadm settle", "kbimg",
+				"udevadm trigger --subsystem-match=block", "udevadm settle",
 			}))
 			Expect(destructive(runner.calls)).To(ContainElements(
 				"wipefs --all --force /dev/nvme0n1p1", "wipefs --all --force /dev/nvme0n1p4",
