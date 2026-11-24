@@ -78,20 +78,20 @@ func TestAddInstallRegistry(t *testing.T) {
 
 	t.Run("no system-uri", func(t *testing.T) {
 		config := kubeosConfig("", false)
-		if err := server.addInstallRegistry(kubeosRegistration(nil, false), config); err != nil || config.Elemental.InstallRegistry != nil {
+		if err := server.addInstallRegistry(kubeosRegistration(nil, false), nil, config); err != nil || config.Elemental.InstallRegistry != nil {
 			t.Fatalf("an install that pulls nothing got the registry: %v %+v", err, config.Elemental.InstallRegistry)
 		}
 	})
 	t.Run("inventory mode before the release", func(t *testing.T) {
 		config := kubeosConfig(logical, false)
-		if err := server.addInstallRegistry(kubeosRegistration(nil, true), config); err != nil || config.Elemental.InstallRegistry != nil {
+		if err := server.addInstallRegistry(kubeosRegistration(nil, true), nil, config); err != nil || config.Elemental.InstallRegistry != nil {
 			t.Fatalf("a configuration that releases no install got the registry: %v %+v", err, config.Elemental.InstallRegistry)
 		}
 	})
 	for name, inventory := range map[string]bool{"inventory mode release": true, "immediate install": false} {
 		t.Run(name, func(t *testing.T) {
 			config := kubeosConfig("docker://"+logical, inventory)
-			if err := server.addInstallRegistry(kubeosRegistration(nil, inventory), config); err != nil {
+			if err := server.addInstallRegistry(kubeosRegistration(nil, inventory), nil, config); err != nil {
 				t.Fatal(err)
 			}
 			reg := config.Elemental.InstallRegistry
@@ -105,7 +105,7 @@ func TestAddInstallRegistry(t *testing.T) {
 	}
 	t.Run("named credential that does not exist fails the configuration", func(t *testing.T) {
 		config := kubeosConfig(logical, false)
-		err := server.addInstallRegistry(kubeosRegistration(map[string]string{"cpaas.io/registry-reference": "team-registry"}, false), config)
+		err := server.addInstallRegistry(kubeosRegistration(map[string]string{"cpaas.io/registry-reference": "team-registry"}, false), nil, config)
 		if err == nil || !strings.Contains(err.Error(), "team-registry") || config.Elemental.InstallRegistry != nil {
 			t.Fatalf("addInstallRegistry() = %v, registry %+v", err, config.Elemental.InstallRegistry)
 		}
@@ -116,15 +116,108 @@ func TestAddInstallRegistryWithoutMirrorInput(t *testing.T) {
 	server := installRegistryServer()
 	t.Run("logical system-uri fails the configuration", func(t *testing.T) {
 		config := kubeosConfig("cpaas-registry.cpaas-system/tkestack/kubeos-rootfs:v1", false)
-		err := server.addInstallRegistry(kubeosRegistration(nil, false), config)
+		err := server.addInstallRegistry(kubeosRegistration(nil, false), nil, config)
 		if err == nil || !strings.Contains(err.Error(), "no registry mirror input") || config.Elemental.InstallRegistry != nil {
 			t.Fatalf("addInstallRegistry() = %v, registry %+v", err, config.Elemental.InstallRegistry)
 		}
 	})
 	t.Run("real system-uri installs without a mirror", func(t *testing.T) {
 		config := kubeosConfig("registry.example.com/tkestack/kubeos-rootfs:v1", false)
-		if err := server.addInstallRegistry(kubeosRegistration(nil, false), config); err != nil || config.Elemental.InstallRegistry != nil {
+		if err := server.addInstallRegistry(kubeosRegistration(nil, false), nil, config); err != nil || config.Elemental.InstallRegistry != nil {
 			t.Fatalf("addInstallRegistry() = %v, registry %+v", err, config.Elemental.InstallRegistry)
 		}
 	})
+}
+
+// teamRegistryObjects is CloudCredential team-registry, a one-endpoint
+// registry mirror input with its credential Secret.
+func teamRegistryObjects(namespace string) []client.Object {
+	body, _ := json.Marshal(map[string]any{
+		"schemaVersion": "v1", "mode": "mirror", "source": "cpaas-registry.cpaas-system",
+		"endpoints":            []string{"team.example.com:5000"},
+		"credentialsSecretRef": map[string]string{"name": "team-registry-auth"},
+	})
+	return []client.Object{
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "team-registry", Labels: map[string]string{"capi.cpaas.io/provider": "registry-credential"}},
+			Type: corev1.SecretType("CloudCredential"), Data: map[string][]byte{"config.json": body}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "team-registry-auth"}, Type: corev1.SecretTypeDockerConfigJson,
+			Data: map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{"team.example.com:5000":{"auth":"dGVhbTp6"}}}`)}},
+	}
+}
+
+func inventoryWithLabels(labels map[string]string) *elementalv1.MachineInventory {
+	return &elementalv1.MachineInventory{ObjectMeta: metav1.ObjectMeta{Namespace: "fleet-default", Name: "node-a", Labels: labels}}
+}
+
+// The cpaas.io/registry-reference label of the MachineInventory selects the
+// registry of its host's install over the one of the MachineRegistration.
+func TestAddInstallRegistryInventoryLabelWins(t *testing.T) {
+	const systemURI = "team.example.com:5000/tkestack/baremetal-base-image:v1"
+	server := installRegistryServer(append(defaultRegistryObjects("fleet-default"), teamRegistryObjects("fleet-default")...)...)
+	team := map[string]string{"cpaas.io/registry-reference": "team-registry"}
+
+	for _, tc := range []struct {
+		name         string
+		registration map[string]string
+		inventory    map[string]string
+		endpoints    string
+		auth         string
+	}{
+		{name: "registration default", endpoints: "harbor.example.com:11443,backup.example.com", auth: "cm9ib3Q6eA=="},
+		{name: "registration label", registration: team, endpoints: "team.example.com:5000", auth: "dGVhbTp6"},
+		{name: "inventory label over the default", inventory: team, endpoints: "team.example.com:5000", auth: "dGVhbTp6"},
+		{name: "inventory label over the registration label", registration: map[string]string{"cpaas.io/registry-reference": "missing"}, inventory: team, endpoints: "team.example.com:5000", auth: "dGVhbTp6"},
+		{name: "empty inventory label selects the default", registration: team, inventory: map[string]string{"cpaas.io/registry-reference": ""}, endpoints: "harbor.example.com:11443,backup.example.com", auth: "cm9ib3Q6eA=="},
+		{name: "other inventory labels do not count", registration: team, inventory: map[string]string{"pool": "a"}, endpoints: "team.example.com:5000", auth: "dGVhbTp6"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := kubeosConfig(systemURI, false)
+			if err := server.addInstallRegistry(kubeosRegistration(tc.registration, false), inventoryWithLabels(tc.inventory), config); err != nil {
+				t.Fatal(err)
+			}
+			reg := config.Elemental.InstallRegistry
+			if reg == nil || strings.Join(reg.Endpoints, ",") != tc.endpoints || !strings.Contains(reg.DockerConfig, tc.auth) {
+				t.Fatalf("registry = %+v, want endpoints %s with auth %s", reg, tc.endpoints, tc.auth)
+			}
+		})
+	}
+	t.Run("a wrong inventory label names the inventory", func(t *testing.T) {
+		config := kubeosConfig(systemURI, false)
+		err := server.addInstallRegistry(kubeosRegistration(team, false), inventoryWithLabels(map[string]string{"cpaas.io/registry-reference": "missing"}), config)
+		if err == nil || !strings.Contains(err.Error(), "MachineInventory fleet-default/node-a") || !strings.Contains(err.Error(), "missing") {
+			t.Fatalf("addInstallRegistry() = %v", err)
+		}
+	})
+}
+
+func TestInstallOfTakesTheInventorySystemURI(t *testing.T) {
+	registration := kubeosRegistration(nil, true)
+	registration.Spec.Config.Elemental.Install.SystemURI = "harbor.example.com:11443/tkestack/baremetal-base-image:v1"
+	registration.Spec.Config.Elemental.Install.Snapshotter = elementalv1.SnapshotterConfig{Type: "btrfs", MaxSnaps: 4}
+
+	for _, tc := range []struct {
+		name    string
+		install *elementalv1.MachineInventoryInstall
+		want    string
+	}{
+		{name: "no spec.install", want: "harbor.example.com:11443/tkestack/baremetal-base-image:v1"},
+		{name: "empty system-uri", install: &elementalv1.MachineInventoryInstall{SystemURI: "  "}, want: "harbor.example.com:11443/tkestack/baremetal-base-image:v1"},
+		{name: "override", install: &elementalv1.MachineInventoryInstall{SystemURI: " team.example.com:5000/tkestack/baremetal-base-image:v1 "}, want: "team.example.com:5000/tkestack/baremetal-base-image:v1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inventory := inventoryWithLabels(nil)
+			inventory.Spec.Install = tc.install
+			install := installOf(registration, inventory)
+			if install.SystemURI != tc.want {
+				t.Fatalf("system-uri = %q, want %q", install.SystemURI, tc.want)
+			}
+			// Nothing else of the registration's install changes.
+			if install.Snapshotter != registration.Spec.Config.Elemental.Install.Snapshotter || install.DeviceSelection != elementalv1.DeviceSelectionInventory {
+				t.Fatalf("install = %+v", install)
+			}
+		})
+	}
+	if registration.Spec.Config.Elemental.Install.SystemURI != "harbor.example.com:11443/tkestack/baremetal-base-image:v1" {
+		t.Fatalf("installOf changed the registration: %q", registration.Spec.Config.Elemental.Install.SystemURI)
+	}
 }

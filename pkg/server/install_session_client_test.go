@@ -114,10 +114,10 @@ func TestLiveInstallWithTheRegisterClient(t *testing.T) {
 		NewWithT(t).Expect(cl.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: name}, found)).To(Succeed())
 		return found
 	}
-	selectDisk := func(id string) {
+	annotate := func(key, value string) {
 		t.Helper()
 		found := inventory()
-		found.Annotations[elementalv1.InstallTargetDeviceAnnotation] = id
+		found.Annotations[key] = value
 		NewWithT(t).Expect(cl.Update(context.Background(), found)).To(Succeed())
 	}
 
@@ -164,8 +164,12 @@ func TestLiveInstallWithTheRegisterClient(t *testing.T) {
 	})
 	g.Expect(cl.Status().Update(context.Background(), stored)).To(Succeed())
 
-	// A person picks a disk: the next round releases the install to it.
-	selectDisk(diskA)
+	// A person picks a disk: the host waits for the approval.
+	annotate(elementalv1.InstallTargetDeviceAnnotation, diskA)
+	_, err = liveRound()
+	g.Expect(held(err).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+	// The approval releases the install on the next round.
+	annotate(elementalv1.InstallApprovedAnnotation, "true")
 	config := released(liveRound())
 	g.Expect(config.Elemental.Install.Device).To(BeEmpty())
 	g.Expect(config.Elemental.InstallTarget).ToNot(BeNil())
@@ -183,11 +187,12 @@ func TestLiveInstallWithTheRegisterClient(t *testing.T) {
 	g.Expect(meta.FindStatusCondition(stored.Status.Conditions, elementalv1.StaleSystemDisksCondition)).To(
 		HaveField("Reason", elementalv1.WipeFailedReason))
 
-	// elemental-register starts over in the same boot and waits again.
+	// elemental-register starts over in the same boot and waits again: the
+	// disk stays selected, the approval was used up.
 	_, err = liveRound()
-	g.Expect(held(err).Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	g.Expect(held(err).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
 	g.Expect(inventory().Status.Install.Message).To(ContainSubstring("the last install attempt in this live boot failed"))
-	selectDisk(diskA)
+	annotate(elementalv1.InstallApprovedAnnotation, "true")
 	config = released(liveRound())
 	g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
 
@@ -201,7 +206,7 @@ func TestLiveInstallWithTheRegisterClient(t *testing.T) {
 	registered := state.InitialRegistration
 	session = liveSession("boot-2")
 	_, err = liveRound()
-	g.Expect(held(err).Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	g.Expect(held(err).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
 	g.Expect(inventory().Status.Install.Message).To(HavePrefix("the host booted the live ISO again after the install to " + diskA + " completed"))
 	state.InitialRegistration = registered
 
@@ -213,4 +218,5 @@ func TestLiveInstallWithTheRegisterClient(t *testing.T) {
 	stored = inventory()
 	g.Expect(stored.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseInstalled))
 	g.Expect(stored.Status.Install.TargetDeviceID).To(Equal(diskA))
+	g.Expect(stored.Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
 }

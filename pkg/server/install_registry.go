@@ -26,15 +26,16 @@ import (
 )
 
 // addInstallRegistry gives an install that pulls its system image
-// (install.system-uri, the KubeOS live install) the registry mirror input the
-// MachineRegistration selects: the CloudCredential named by its
-// cpaas.io/registry-reference label, public-registry-credential by default.
+// (install.system-uri, by the toolkit or the KubeOS live install) the
+// registry mirror input the host's cpaas.io/registry-reference label selects:
+// the MachineInventory's when it has the label, else the
+// MachineRegistration's, public-registry-credential when neither names one.
 // Only a configuration that starts an install carries it: in inventory mode
 // the one that releases the host, otherwise every one, since the host
 // installs on its first configuration. Invalid input, or a system-uri under
 // the logical registry with no mirror input to pull it through, fails the
 // configuration, so the host does not install and registers again.
-func (i *InventoryServer) addInstallRegistry(registration *elementalv1.MachineRegistration, config *elementalv1.Config) error {
+func (i *InventoryServer) addInstallRegistry(registration *elementalv1.MachineRegistration, inventory *elementalv1.MachineInventory, config *elementalv1.Config) error {
 	systemURI := config.Elemental.Install.SystemURI
 	if systemURI == "" {
 		return nil
@@ -42,14 +43,15 @@ func (i *InventoryServer) addInstallRegistry(registration *elementalv1.MachineRe
 	if inventoryMode(registration) && config.Elemental.InstallTarget == nil {
 		return nil
 	}
-	access, err := registryaccess.ResolveDefault(i, i.Client, registration.Namespace, registration.Labels)
+	selection := registrySelectionOf(registration, inventory)
+	access, err := registryaccess.ResolveDefault(i, i.Client, registration.Namespace, selection.labels)
 	if err != nil {
-		return fmt.Errorf("MachineRegistration %s/%s: registry mirror input: %w", registration.Namespace, registration.Name, err)
+		return fmt.Errorf("%s: registry mirror input: %w", selection.owner, err)
 	}
 	if access == nil {
 		if pullsLogicalRegistry(systemURI) {
-			return fmt.Errorf("MachineRegistration %s/%s: system-uri %s is under %s, but no registry mirror input exists (%s, or %s on a bootstrap cluster)",
-				registration.Namespace, registration.Name, systemURI, registryaccess.LogicalRegistry, registryaccess.DefaultCredential, registryaccess.PreparedInput)
+			return fmt.Errorf("%s: system-uri %s is under %s, but no registry mirror input exists (%s, or %s on a bootstrap cluster)",
+				selection.owner, systemURI, registryaccess.LogicalRegistry, registryaccess.DefaultCredential, registryaccess.PreparedInput)
 		}
 		return nil
 	}
@@ -62,7 +64,7 @@ func (i *InventoryServer) addInstallRegistry(registration *elementalv1.MachineRe
 		Endpoints:    append([]string(nil), access.Endpoints...),
 		DockerConfig: string(doc),
 	}
-	log.Debugf("Install of MachineRegistration %s/%s pulls through %s", registration.Namespace, registration.Name, access.String())
+	log.Debugf("Install of %s pulls through %s", selection.owner, access.String())
 	return nil
 }
 
