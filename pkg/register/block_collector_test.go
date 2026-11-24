@@ -222,14 +222,17 @@ func TestForkProtocolMessageNumbers(t *testing.T) {
 		MsgLiveInstallSession:    16,
 		MsgInstallHold:           17,
 		MsgInstallReport:         18,
+		// A protocol level only: the operator holds a toolkit install from
+		// a system-uri for registers below it.
+		MsgToolkitInstallRegistry: 19,
 	}
 	for msg, number := range want {
 		if byte(msg) != number {
 			t.Errorf("%s = %d, want %d", msg, byte(msg), number)
 		}
 	}
-	if MsgLast != MsgInstallReport {
-		t.Errorf("MsgLast = %d, want %d", MsgLast, MsgInstallReport)
+	if MsgLast != MsgToolkitInstallRegistry {
+		t.Errorf("MsgLast = %d, want %d", MsgLast, MsgToolkitInstallRegistry)
 	}
 	// 14 and 15 carried the removed storage observer. Peers of older releases
 	// may still send them, so no message may ever be given those numbers again.

@@ -33,23 +33,30 @@ const (
 	MsgReady
 	MsgSmbios
 	MsgLabels
-	MsgGet                                      // v0.5.0
-	MsgVersion                                  // v1.1.0
-	MsgSystemData                               // v1.1.1 deprecated by MsgSystemDataV2
-	MsgConfig                                   // v1.1.1
-	MsgError                                    // v1.1.1
-	MsgAnnotations                              // v1.1.4
-	MsgUpdate                                   // v1.2.6
-	MsgSystemDataV2                             // v1.6.0
-	MsgNetworkConfig                            // v1.7.0
-	MsgObservedNetworkConfig                    // Alauda fork: live-ISO observed network snapshot
-	_                                           // Alauda fork: reserved, was the storage observer report
-	_                                           // Alauda fork: reserved, was the storage observer session
-	MsgLiveInstallSession                       // Alauda fork: live-ISO install session (boot, installer, disks)
-	MsgInstallHold                              // Alauda fork: MsgGet reply while no install target was chosen
-	MsgInstallReport                            // Alauda fork: install outcome of a released host
-	MsgLast                  = MsgInstallReport // MsgLast must point to the last message
+	MsgGet                                                // v0.5.0
+	MsgVersion                                            // v1.1.0
+	MsgSystemData                                         // v1.1.1 deprecated by MsgSystemDataV2
+	MsgConfig                                             // v1.1.1
+	MsgError                                              // v1.1.1
+	MsgAnnotations                                        // v1.1.4
+	MsgUpdate                                             // v1.2.6
+	MsgSystemDataV2                                       // v1.6.0
+	MsgNetworkConfig                                      // v1.7.0
+	MsgObservedNetworkConfig                              // Alauda fork: live-ISO observed network snapshot
+	_                                                     // Alauda fork: reserved, was the storage observer report
+	_                                                     // Alauda fork: reserved, was the storage observer session
+	MsgLiveInstallSession                                 // Alauda fork: live-ISO install session (boot, installer, disks)
+	MsgInstallHold                                        // Alauda fork: MsgGet reply while no install target was chosen
+	MsgInstallReport                                      // Alauda fork: install outcome of a released host
+	MsgToolkitInstallRegistry                             // Alauda fork: protocol level only, never sent (see below)
+	MsgLast                   = MsgToolkitInstallRegistry // MsgLast must point to the last message
 )
+
+// MsgToolkitInstallRegistry is a protocol level, not a message: a client at
+// it or later pulls the system-uri of a toolkit install through the
+// install-registry the operator sends and checks that the image can be pulled
+// before it touches a disk. The operator releases no such install to an older
+// client, whose toolkit would partition the disk before it fails to pull.
 
 func (mt MessageType) String() string {
 	switch mt {
@@ -87,6 +94,8 @@ func (mt MessageType) String() string {
 		return "InstallHold"
 	case MsgInstallReport:
 		return "InstallReport"
+	case MsgToolkitInstallRegistry:
+		return "ToolkitInstallRegistry"
 	default:
 		return "Unknown"
 	}

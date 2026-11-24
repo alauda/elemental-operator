@@ -29,8 +29,23 @@ import (
 
 const TempCloudInitDir = "/tmp/elemental/cloud-init"
 
+// dockerConfigEnv names the directory go-containerregistry, which the toolkit
+// pulls images with, reads config.json from.
+const dockerConfigEnv = "DOCKER_CONFIG"
+
+// InstallOptions are what elemental install needs beyond the install section
+// of the configuration. The zero value runs it as before.
+type InstallOptions struct {
+	// DockerConfig is the directory set as DOCKER_CONFIG for the install:
+	// the registry credentials the toolkit pulls install.system-uri with.
+	DockerConfig string
+	// SkipTLSVerify passes --tls-verify=false: the toolkit does not verify
+	// the certificate of the registry it pulls install.system-uri from.
+	SkipTLSVerify bool
+}
+
 type Runner interface {
-	Install(elementalv1.Install) error
+	Install(elementalv1.Install, InstallOptions) error
 	Reset(elementalv1.Reset) error
 }
 
@@ -42,21 +57,10 @@ var _ Runner = (*runner)(nil)
 
 type runner struct{}
 
-func (r *runner) Install(conf elementalv1.Install) error {
-	installerOpts := []string{"elemental"}
-	// There are no env var bindings in elemental-cli for elemental root options
-	// so root flags should be passed within the command line
-	if conf.Debug {
-		installerOpts = append(installerOpts, "--debug")
-	}
-
-	if conf.ConfigDir != "" {
-		installerOpts = append(installerOpts, "--config-dir", conf.ConfigDir)
-	}
-	installerOpts = append(installerOpts, "install")
-
+func (r *runner) Install(conf elementalv1.Install, opts InstallOptions) error {
+	installerOpts := installArgs(conf, opts)
 	cmd := exec.Command("elemental")
-	environmentVariables := mapToInstallEnv(conf)
+	environmentVariables := installEnv(conf, opts)
 	cmd.Env = append(os.Environ(), environmentVariables...)
 	cmd.Stdout = os.Stdout
 	cmd.Args = installerOpts
@@ -86,11 +90,48 @@ func (r *runner) Reset(conf elementalv1.Reset) error {
 	return cmd.Run()
 }
 
+// installArgs is the elemental install command line.
+func installArgs(conf elementalv1.Install, opts InstallOptions) []string {
+	installerOpts := []string{"elemental"}
+	// There are no env var bindings in elemental-cli for elemental root options
+	// so root flags should be passed within the command line
+	if conf.Debug {
+		installerOpts = append(installerOpts, "--debug")
+	}
+
+	if conf.ConfigDir != "" {
+		installerOpts = append(installerOpts, "--config-dir", conf.ConfigDir)
+	}
+	installerOpts = append(installerOpts, "install")
+	// The registry TLS policy has no environment variable.
+	if opts.SkipTLSVerify {
+		installerOpts = append(installerOpts, "--tls-verify=false")
+	}
+	return installerOpts
+}
+
+// installEnv is the environment elemental install runs with on top of the
+// register's own: later entries win over the inherited ones.
+func installEnv(conf elementalv1.Install, opts InstallOptions) []string {
+	variables := mapToInstallEnv(conf)
+	if opts.DockerConfig != "" {
+		variables = append(variables, formatEV(dockerConfigEnv, opts.DockerConfig))
+	}
+	return variables
+}
+
 func mapToInstallEnv(conf elementalv1.Install) []string {
 	var variables []string
 	// See GetInstallKeyEnvMap() in https://github.com/rancher/elemental-toolkit/blob/main/pkg/constants/constants.go
 	variables = append(variables, formatEV("ELEMENTAL_INSTALL_TARGET", conf.Device))
 	variables = append(variables, formatEV("ELEMENTAL_INSTALL_SYSTEM", conf.SystemURI))
+	// The toolkit sets the recovery source to the live system before it
+	// reads the environment, so a system-uri alone would put the live system
+	// on the recovery partition. The same source makes it snapshot the
+	// installed system instead of pulling the image a second time.
+	if conf.SystemURI != "" {
+		variables = append(variables, formatEV("ELEMENTAL_INSTALL_RECOVERY_SYSTEM", conf.SystemURI))
+	}
 	variables = append(variables, formatEV("ELEMENTAL_INSTALL_FIRMWARE", conf.Firmware))
 	variables = append(variables, formatEV("ELEMENTAL_INSTALL_ISO", conf.ISO))
 	variables = append(variables, formatEV("ELEMENTAL_INSTALL_TTY", conf.TTY))

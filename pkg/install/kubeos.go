@@ -33,7 +33,6 @@ import (
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 	"github.com/rancher/elemental-operator/pkg/log"
 	"github.com/rancher/elemental-operator/pkg/register"
-	"github.com/rancher/elemental-operator/pkg/registryaccess"
 )
 
 // KubeOS install backend.
@@ -396,13 +395,8 @@ func (i *installer) useKubeOSInstallRegistry(reg *elementalv1.InstallRegistry) (
 	if reg == nil {
 		return func() {}, nil
 	}
-	if reg.Source == "" || len(reg.Endpoints) == 0 {
-		return nil, errors.New("install-registry needs a source and endpoints")
-	}
-	for _, endpoint := range append([]string{reg.Source}, reg.Endpoints...) {
-		if !registryaccess.ValidEndpoint(endpoint) {
-			return nil, fmt.Errorf("install-registry names an invalid registry %q", endpoint)
-		}
+	if err := validateInstallRegistry(reg); err != nil {
+		return nil, err
 	}
 	var conf strings.Builder
 	conf.WriteString("# Written by elemental-register: the registry mirror of this install.\n")
