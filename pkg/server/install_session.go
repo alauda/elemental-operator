@@ -875,13 +875,20 @@ func (i *InventoryServer) discardAnnotation(inventory *elementalv1.MachineInvent
 // set for a registration update, i.e. a host with registration state: an
 // installed system. Only such a host also ends a wait for an install target,
 // as when the installation media stayed attached and the host went back to
-// the live ISO once before someone booted it from its disk.
+// the live ISO once before someone booted it from its disk. Its registration
+// also removes the selection when the install already reported itself
+// Installed, the usual way an install ends: the selection is not consumed by
+// the release, so nothing else would.
 func (i *InventoryServer) settleInstall(inventory *elementalv1.MachineInventory, registered bool) {
-	if !installUnsettled(inventory.Status.Install, registered) {
+	unsettled := installUnsettled(inventory.Status.Install, registered)
+	if !unsettled && !registered {
 		return
 	}
 	if err := i.removeAnnotations(inventory, installGateAnnotations...); err != nil {
 		log.Warningf("Cannot remove %s from MachineInventory %s/%s: %v", strings.Join(installGateAnnotations, " and "), inventory.Namespace, inventory.Name, err)
+	}
+	if !unsettled {
+		return
 	}
 	now := i.now()
 	err := i.patchInstallStatus(inventory, func(status *elementalv1.MachineInventoryStatus) bool {

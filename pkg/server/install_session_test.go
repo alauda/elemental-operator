@@ -865,6 +865,31 @@ func TestInstalledSystemSettlesTheInstall(t *testing.T) {
 		g.Expect(meta.FindStatusCondition(stored.Status.Conditions, elementalv1.InstallTargetReadyCondition)).To(BeNil())
 		g.Expect(meta.FindStatusCondition(stored.Status.Conditions, elementalv1.StaleSystemDisksCondition)).To(BeNil())
 	})
+	// The usual end of an install: the host reported it Installed before it
+	// rebooted, then the installed system registers. The selection, which
+	// the release did not consume, goes; the status is already final.
+	t.Run("an installed system removes the selection after a reported install", func(t *testing.T) {
+		g := NewWithT(t)
+		inventory := liveInventory("node-a")
+		inventory.Status.Install = &elementalv1.InstallStatus{Phase: elementalv1.InstallPhaseInstalled, BootID: "boot-1", TargetDeviceID: diskA}
+		inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation] = diskA
+		env := newInstallTestEnv(t, installEnvOptions{}, inventory)
+
+		env.config(liveHost{auth: hostA.auth, update: true})
+		stored := env.inventory("node-a")
+		g.Expect(stored.Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+		g.Expect(stored.Status.Install).To(Equal(inventory.Status.Install))
+	})
+	t.Run("a registration without state leaves a reported install alone", func(t *testing.T) {
+		g := NewWithT(t)
+		inventory := liveInventory("node-a")
+		inventory.Status.Install = &elementalv1.InstallStatus{Phase: elementalv1.InstallPhaseInstalled, BootID: "boot-1", TargetDeviceID: diskA}
+		inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation] = diskA
+		env := newInstallTestEnv(t, installEnvOptions{}, inventory)
+
+		env.config(hostA)
+		g.Expect(env.inventory("node-a").Annotations).To(HaveKeyWithValue(elementalv1.InstallTargetDeviceAnnotation, diskA))
+	})
 	t.Run("an install awaiting a target is left alone", func(t *testing.T) {
 		g := NewWithT(t)
 		inventory := liveInventory("node-a")
