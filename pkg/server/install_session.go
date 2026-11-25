@@ -38,6 +38,7 @@ import (
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 	"github.com/rancher/elemental-operator/pkg/log"
 	"github.com/rancher/elemental-operator/pkg/register"
+	"github.com/rancher/elemental-operator/pkg/registryaccess"
 )
 
 // Live install sessions: with install.device-selection: inventory, a host
@@ -375,7 +376,34 @@ func (i *InventoryServer) installFromSelection(conn *websocket.Conn, protoVersio
 		return i.holdInstall(conn, round, reason,
 			discardedApproval(approval, problem)+"; "+keptSelection(selection), register.DefaultInstallHoldSeconds)
 	}
-	return i.releaseInstall(conn, protoVersion, round, registration, candidate)
+	// Resolved before the approval is consumed: an install that cannot pull
+	// its system image is not released.
+	registry, err := i.installRegistryOf(registration, inventory, installOf(registration, inventory).SystemURI)
+	if err != nil {
+		return i.holdForRegistryInput(conn, round, selection, approval, err)
+	}
+	return i.releaseInstall(conn, protoVersion, round, registration, candidate, registry)
+}
+
+// holdForRegistryInput holds a host whose approved install cannot resolve
+// the registry mirror input it pulls its system image through. Input that
+// cannot be used discards the approval, so the install is approved again
+// once a person fixed it; the selection stays. A transient API error keeps
+// the approval, which is checked again shortly.
+func (i *InventoryServer) holdForRegistryInput(conn *websocket.Conn, round *installRound, selection, approval string, err error) error {
+	inventory := round.inventory
+	var invalid *registryaccess.InvalidError
+	if !errors.As(err, &invalid) {
+		log.Warningf("Cannot resolve the registry mirror input of MachineInventory %s/%s: %v", inventory.Namespace, inventory.Name, err)
+		return i.holdInstall(conn, round, elementalv1.AwaitingApprovalReason,
+			fmt.Sprintf("%s is checked again: the registry mirror input could not be read: %v", elementalv1.InstallApprovedAnnotation, err), selectionRetrySeconds)
+	}
+	why := err.Error()
+	i.discardApproval(inventory, approval, why)
+	return i.holdInstall(conn, round, elementalv1.RegistryInputInvalidReason,
+		fmt.Sprintf("%s; %s=%q stays; fix the registry mirror input, then approve the install again",
+			discardedApproval(approval, why), elementalv1.InstallTargetDeviceAnnotation, truncate(selection, maxInstallField)),
+		register.DefaultInstallHoldSeconds)
 }
 
 // installGate is what a person set on the inventory to prepare and release
@@ -635,7 +663,7 @@ func describeCandidate(candidate *elementalv1.InstallCandidate) string {
 // installs to the chosen disk and wipes the stale system disks a person saw
 // listed. The release is recorded before the configuration leaves. The
 // selection stays until the installed system registers.
-func (i *InventoryServer) releaseInstall(conn *websocket.Conn, protoVersion register.MessageType, round *installRound, registration *elementalv1.MachineRegistration, candidate *elementalv1.InstallCandidate) error {
+func (i *InventoryServer) releaseInstall(conn *websocket.Conn, protoVersion register.MessageType, round *installRound, registration *elementalv1.MachineRegistration, candidate *elementalv1.InstallCandidate, registry *elementalv1.InstallRegistry) error {
 	inventory := round.inventory
 	// Guarded by the resourceVersion of the committed inventory: the approval
 	// consumed goes with the selection, spec.network and spec.install
@@ -694,7 +722,7 @@ func (i *InventoryServer) releaseInstall(conn *websocket.Conn, protoVersion regi
 		// Set even when empty: then no stale system disk may be wiped.
 		WipeDeviceIDs: &wipe,
 	}
-	return i.sendConfig(conn, protoVersion, inventory, registration, installReleasedTo(target))
+	return i.sendConfig(conn, protoVersion, inventory, registration, installReleasedTo(target, registry))
 }
 
 // holdInstall records the round with the host waiting for an install target
@@ -960,12 +988,14 @@ func withoutInstallRelease(registration *elementalv1.MachineRegistration) func(*
 }
 
 // installReleasedTo adjusts the configuration to install to the released
-// target and nothing else.
-func installReleasedTo(target elementalv1.InstallTarget) func(*elementalv1.Config) {
+// target and nothing else, pulling the system image through registry, the
+// registry mirror input resolved before the release.
+func installReleasedTo(target elementalv1.InstallTarget, registry *elementalv1.InstallRegistry) func(*elementalv1.Config) {
 	return func(config *elementalv1.Config) {
 		config.Elemental.Install.Device = ""
 		config.Elemental.Install.DeviceSelector = nil
 		config.Elemental.InstallTarget = &target
+		config.Elemental.InstallRegistry = registry
 	}
 }
 

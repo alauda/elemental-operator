@@ -184,6 +184,11 @@ const (
 	// the install the configuration asks for (a toolkit install from
 	// system-uri); the host must boot a newer live ISO.
 	LiveTooOldReason = "LiveTooOld"
+	// RegistryInputInvalidReason: the registry mirror input the install
+	// pulls its system image (install.system-uri) through is missing or
+	// does not validate. The install-approved annotation was discarded
+	// before the install was released; the selection stays.
+	RegistryInputInvalidReason = "RegistryInputInvalid"
 	// TargetNotObservedReason: the chosen disk is not among the disks the
 	// live session reported, or the host could not find it.
 	TargetNotObservedReason = "TargetNotObserved"

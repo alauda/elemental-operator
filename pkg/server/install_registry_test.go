@@ -88,7 +88,16 @@ func TestAddInstallRegistry(t *testing.T) {
 			t.Fatalf("a configuration that releases no install got the registry: %v %+v", err, config.Elemental.InstallRegistry)
 		}
 	})
-	for name, inventory := range map[string]bool{"inventory mode release": true, "immediate install": false} {
+	t.Run("inventory mode release", func(t *testing.T) {
+		// The release resolved it before it consumed the approval.
+		resolved := &elementalv1.InstallRegistry{Source: "resolved by the release"}
+		config := kubeosConfig("docker://"+logical, true)
+		config.Elemental.InstallRegistry = resolved
+		if err := server.addInstallRegistry(kubeosRegistration(nil, true), nil, config); err != nil || config.Elemental.InstallRegistry != resolved {
+			t.Fatalf("addInstallRegistry() = %v, registry %+v", err, config.Elemental.InstallRegistry)
+		}
+	})
+	for name, inventory := range map[string]bool{"immediate install": false} {
 		t.Run(name, func(t *testing.T) {
 			config := kubeosConfig("docker://"+logical, inventory)
 			if err := server.addInstallRegistry(kubeosRegistration(nil, inventory), nil, config); err != nil {

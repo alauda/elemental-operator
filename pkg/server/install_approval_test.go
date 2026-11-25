@@ -25,6 +25,7 @@ import (
 
 	. "github.com/onsi/gomega"
 	"gopkg.in/yaml.v3"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -379,4 +380,117 @@ func conflictOnPatchOf(key string, armed *atomic.Bool) interceptor.Funcs {
 		}
 		return c.Patch(ctx, obj, patch, opts...)
 	}}
+}
+
+// The registry mirror input an install pulls its system image through is
+// resolved before the approval is consumed. Input that cannot be used holds
+// the host with the reason on the inventory and discards the approval; the
+// selection stays, and the install is released once the input is fixed and
+// the install approved again.
+func TestLiveInstallRegistryInputIsCheckedBeforeTheRelease(t *testing.T) {
+	missingEndpoint := defaultRegistryObjects(identityTestNamespace)
+	missingEndpoint[1].(*corev1.Secret).Data[corev1.DockerConfigJsonKey] = []byte(`{"auths":{"harbor.example.com:11443":{"auth":"cm9ib3Q6eA=="}}}`)
+	for _, tc := range []struct {
+		name      string
+		systemURI string
+		objects   []client.Object
+		label     string
+		want      string
+		fix       func(env *installTestEnv)
+	}{
+		{
+			name: "a named credential that does not exist", systemURI: registrationSystemURI,
+			objects: defaultRegistryObjects(identityTestNamespace), label: "missing",
+			want: "MachineInventory " + identityTestNamespace + "/node-a: registry mirror input: registry credential " + identityTestNamespace + "/missing named by cpaas.io/registry-reference does not exist",
+			fix: func(env *installTestEnv) {
+				env.update("node-a", func(inventory *elementalv1.MachineInventory) { delete(inventory.Labels, "cpaas.io/registry-reference") })
+			},
+		},
+		{
+			name: "an endpoint without credentials", systemURI: registrationSystemURI, objects: missingEndpoint,
+			want: "MachineRegistration " + identityTestNamespace + "/registration: registry mirror input: registry credential Secret " + identityTestNamespace + "/acp-registry-bootstrap-auth-1 has no entry for endpoint backup.example.com",
+			fix: func(env *installTestEnv) {
+				secret := &corev1.Secret{}
+				NewWithT(env.t).Expect(env.server.Get(context.Background(), client.ObjectKey{Namespace: identityTestNamespace, Name: "acp-registry-bootstrap-auth-1"}, secret)).To(Succeed())
+				secret.Data[corev1.DockerConfigJsonKey] = defaultRegistryObjects(identityTestNamespace)[1].(*corev1.Secret).Data[corev1.DockerConfigJsonKey]
+				NewWithT(env.t).Expect(env.server.Update(context.Background(), secret)).To(Succeed())
+			},
+		},
+		{
+			name: "a logical system-uri without mirror input", systemURI: "cpaas-registry.cpaas-system/tkestack/baremetal-base-image:v1",
+			want: "system-uri cpaas-registry.cpaas-system/tkestack/baremetal-base-image:v1 is under cpaas-registry.cpaas-system, but no registry mirror input exists",
+			fix: func(env *installTestEnv) {
+				for _, object := range defaultRegistryObjects(identityTestNamespace) {
+					NewWithT(env.t).Expect(env.server.Create(context.Background(), object)).To(Succeed())
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			inventory := liveInventory("node-a")
+			if tc.label != "" {
+				inventory.Labels["cpaas.io/registry-reference"] = tc.label
+			}
+			env := newInstallTestEnv(t, installEnvOptions{registration: withSystemURI(tc.systemURI)}, append(tc.objects, inventory)...)
+			env.hold(hostA.in("boot-1"))
+			env.selectAndApprove("node-a", diskA)
+
+			hold := env.hold(hostA.in("boot-1"))
+			g.Expect(hold.Reason).To(Equal(elementalv1.RegistryInputInvalidReason))
+			g.Expect(hold.RetryAfterSeconds).To(Equal(register.DefaultInstallHoldSeconds))
+			g.Expect(hold.Message).To(HavePrefix(`discarded baremetal.alauda.io/install-approved="true": `))
+			g.Expect(hold.Message).To(ContainSubstring(tc.want))
+			g.Expect(hold.Message).To(HaveSuffix(`; baremetal.alauda.io/install-target-device="` + diskA + `" stays; fix the registry mirror input, then approve the install again`))
+			stored := env.inventory("node-a")
+			g.Expect(stored.Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
+			g.Expect(stored.Annotations).To(HaveKeyWithValue(elementalv1.InstallTargetDeviceAnnotation, diskA))
+			g.Expect(stored.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseAwaitingTarget))
+			g.Expect(condition(stored, elementalv1.InstallTargetReadyCondition)).To(haveCondition(metav1.ConditionFalse, elementalv1.RegistryInputInvalidReason))
+			g.Expect(condition(stored, elementalv1.InstallTargetReadyCondition).Message).To(Equal(hold.Message))
+			g.Expect(env.events()).To(ConsistOf(HavePrefix("Warning ApprovalDiscarded")))
+
+			// Fixed, the host waits for a new approval, which releases it.
+			tc.fix(env)
+			g.Expect(env.hold(hostA.in("boot-1")).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+			env.approve("node-a")
+			config, raw := env.config(hostA.in("boot-1"))
+			g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
+			g.Expect(config.Elemental.InstallRegistry).ToNot(BeNil(), raw)
+			g.Expect(config.Elemental.InstallRegistry.Endpoints).To(Equal([]string{"harbor.example.com:11443", "backup.example.com"}))
+			g.Expect(env.inventory("node-a").Status.Install.Phase).To(Equal(elementalv1.InstallPhaseInstalling))
+		})
+	}
+}
+
+// Input that cannot be read for now does not use up the approval: the host
+// is checked again shortly and released once the read succeeds.
+func TestLiveInstallRegistryInputReadErrorKeepsTheApproval(t *testing.T) {
+	g := NewWithT(t)
+	armed := &atomic.Bool{}
+	funcs := interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if key.Name == "public-registry-credential" && armed.CompareAndSwap(true, false) {
+			return apierrors.NewServiceUnavailable("etcd is unavailable")
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}}
+	env := newInstallTestEnv(t, installEnvOptions{registration: withSystemURI(registrationSystemURI), funcs: funcs},
+		append(defaultRegistryObjects(identityTestNamespace), liveInventory("node-a"))...)
+	env.hold(hostA.in("boot-1"))
+	env.selectAndApprove("node-a", diskA)
+	armed.Store(true)
+
+	hold := env.hold(hostA.in("boot-1"))
+	g.Expect(armed.Load()).To(BeFalse())
+	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+	g.Expect(hold.RetryAfterSeconds).To(Equal(selectionRetrySeconds))
+	g.Expect(hold.Message).To(HavePrefix("baremetal.alauda.io/install-approved is checked again: the registry mirror input could not be read: "))
+	g.Expect(hold.Message).To(ContainSubstring("etcd is unavailable"))
+	g.Expect(env.inventory("node-a").Annotations).To(HaveKeyWithValue(elementalv1.InstallApprovedAnnotation, elementalv1.InstallApprovedValue))
+	g.Expect(env.events()).To(BeEmpty())
+
+	config, _ := env.config(hostA.in("boot-1"))
+	g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
+	g.Expect(config.Elemental.InstallRegistry.Endpoints).To(Equal([]string{"harbor.example.com:11443", "backup.example.com"}))
+	g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
 }
