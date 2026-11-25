@@ -272,12 +272,21 @@ func NormalizeDeviceID(id string) string {
 	return id
 }
 
+// unidentifiedIDPrefix starts the IDs UnidentifiedDeviceID reports.
+const unidentifiedIDPrefix = "unidentified:"
+
 // UnidentifiedDeviceID is the diagnostic ID reported for a device without a
 // canonical identity. It is derived from the kernel path, so it names the
-// device only in the boot that reported it: an install released in that live
-// boot is the one thing that selects a disk by it.
+// device only in the boot that reported it: a selection by it holds for that
+// live boot only.
 func UnidentifiedDeviceID(path string) string {
-	return "unidentified:" + sanitizeDiagnosticID(path)
+	return unidentifiedIDPrefix + sanitizeDiagnosticID(path)
+}
+
+// IsUnidentifiedDeviceID tells whether id, written as a person may write it,
+// is an ID UnidentifiedDeviceID reports.
+func IsUnidentifiedDeviceID(id string) bool {
+	return strings.HasPrefix(NormalizeDeviceID(id), unidentifiedIDPrefix)
 }
 
 func sortedSetMembers(set map[string]struct{}) []string {

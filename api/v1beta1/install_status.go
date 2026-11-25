@@ -27,7 +27,9 @@ const (
 	// the install: InstallApprovedAnnotation releases it. The selection stays
 	// across live boots and is checked again against the disks of the boot
 	// the install is approved in; the registration server removes it once
-	// the installed system registers.
+	// the installed system registers. An unidentified: ID names a disk by its
+	// kernel path in one live boot only: such a selection is discarded when
+	// the host boots the live ISO again.
 	InstallTargetDeviceAnnotation = "baremetal.alauda.io/install-target-device"
 	// InstallApprovedAnnotation, set to "true", releases the install of a
 	// host waiting in the live ISO with install.device-selection: inventory
@@ -171,10 +173,9 @@ const (
 	// AwaitingApprovalReason: an install target is selected and the host
 	// waits for the install-approved annotation.
 	AwaitingApprovalReason = "AwaitingApproval"
-	// SelectionDiscardedReason: an install-target annotation was removed
-	// without releasing an install. The selection is kept across live boots
-	// now and only the approval is discarded (ApprovalDiscardedReason); the
-	// reason stays for status written by earlier servers.
+	// SelectionDiscardedReason: an install-target annotation by an
+	// unidentified: ID was set before the live boot registered and was
+	// removed. Selections by stable IDs stay across live boots.
 	SelectionDiscardedReason = "SelectionDiscarded"
 	// ApprovalDiscardedReason: an install-approved annotation was set before
 	// the live boot registered, or is not "true", and was removed.

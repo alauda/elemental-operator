@@ -343,10 +343,10 @@ func (i *InventoryServer) installFromSelection(conn *websocket.Conn, protoVersio
 		return i.holdInstall(conn, round, elementalv1.IdentityConflictReason, message, register.DefaultInstallHoldSeconds)
 	}
 
-	if stale := staleApproval(approval, approved, newBoot, session.BootID); stale != "" {
-		i.discardApproval(inventory, approval, stale)
-		return i.holdInstall(conn, round, elementalv1.ApprovalDiscardedReason,
-			discardedApproval(approval, stale)+"; "+waitingHint(inventory, session, selection, selected), register.DefaultInstallHoldSeconds)
+	gate := installGate{selection: selection, selected: selected, approval: approval, approved: approved}
+	if reason, discarded := i.dropCarriedOver(inventory, session.BootID, newBoot, &gate); len(discarded) > 0 {
+		return i.holdInstall(conn, round, reason,
+			strings.Join(discarded, "; ")+"; "+waitingHint(inventory, session, gate.selection, gate.selected), register.DefaultInstallHoldSeconds)
 	}
 
 	if liveTooOld(protoVersion, session, installOf(registration, inventory)) {
@@ -376,6 +376,39 @@ func (i *InventoryServer) installFromSelection(conn *websocket.Conn, protoVersio
 			discardedApproval(approval, problem)+"; "+keptSelection(selection), register.DefaultInstallHoldSeconds)
 	}
 	return i.releaseInstall(conn, protoVersion, round, registration, candidate)
+}
+
+// installGate is what a person set on the inventory to prepare and release
+// the install.
+type installGate struct {
+	selection, approval string
+	selected, approved  bool
+}
+
+// dropCarriedOver discards what gate holds from before live boot bootID
+// registered: an approval never carries over, and neither does a selection
+// by an unidentified: ID, which names a disk by its kernel path in the boot
+// that reported it. It also discards an approval that is not "true". It
+// returns the hold reason and what it discarded, nothing when gate stands.
+func (i *InventoryServer) dropCarriedOver(inventory *elementalv1.MachineInventory, bootID string, newBoot bool, gate *installGate) (string, []string) {
+	var discarded []string
+	reason := ""
+	if gate.selected && newBoot && register.IsUnidentifiedDeviceID(gate.selection) {
+		why := fmt.Sprintf("an unidentified: ID names a disk only in the live boot that reported it, and live boot %s registered since; pick the disk again", bootID)
+		i.discardAnnotation(inventory, elementalv1.InstallTargetDeviceAnnotation, gate.selection, why, EventReasonSelectionDiscarded)
+		discarded = append(discarded, discardedSelection(gate.selection, why))
+		gate.selection, gate.selected = "", false
+		reason = elementalv1.SelectionDiscardedReason
+	}
+	if stale := staleApproval(gate.approval, gate.approved, newBoot, bootID); stale != "" {
+		i.discardApproval(inventory, gate.approval, stale)
+		discarded = append(discarded, discardedApproval(gate.approval, stale))
+		gate.approval, gate.approved = "", false
+		if reason == "" {
+			reason = elementalv1.ApprovalDiscardedReason
+		}
+	}
+	return reason, discarded
 }
 
 // staleApproval says why an install-approved annotation cannot release the
@@ -485,7 +518,15 @@ func approvalHint(inventory *elementalv1.MachineInventory, session *register.Liv
 }
 
 func discardedApproval(approval, why string) string {
-	return fmt.Sprintf("discarded %s=%q: %s", elementalv1.InstallApprovedAnnotation, truncate(approval, maxInstallField), why)
+	return discardedAnnotation(elementalv1.InstallApprovedAnnotation, approval, why)
+}
+
+func discardedSelection(selection, why string) string {
+	return discardedAnnotation(elementalv1.InstallTargetDeviceAnnotation, selection, why)
+}
+
+func discardedAnnotation(key, value, why string) string {
+	return fmt.Sprintf("discarded %s=%q: %s", key, truncate(value, maxInstallField), why)
 }
 
 func keptSelection(selection string) string {
@@ -788,14 +829,20 @@ func (i *InventoryServer) removeAnnotations(inventory *elementalv1.MachineInvent
 }
 
 // discardApproval removes the install-approved annotation without releasing
-// anything. It does not let a concurrent change keep an approval alive: on a
-// conflict it reads the inventory again and removes whatever approval it
-// holds, since an approval that the next registration of this boot would see
-// must not be one this registration rejected.
+// anything.
 func (i *InventoryServer) discardApproval(inventory *elementalv1.MachineInventory, approval, why string) {
+	i.discardAnnotation(inventory, elementalv1.InstallApprovedAnnotation, approval, why, EventReasonApprovalDiscarded)
+}
+
+// discardAnnotation removes the annotation key, whose value was rejected for
+// why, and records eventReason. It does not let a concurrent change keep the
+// annotation alive: on a conflict it reads the inventory again and removes
+// whatever value it holds, since what the next registration of this boot
+// would see must not be what this registration rejected.
+func (i *InventoryServer) discardAnnotation(inventory *elementalv1.MachineInventory, key, value, why, eventReason string) {
 	current := inventory
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		err := i.removeAnnotations(current, elementalv1.InstallApprovedAnnotation)
+		err := i.removeAnnotations(current, key)
 		if !apierrors.IsConflict(err) {
 			return err
 		}
@@ -810,14 +857,14 @@ func (i *InventoryServer) discardApproval(inventory *elementalv1.MachineInventor
 		return err
 	})
 	if err != nil {
-		log.Warningf("Cannot discard %s of MachineInventory %s/%s: %v", elementalv1.InstallApprovedAnnotation, inventory.Namespace, inventory.Name, err)
+		log.Warningf("Cannot discard %s of MachineInventory %s/%s: %v", key, inventory.Namespace, inventory.Name, err)
 		return
 	}
 	if current != inventory {
 		current.DeepCopyInto(inventory)
 	}
-	message := discardedApproval(approval, why)
-	i.recordEvent(inventory, corev1.EventTypeWarning, EventReasonApprovalDiscarded, message)
+	message := discardedAnnotation(key, value, why)
+	i.recordEvent(inventory, corev1.EventTypeWarning, eventReason, message)
 	log.Infof("MachineInventory %s/%s: %s", inventory.Namespace, inventory.Name, message)
 }
 

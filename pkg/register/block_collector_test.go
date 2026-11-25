@@ -769,3 +769,17 @@ func TestBlockCollectorMeasuredQEMUBusEvidence(t *testing.T) {
 		t.Fatalf("sda IDProblem must name the driver that failed the check: %q", sda.IDProblem)
 	}
 }
+
+func TestIsUnidentifiedDeviceID(t *testing.T) {
+	for id, want := range map[string]bool{
+		UnidentifiedDeviceID("/dev/vda"): true,
+		" UNIDENTIFIED:dev_vda":          true,
+		"wwn:5000c500a1b2c3d4":           false,
+		"serial:model:unidentified":      false,
+		"":                               false,
+	} {
+		if got := IsUnidentifiedDeviceID(id); got != want {
+			t.Errorf("IsUnidentifiedDeviceID(%q) = %v, want %v", id, got, want)
+		}
+	}
+}

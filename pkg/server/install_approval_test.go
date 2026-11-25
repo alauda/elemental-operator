@@ -17,14 +17,20 @@ limitations under the License.
 package server
 
 import (
+	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	. "github.com/onsi/gomega"
 	"gopkg.in/yaml.v3"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 	"github.com/rancher/elemental-operator/pkg/network"
@@ -296,4 +302,81 @@ func (e *installTestEnv) registration() *elementalv1.MachineRegistration {
 	registration := &elementalv1.MachineRegistration{}
 	NewWithT(e.t).Expect(e.server.Get(e.server, client.ObjectKey{Namespace: identityTestNamespace, Name: "registration"}, registration)).To(Succeed())
 	return registration
+}
+
+// An unidentified: ID names a disk by its kernel path in the live boot that
+// reported it: after a reboot it may name another disk. Such a selection does
+// not survive a new live boot, while one by a stable ID does.
+func TestLiveInstallUnidentifiedSelectionDoesNotSurviveANewBoot(t *testing.T) {
+	unidentified := func(bootID string) *register.LiveInstallSession {
+		session := liveSession(bootID)
+		session.Candidates = append(session.Candidates, elementalv1.InstallCandidate{ID: "unidentified:dev_vda", Path: "/dev/vda", SizeBytes: 107374182400, Eligible: true})
+		return session
+	}
+
+	t.Run("selection only", func(t *testing.T) {
+		g := NewWithT(t)
+		env := newInstallTestEnv(t, installEnvOptions{}, liveInventory("node-a"))
+		env.hold(hostA.with(unidentified("boot-1")))
+		env.selectDisk("node-a", "UNIDENTIFIED:dev_vda")
+		g.Expect(env.hold(hostA.with(unidentified("boot-1"))).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+
+		hold := env.hold(hostA.with(unidentified("boot-2")))
+		g.Expect(hold.Reason).To(Equal(elementalv1.SelectionDiscardedReason))
+		g.Expect(hold.Message).To(HavePrefix(`discarded baremetal.alauda.io/install-target-device="UNIDENTIFIED:dev_vda": an unidentified: ID names a disk only in the live boot that reported it, and live boot boot-2 registered since`))
+		g.Expect(hold.Message).To(ContainSubstring("pick one with"))
+		g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+		g.Expect(condition(env.inventory("node-a"), elementalv1.InstallTargetReadyCondition)).To(haveCondition(metav1.ConditionFalse, elementalv1.SelectionDiscardedReason))
+		g.Expect(env.events()).To(ConsistOf(HavePrefix("Warning SelectionDiscarded")))
+		g.Expect(env.hold(hostA.with(unidentified("boot-2"))).Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	})
+	t.Run("selection and approval", func(t *testing.T) {
+		g := NewWithT(t)
+		env := newInstallTestEnv(t, installEnvOptions{}, liveInventory("node-a"))
+		env.hold(hostA.with(unidentified("boot-1")))
+		env.selectAndApprove("node-a", "unidentified:dev_vda")
+
+		// The host rebooted before it registered again: neither carries over.
+		hold := env.hold(hostA.with(unidentified("boot-2")))
+		g.Expect(hold.Reason).To(Equal(elementalv1.SelectionDiscardedReason))
+		g.Expect(hold.Message).To(ContainSubstring(`discarded baremetal.alauda.io/install-target-device="unidentified:dev_vda"`))
+		g.Expect(hold.Message).To(ContainSubstring(`discarded baremetal.alauda.io/install-approved="true": it was set before live boot boot-2 registered`))
+		inventory := env.inventory("node-a")
+		g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+		g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
+		g.Expect(env.events()).To(ConsistOf(HavePrefix("Warning SelectionDiscarded"), HavePrefix("Warning ApprovalDiscarded")))
+	})
+	t.Run("same boot", func(t *testing.T) {
+		g := NewWithT(t)
+		env := newInstallTestEnv(t, installEnvOptions{}, liveInventory("node-a"))
+		env.hold(hostA.with(unidentified("boot-1")))
+		env.selectDisk("node-a", "unidentified:dev_vda")
+		g.Expect(env.hold(hostA.with(unidentified("boot-1"))).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+		env.approve("node-a")
+		config, _ := env.config(hostA.with(unidentified("boot-1")))
+		g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal("unidentified:dev_vda"))
+	})
+	t.Run("a discard that runs into a conflict still removes it", func(t *testing.T) {
+		g := NewWithT(t)
+		armed := &atomic.Bool{}
+		env := newInstallTestEnv(t, installEnvOptions{funcs: conflictOnPatchOf(elementalv1.InstallTargetDeviceAnnotation, armed)}, liveInventory("node-a"))
+		env.hold(hostA.with(unidentified("boot-1")))
+		env.selectDisk("node-a", "unidentified:dev_vda")
+		armed.Store(true)
+		g.Expect(env.hold(hostA.with(unidentified("boot-2"))).Reason).To(Equal(elementalv1.SelectionDiscardedReason))
+		g.Expect(armed.Load()).To(BeFalse())
+		g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+	})
+}
+
+// conflictOnPatchOf makes the next patch that touches the annotation key fail
+// with a conflict.
+func conflictOnPatchOf(key string, armed *atomic.Bool) interceptor.Funcs {
+	return interceptor.Funcs{Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+		data, err := patch.Data(obj)
+		if err == nil && strings.Contains(string(data), key) && armed.CompareAndSwap(true, false) {
+			return apierrors.NewConflict(schema.GroupResource{Group: "elemental.cattle.io", Resource: "machineinventories"}, obj.GetName(), errors.New("the object has been modified"))
+		}
+		return c.Patch(ctx, obj, patch, opts...)
+	}}
 }
