@@ -54,8 +54,8 @@ const (
 
 // MsgToolkitInstallRegistry is a protocol level, not a message: a client at
 // it or later pulls the system-uri of a toolkit install through the
-// install-registry the operator sends and checks that the image can be pulled
-// before it touches a disk. The operator releases no such install to an older
+// install-registry the operator sends (anonymously when there is none) and
+// checks that the image can be pulled before it touches a disk. The operator releases no such install to an older
 // client, whose toolkit would partition the disk before it fails to pull.
 
 func (mt MessageType) String() string {

@@ -153,7 +153,7 @@ func dockerConfigFor(hosts ...string) string {
 
 var systemImage = systemRepository + ":" + systemTag
 
-var _ = Describe("toolkit install through install-registry", Label("installer", "install", "registry"), func() {
+var _ = Describe("toolkit install of a system-uri", Label("installer", "install", "registry"), func() {
 	var fs *vfst.TestFS
 	var cliRunner *climocks.MockRunner
 	var networkConfigurator *networkmocks.MockConfigurator
@@ -318,12 +318,36 @@ var _ = Describe("toolkit install through install-registry", Label("installer", 
 		})
 	})
 
-	It("leaves an install without install-registry as it is", func() {
-		config.Elemental.Install.SystemURI = "registry.example.com/" + systemImage
-		expectHook()
-		cliRunner.EXPECT().Install(config.Elemental.Install, elementalcli.InstallOptions{}).Return(nil)
-		Expect(inst.InstallElemental(config, stateFixture, networkConfigFixture)).To(Succeed())
-		expectNoCredentials()
+	Context("without install-registry", func() {
+		It("pulls the system-uri anonymously, without verifying certificates", func() {
+			registry := newFakeRegistry(true, "", systemImage)
+			config.Elemental.Install.SystemURI = registry.host() + "/" + systemImage
+			expectHook()
+			want := config.Elemental.Install
+			want.SystemURI = "docker:" + registry.host() + "/" + systemImage
+			cliRunner.EXPECT().Install(want, elementalcli.InstallOptions{SkipTLSVerify: true}).Return(nil)
+			Expect(inst.InstallElemental(config, stateFixture, networkConfigFixture)).To(Succeed())
+			Expect(registry.seen()).To(ContainElement("HEAD /v2/" + systemRepository + "/manifests/" + systemTag))
+			expectNoCredentials()
+		})
+		It("touches no disk when the image is not there", func() {
+			registry := newFakeRegistry(true, "")
+			config.Elemental.Install.SystemURI = registry.host() + "/" + systemImage
+			err := inst.InstallElemental(config, stateFixture, networkConfigFixture)
+			Expect(err).To(MatchError(ContainSubstring("cannot be pulled, nothing was written to disk")))
+			Expect(err).To(MatchError(ContainSubstring("HTTP 404")))
+			Expect(destructive(host.calls)).To(BeEmpty())
+		})
+		It("refuses a system-uri under the logical registry", func() {
+			config.Elemental.Install.SystemURI = logicalRegistry + "/" + systemImage
+			err := inst.InstallElemental(config, stateFixture, networkConfigFixture)
+			Expect(err).To(MatchError(ContainSubstring("the operator sent no install-registry")))
+			Expect(destructive(host.calls)).To(BeEmpty())
+		})
+		It("refuses what is not an image reference", func() {
+			config.Elemental.Install.SystemURI = "a system uri"
+			Expect(inst.InstallElemental(config, stateFixture, networkConfigFixture)).To(MatchError(ContainSubstring("not an image reference")))
+		})
 	})
 	It("leaves an install from the live system as it is", func() {
 		config.Elemental.InstallRegistry = &elementalv1.InstallRegistry{Source: logicalRegistry, Endpoints: []string{"harbor.example.com"}}

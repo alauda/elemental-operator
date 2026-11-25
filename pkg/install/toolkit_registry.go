@@ -37,15 +37,16 @@ import (
 	"github.com/rancher/elemental-operator/pkg/registryaccess"
 )
 
-// Toolkit install of install.system-uri through install-registry.
+// Toolkit install of install.system-uri.
 //
 // The operator gives an install that pulls a system-uri the registry it
-// pulls through: the logical registry, its real endpoints in order, and a
-// dockerconfigjson with their credentials (install-registry). The KubeOS
-// backend hands that to skopeo and kbimg as a registries.conf.d mirror; the
-// toolkit pulls with go-containerregistry instead, which reads credentials
-// from $DOCKER_CONFIG/config.json and knows nothing of registries.conf. So
-// for the toolkit the register:
+// pulls through when the platform pulls through a mirror: the logical
+// registry, its real endpoints in order, and a dockerconfigjson with their
+// credentials (install-registry). The KubeOS backend hands that to skopeo and
+// kbimg as a registries.conf.d mirror; the toolkit pulls with
+// go-containerregistry instead, which reads credentials from
+// $DOCKER_CONFIG/config.json and knows nothing of registries.conf. So for the
+// toolkit the register:
 //
 //   - writes the dockerconfigjson to a root-only directory on tmpfs and runs
 //     elemental install with DOCKER_CONFIG pointing at it;
@@ -53,12 +54,14 @@ import (
 //     one under the logical registry to the first endpoint that serves it;
 //   - checks that the image can be pulled (a manifest HEAD) before any disk
 //     is touched: the toolkit partitions first and pulls afterwards;
-//   - passes --tls-verify=false, since install-registry endpoints are never
-//     verified, and the same image as the recovery system (elementalcli);
+//   - passes --tls-verify=false: registry certificates are never verified,
+//     and the same image as the recovery system (elementalcli);
 //   - removes the credentials once elemental install returns, so the
 //     installed system never gets them.
 //
-// Without install-registry the system-uri goes to the toolkit unchanged.
+// Without install-registry the system-uri is pulled anonymously, as written,
+// with the same check before the disk is touched and without certificate
+// verification either.
 
 const (
 	toolkitRegistryDockerDir = "/run/elemental/registry-docker"
@@ -89,23 +92,26 @@ func (i *installer) toolkitDockerConfigDir() string {
 	return toolkitRegistryDockerDir
 }
 
-// useToolkitInstallRegistry prepares the toolkit to pull install.system-uri
-// through reg: it writes the credentials, rewrites a logical system-uri to the
-// first endpoint that serves the image and checks that the image can be
-// pulled. It returns the options elemental install runs with and a function
-// that removes the credentials. Without reg, or without a system-uri that
-// names an image, it changes nothing.
-func (i *installer) useToolkitInstallRegistry(install *elementalv1.Install, reg *elementalv1.InstallRegistry) (elementalcli.InstallOptions, func(), error) {
+// prepareSystemImagePull prepares the toolkit to pull install.system-uri,
+// through reg when the operator sent one: it writes the credentials,
+// rewrites a logical system-uri to the first endpoint that serves the image
+// and checks that the image can be pulled. It returns the options elemental
+// install runs with and a function that removes the credentials. Without a
+// system-uri that names an image it changes nothing.
+func (i *installer) prepareSystemImagePull(install *elementalv1.Install, reg *elementalv1.InstallRegistry) (elementalcli.InstallOptions, func(), error) {
 	noop := func() {}
-	if reg == nil || !pullsImage(install.SystemURI) {
+	if !pullsImage(install.SystemURI) {
 		return elementalcli.InstallOptions{}, noop, nil
-	}
-	if err := validateInstallRegistry(reg); err != nil {
-		return elementalcli.InstallOptions{}, nil, err
 	}
 	ref, err := parseImageReference(install.SystemURI)
 	if err != nil {
 		return elementalcli.InstallOptions{}, nil, fmt.Errorf("install.system-uri %q: %w", install.SystemURI, err)
+	}
+	if reg == nil {
+		return i.pullAnonymously(install, ref)
+	}
+	if err := validateInstallRegistry(reg); err != nil {
+		return elementalcli.InstallOptions{}, nil, err
 	}
 	auths, err := parseDockerAuths(reg.DockerConfig)
 	if err != nil {
@@ -142,6 +148,22 @@ func (i *installer) useToolkitInstallRegistry(install *elementalv1.Install, reg 
 	log.Infof("The system image %s can be pulled; installing it through the registry mirror %s", chosen, reg.Source)
 	install.SystemURI = "docker:" + chosen.String()
 	return elementalcli.InstallOptions{DockerConfig: rawDir, SkipTLSVerify: true}, cleanup, nil
+}
+
+// pullAnonymously prepares the pull of a system-uri the operator sent no
+// install-registry for: the platform does not pull through a mirror. The
+// image is pulled as written, without credentials or certificate
+// verification, once it was seen to be there.
+func (i *installer) pullAnonymously(install *elementalv1.Install, ref imageReference) (elementalcli.InstallOptions, func(), error) {
+	if ref.registry == registryaccess.LogicalRegistry {
+		return elementalcli.InstallOptions{}, nil, fmt.Errorf("install.system-uri %s is under %s, but the operator sent no install-registry to reach it through: write the platform registry address instead", ref, registryaccess.LogicalRegistry)
+	}
+	if _, err := newImageProbe().first([]imageReference{ref}, dockerAuths{}); err != nil {
+		return elementalcli.InstallOptions{}, nil, fmt.Errorf("the system image %s cannot be pulled, nothing was written to disk: %w", ref, err)
+	}
+	log.Infof("The system image %s can be pulled; installing it", ref)
+	install.SystemURI = "docker:" + ref.String()
+	return elementalcli.InstallOptions{SkipTLSVerify: true}, func() {}, nil
 }
 
 // writeToolkitDockerConfig writes config as dir/config.json, readable by root

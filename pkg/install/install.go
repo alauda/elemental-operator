@@ -117,7 +117,7 @@ func (i *installer) InstallElemental(config elementalv1.Config, state register.S
 
 	// The toolkit partitions the disk before it pulls install.system-uri:
 	// make sure the image can be pulled while no disk was touched yet.
-	pull, removeCredentials, err := i.useToolkitInstallRegistry(&config.Elemental.Install, config.Elemental.InstallRegistry)
+	pull, removeCredentials, err := i.prepareSystemImagePull(&config.Elemental.Install, config.Elemental.InstallRegistry)
 	if err != nil {
 		return err
 	}

@@ -56,7 +56,6 @@ var (
 				NoFormat:         true,
 				ConfigURLs:       []string{"foo", "bar"},
 				ISO:              "a test iso",
-				SystemURI:        "a system uri",
 				Debug:            true,
 				TTY:              "a test tty",
 				PowerOff:         true,
