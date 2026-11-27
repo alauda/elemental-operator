@@ -63,7 +63,7 @@ var _ = Describe("installed registration config", Label("installer", "install", 
 
 		config := configFixture
 		config.Elemental.Registration = autoRegistration
-		cliRunner.EXPECT().Install(config.Elemental.Install).Return(nil)
+		cliRunner.EXPECT().Install(config.Elemental.Install, elementalcli.InstallOptions{}).Return(nil)
 		networkConfigurator.EXPECT().GetNetworkConfigApplicator(networkConfigFixture).Return(networkConfigApplicatorFixture, nil)
 		Expect(inst.InstallElemental(config, emulatedState, networkConfigFixture)).To(Succeed())
 

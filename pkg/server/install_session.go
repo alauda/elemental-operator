@@ -38,16 +38,19 @@ import (
 	elementalv1 "github.com/rancher/elemental-operator/api/v1beta1"
 	"github.com/rancher/elemental-operator/pkg/log"
 	"github.com/rancher/elemental-operator/pkg/register"
+	"github.com/rancher/elemental-operator/pkg/registryaccess"
 )
 
 // Live install sessions: with install.device-selection: inventory, a host
 // booted from the live ISO with --install reports its boot and disks
 // (MsgLiveInstallSession) before MsgGet. The server records them in
-// status.install and holds the host (MsgInstallHold) until a person picks the
-// install disk with the one-shot install-target annotation; the next
-// registration then consumes the annotation and releases the install. The
-// released host reports how its install goes (MsgInstallReport) on a short
-// session of its own.
+// status.install and holds the host (MsgInstallHold) while a person prepares
+// the install, picking the disk with the install-target annotation and
+// writing spec.network and spec.install as needed, and until the person
+// approves it with the one-shot install-approved annotation; the next
+// registration then consumes the approval and releases the install with what
+// the MachineInventory holds at that moment. The released host reports how
+// its install goes (MsgInstallReport) on a short session of its own.
 
 // Event reasons of live install sessions, recorded on the MachineInventory.
 const (
@@ -56,6 +59,7 @@ const (
 	EventReasonInstallFailed      = "InstallFailed"
 	EventReasonInstallCompleted   = "InstallCompleted"
 	EventReasonSelectionDiscarded = "SelectionDiscarded"
+	EventReasonApprovalDiscarded  = "ApprovalDiscarded"
 )
 
 // targetAmbiguousReason is what elemental-register reports when several disks
@@ -77,7 +81,7 @@ var allocationAnnotations = []string{
 }
 
 const (
-	// selectionRetrySeconds holds a host whose selection could not be
+	// selectionRetrySeconds holds a host whose approval could not be
 	// consumed only briefly: the next registration checks it again.
 	selectionRetrySeconds = 5
 	// liveBootAlternation: a live boot coming back within it after another
@@ -200,22 +204,32 @@ func truncate(s string, limit int) string {
 	return s[:cut]
 }
 
-// applyInstallSelection makes the install-target annotation of the inventory
-// about to be committed what the stored inventory had: a person sets it on
-// the MachineInventory, never a MachineRegistration template.
+// installGateAnnotations are the annotations that prepare and release an
+// install. A person sets them on the MachineInventory, never a
+// MachineRegistration template or the host.
+var installGateAnnotations = []string{
+	elementalv1.InstallTargetDeviceAnnotation,
+	elementalv1.InstallApprovedAnnotation,
+}
+
+// applyInstallSelection makes the install-target and install-approved
+// annotations of the inventory about to be committed what the stored
+// inventory had.
 func (s *registrationSession) applyInstallSelection(inventory *elementalv1.MachineInventory) {
-	value, found := "", false
-	if s.stored != nil {
-		value, found = s.stored.Annotations[elementalv1.InstallTargetDeviceAnnotation]
+	for _, key := range installGateAnnotations {
+		value, found := "", false
+		if s.stored != nil {
+			value, found = s.stored.Annotations[key]
+		}
+		if !found {
+			delete(inventory.Annotations, key)
+			continue
+		}
+		if inventory.Annotations == nil {
+			inventory.Annotations = map[string]string{}
+		}
+		inventory.Annotations[key] = value
 	}
-	if !found {
-		delete(inventory.Annotations, elementalv1.InstallTargetDeviceAnnotation)
-		return
-	}
-	if inventory.Annotations == nil {
-		inventory.Annotations = map[string]string{}
-	}
-	inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation] = value
 }
 
 // inventoryMode tells whether a person picks the install disk on the
@@ -271,8 +285,21 @@ func (i *InventoryServer) handleLiveInstallGet(conn *websocket.Conn, protoVersio
 
 // installWithoutSelection records the session of a host that installs right
 // away to the disk install.device or install.device-selector picks; in
-// inventory mode that is no disk at all.
+// inventory mode that is no disk at all. A host whose register cannot do the
+// install safely is held when it can be, and refused otherwise.
 func (i *InventoryServer) installWithoutSelection(conn *websocket.Conn, protoVersion register.MessageType, round *installRound, registration *elementalv1.MachineRegistration) error {
+	if liveTooOld(protoVersion, round.session, installOf(registration, round.inventory)) {
+		message := liveTooOldMessage(protoVersion, round.session)
+		if protoVersion >= register.MsgInstallHold {
+			round.next.Message = message
+			return i.holdInstall(conn, round, elementalv1.LiveTooOldReason, message, register.DefaultInstallHoldSeconds)
+		}
+		err := fmt.Errorf("MachineInventory %s/%s: %s", round.inventory.Namespace, round.inventory.Name, message)
+		if writeErr := writeError(conn, protoVersion, register.NewErrorMessage(err)); writeErr != nil {
+			log.Errorf("Error reporting back error to client: %v", writeErr)
+		}
+		return err
+	}
 	round.next.Phase = elementalv1.InstallPhaseInstalling
 	// Nobody picks a disk, so there is no InstallTargetReady to show.
 	round.targetReady = nil
@@ -282,21 +309,27 @@ func (i *InventoryServer) installWithoutSelection(conn *websocket.Conn, protoVer
 	return i.sendConfig(conn, protoVersion, round.inventory, registration, withoutInstallRelease(registration))
 }
 
-// installFromSelection decides about a host that waits for a person to pick
-// its install disk with the install-target annotation. The annotation is
-// one-shot: it is consumed when it releases the install and discarded when it
-// was set before this live boot registered or does not pass validation.
+// installFromSelection decides about a host that waits in inventory mode.
+// The install-target annotation picks the disk and stays until the installed
+// system registers; the install-approved annotation releases the install and
+// is one-shot: it is consumed when it releases the install, and discarded when
+// it was set before this live boot registered or the install cannot go ahead.
 func (i *InventoryServer) installFromSelection(conn *websocket.Conn, protoVersion register.MessageType, round *installRound, registration *elementalv1.MachineRegistration) error {
 	inventory, session := round.inventory, round.session
 	prev := inventory.Status.Install
 	newBoot := prev == nil || prev.BootID != session.BootID
 	round.next.Message = installHistory(prev, newBoot)
+	if !newBoot && heldBy(inventory, elementalv1.LiveTooOldReason) {
+		// The last hold wrote why the live was too old, not a history.
+		round.next.Message = ""
+	}
 	round.installedTo = installedTarget(prev, newBoot)
 	if newBoot && prev != nil && prev.Phase == elementalv1.InstallPhaseInstalling {
 		i.recordEvent(inventory, corev1.EventTypeWarning, EventReasonInstallInterrupted, round.next.Message)
 	}
 
 	selection, selected := inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation]
+	approval, approved := inventory.Annotations[elementalv1.InstallApprovedAnnotation]
 	boots := i.liveBoots.observe(inventory.UID, session.BootID, round.now)
 	if boots.alternating {
 		pair := []string{session.BootID, boots.other}
@@ -305,27 +338,127 @@ func (i *InventoryServer) installFromSelection(conn *websocket.Conn, protoVersio
 		if boots.returned {
 			i.recordEvent(inventory, corev1.EventTypeWarning, EventReasonIdentityConflict, message)
 		}
-		if selected {
-			i.discardSelection(inventory, selection, "two hosts present the identity of this MachineInventory")
+		if approved {
+			i.discardApproval(inventory, approval, "two hosts present the identity of this MachineInventory")
 		}
 		return i.holdInstall(conn, round, elementalv1.IdentityConflictReason, message, register.DefaultInstallHoldSeconds)
 	}
 
-	hint := selectionHint(inventory, session)
+	gate := installGate{selection: selection, selected: selected, approval: approval, approved: approved}
+	if reason, discarded := i.dropCarriedOver(inventory, session.BootID, newBoot, &gate); len(discarded) > 0 {
+		return i.holdInstall(conn, round, reason,
+			strings.Join(discarded, "; ")+"; "+waitingHint(inventory, session, gate.selection, gate.selected), register.DefaultInstallHoldSeconds)
+	}
+
+	if liveTooOld(protoVersion, session, installOf(registration, inventory)) {
+		message := liveTooOldMessage(protoVersion, session)
+		if approved {
+			i.discardApproval(inventory, approval, "the live system cannot do the install")
+		}
+		round.next.Message = message
+		return i.holdInstall(conn, round, elementalv1.LiveTooOldReason, message, register.DefaultInstallHoldSeconds)
+	}
+
 	switch {
+	case !selected && approved:
+		why := "no install target is selected"
+		i.discardApproval(inventory, approval, why)
+		return i.holdInstall(conn, round, elementalv1.AwaitingSelectionReason,
+			discardedApproval(approval, why)+"; "+selectionHint(inventory, session), register.DefaultInstallHoldSeconds)
 	case !selected:
-		return i.holdInstall(conn, round, elementalv1.AwaitingSelectionReason, hint, register.DefaultInstallHoldSeconds)
-	case newBoot:
-		why := fmt.Sprintf("it was set before live boot %s registered", session.BootID)
-		i.discardSelection(inventory, selection, why)
-		return i.holdInstall(conn, round, elementalv1.SelectionDiscardedReason, discardedSelection(selection, why)+"; "+hint, register.DefaultInstallHoldSeconds)
+		return i.holdInstall(conn, round, elementalv1.AwaitingSelectionReason, selectionHint(inventory, session), register.DefaultInstallHoldSeconds)
+	case !approved:
+		return i.holdInstall(conn, round, elementalv1.AwaitingApprovalReason, approvalHint(inventory, session, selection), register.DefaultInstallHoldSeconds)
 	}
 	candidate, reason, problem := checkSelection(inventory, session, selection)
 	if candidate == nil {
-		i.discardSelection(inventory, selection, problem)
-		return i.holdInstall(conn, round, reason, discardedSelection(selection, problem), register.DefaultInstallHoldSeconds)
+		i.discardApproval(inventory, approval, problem)
+		return i.holdInstall(conn, round, reason,
+			discardedApproval(approval, problem)+"; "+keptSelection(selection), register.DefaultInstallHoldSeconds)
 	}
-	return i.releaseInstall(conn, protoVersion, round, registration, candidate)
+	// Resolved before the approval is consumed: an install that cannot pull
+	// its system image is not released.
+	registry, err := i.installRegistryOf(registration, inventory, installOf(registration, inventory).SystemURI)
+	if err != nil {
+		return i.holdForRegistryInput(conn, round, selection, approval, err)
+	}
+	return i.releaseInstall(conn, protoVersion, round, registration, candidate, registry)
+}
+
+// holdForRegistryInput holds a host whose approved install cannot resolve
+// the registry mirror input it pulls its system image through. Input that
+// cannot be used discards the approval, so the install is approved again
+// once a person fixed it; the selection stays. A transient API error keeps
+// the approval, which is checked again shortly.
+func (i *InventoryServer) holdForRegistryInput(conn *websocket.Conn, round *installRound, selection, approval string, err error) error {
+	inventory := round.inventory
+	var invalid *registryaccess.InvalidError
+	if !errors.As(err, &invalid) {
+		log.Warningf("Cannot resolve the registry mirror input of MachineInventory %s/%s: %v", inventory.Namespace, inventory.Name, err)
+		return i.holdInstall(conn, round, elementalv1.AwaitingApprovalReason,
+			fmt.Sprintf("%s is checked again: the registry mirror input could not be read: %v", elementalv1.InstallApprovedAnnotation, err), selectionRetrySeconds)
+	}
+	why := err.Error()
+	i.discardApproval(inventory, approval, why)
+	return i.holdInstall(conn, round, elementalv1.RegistryInputInvalidReason,
+		fmt.Sprintf("%s; %s=%q stays; fix the registry mirror input, then approve the install again",
+			discardedApproval(approval, why), elementalv1.InstallTargetDeviceAnnotation, truncate(selection, maxInstallField)),
+		register.DefaultInstallHoldSeconds)
+}
+
+// installGate is what a person set on the inventory to prepare and release
+// the install.
+type installGate struct {
+	selection, approval string
+	selected, approved  bool
+}
+
+// dropCarriedOver discards what gate holds from before live boot bootID
+// registered: an approval never carries over, and neither does a selection
+// by an unidentified: ID, which names a disk by its kernel path in the boot
+// that reported it. It also discards an approval that is not "true". It
+// returns the hold reason and what it discarded, nothing when gate stands.
+func (i *InventoryServer) dropCarriedOver(inventory *elementalv1.MachineInventory, bootID string, newBoot bool, gate *installGate) (string, []string) {
+	var discarded []string
+	reason := ""
+	if gate.selected && newBoot && register.IsUnidentifiedDeviceID(gate.selection) {
+		why := fmt.Sprintf("an unidentified: ID names a disk only in the live boot that reported it, and live boot %s registered since; pick the disk again", bootID)
+		i.discardAnnotation(inventory, elementalv1.InstallTargetDeviceAnnotation, gate.selection, why, EventReasonSelectionDiscarded)
+		discarded = append(discarded, discardedSelection(gate.selection, why))
+		gate.selection, gate.selected = "", false
+		reason = elementalv1.SelectionDiscardedReason
+	}
+	if stale := staleApproval(gate.approval, gate.approved, newBoot, bootID); stale != "" {
+		i.discardApproval(inventory, gate.approval, stale)
+		discarded = append(discarded, discardedApproval(gate.approval, stale))
+		gate.approval, gate.approved = "", false
+		if reason == "" {
+			reason = elementalv1.ApprovalDiscardedReason
+		}
+	}
+	return reason, discarded
+}
+
+// staleApproval says why an install-approved annotation cannot release the
+// install whatever else holds, "" when it can. An approval holds for the live
+// boot a person saw waiting, and only "true" approves.
+func staleApproval(approval string, approved, newBoot bool, bootID string) string {
+	switch {
+	case !approved:
+		return ""
+	case newBoot:
+		return fmt.Sprintf("it was set before live boot %s registered", bootID)
+	case strings.TrimSpace(approval) != elementalv1.InstallApprovedValue:
+		return fmt.Sprintf("only %q approves the install", elementalv1.InstallApprovedValue)
+	default:
+		return ""
+	}
+}
+
+// heldBy tells whether the last hold of the inventory had reason.
+func heldBy(inventory *elementalv1.MachineInventory, reason string) bool {
+	ready := meta.FindStatusCondition(inventory.Status.Conditions, elementalv1.InstallTargetReadyCondition)
+	return ready != nil && ready.Status == metav1.ConditionFalse && ready.Reason == reason
 }
 
 // installHistory is status.install.message of a held host: what became of the
@@ -373,7 +506,15 @@ func installedTarget(prev *elementalv1.InstallStatus, newBoot bool) string {
 	}
 }
 
-// selectionHint tells a person how to release the install.
+// waitingHint tells a person what the install waits for.
+func waitingHint(inventory *elementalv1.MachineInventory, session *register.LiveInstallSession, selection string, selected bool) string {
+	if selected {
+		return approvalHint(inventory, session, selection)
+	}
+	return selectionHint(inventory, session)
+}
+
+// selectionHint tells a person how to pick the install target.
 func selectionHint(inventory *elementalv1.MachineInventory, session *register.LiveInstallSession) string {
 	if session.SurveyError != "" {
 		return "the host could not list its disks: " + session.SurveyError
@@ -387,12 +528,38 @@ func selectionHint(inventory *elementalv1.MachineInventory, session *register.Li
 	if eligible == 0 {
 		return fmt.Sprintf("none of the %d disks the host reported can be the install target (status.install.candidates)", len(session.Candidates))
 	}
-	return fmt.Sprintf("%d of %d disks the host reported can be the install target (status.install.candidates); pick one with: kubectl -n %s annotate machineinventory %s %s=<id>",
-		eligible, len(session.Candidates), inventory.Namespace, inventory.Name, elementalv1.InstallTargetDeviceAnnotation)
+	return fmt.Sprintf("%d of %d disks the host reported can be the install target (status.install.candidates); pick one with: kubectl -n %s annotate machineinventory %s %s=<id>, then approve the install with %s=%s",
+		eligible, len(session.Candidates), inventory.Namespace, inventory.Name, elementalv1.InstallTargetDeviceAnnotation,
+		elementalv1.InstallApprovedAnnotation, elementalv1.InstallApprovedValue)
+}
+
+// approvalHint tells a person who selected a disk how to release the
+// install, or why the selected disk cannot be installed to as things stand.
+func approvalHint(inventory *elementalv1.MachineInventory, session *register.LiveInstallSession, selection string) string {
+	candidate, _, problem := checkSelection(inventory, session, selection)
+	if candidate == nil {
+		return fmt.Sprintf("install target %s=%q is selected, but %s; select another disk or deal with that before approving the install",
+			elementalv1.InstallTargetDeviceAnnotation, truncate(selection, maxInstallField), problem)
+	}
+	return fmt.Sprintf("install target %s is selected; review spec.network and spec.install, then approve the install with: kubectl -n %s annotate machineinventory %s %s=%s",
+		describeCandidate(candidate), inventory.Namespace, inventory.Name, elementalv1.InstallApprovedAnnotation, elementalv1.InstallApprovedValue)
+}
+
+func discardedApproval(approval, why string) string {
+	return discardedAnnotation(elementalv1.InstallApprovedAnnotation, approval, why)
 }
 
 func discardedSelection(selection, why string) string {
-	return fmt.Sprintf("discarded %s=%q: %s", elementalv1.InstallTargetDeviceAnnotation, truncate(selection, maxInstallField), why)
+	return discardedAnnotation(elementalv1.InstallTargetDeviceAnnotation, selection, why)
+}
+
+func discardedAnnotation(key, value, why string) string {
+	return fmt.Sprintf("discarded %s=%q: %s", key, truncate(value, maxInstallField), why)
+}
+
+func keptSelection(selection string) string {
+	return fmt.Sprintf("%s=%q stays; select another disk or deal with the problem, then approve the install again",
+		elementalv1.InstallTargetDeviceAnnotation, truncate(selection, maxInstallField))
 }
 
 // checkSelection validates the install-target annotation against what the
@@ -492,21 +659,22 @@ func describeCandidate(candidate *elementalv1.InstallCandidate) string {
 	return fmt.Sprintf("%s (%s)", candidate.ID, strings.Join(facts, ", "))
 }
 
-// releaseInstall consumes the selection and sends the configuration that
+// releaseInstall consumes the approval and sends the configuration that
 // installs to the chosen disk and wipes the stale system disks a person saw
-// listed. The release is recorded before the configuration leaves.
-func (i *InventoryServer) releaseInstall(conn *websocket.Conn, protoVersion register.MessageType, round *installRound, registration *elementalv1.MachineRegistration, candidate *elementalv1.InstallCandidate) error {
+// listed. The release is recorded before the configuration leaves. The
+// selection stays until the installed system registers.
+func (i *InventoryServer) releaseInstall(conn *websocket.Conn, protoVersion register.MessageType, round *installRound, registration *elementalv1.MachineRegistration, candidate *elementalv1.InstallCandidate, registry *elementalv1.InstallRegistry) error {
 	inventory := round.inventory
-	selection := inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation]
-	// Guarded by the resourceVersion of the committed inventory: what gets
-	// consumed is the value validated above.
-	if err := i.removeSelection(inventory); err != nil {
-		log.Warningf("Cannot consume %s of MachineInventory %s/%s: %v", elementalv1.InstallTargetDeviceAnnotation, inventory.Namespace, inventory.Name, err)
-		message := fmt.Sprintf("%s=%q is checked again: the MachineInventory changed while it was consumed", elementalv1.InstallTargetDeviceAnnotation, selection)
+	// Guarded by the resourceVersion of the committed inventory: the approval
+	// consumed goes with the selection, spec.network and spec.install
+	// validated and sent.
+	if err := i.removeAnnotations(inventory, elementalv1.InstallApprovedAnnotation); err != nil {
+		log.Warningf("Cannot consume %s of MachineInventory %s/%s: %v", elementalv1.InstallApprovedAnnotation, inventory.Namespace, inventory.Name, err)
+		message := fmt.Sprintf("%s is checked again: the MachineInventory changed while it was consumed", elementalv1.InstallApprovedAnnotation)
 		if !apierrors.IsConflict(err) {
-			message = fmt.Sprintf("%s=%q is checked again: it could not be consumed: %v", elementalv1.InstallTargetDeviceAnnotation, selection, err)
+			message = fmt.Sprintf("%s is checked again: it could not be consumed: %v", elementalv1.InstallApprovedAnnotation, err)
 		}
-		return i.holdInstall(conn, round, elementalv1.AwaitingSelectionReason, message, selectionRetrySeconds)
+		return i.holdInstall(conn, round, elementalv1.AwaitingApprovalReason, message, selectionRetrySeconds)
 	}
 
 	next := round.next
@@ -554,7 +722,7 @@ func (i *InventoryServer) releaseInstall(conn *websocket.Conn, protoVersion regi
 		// Set even when empty: then no stale system disk may be wiped.
 		WipeDeviceIDs: &wipe,
 	}
-	return i.sendConfig(conn, protoVersion, inventory, registration, installReleasedTo(target))
+	return i.sendConfig(conn, protoVersion, inventory, registration, installReleasedTo(target, registry))
 }
 
 // holdInstall records the round with the host waiting for an install target
@@ -670,15 +838,17 @@ func (i *InventoryServer) patchInstallStatus(inventory *elementalv1.MachineInven
 	})
 }
 
-// removeSelection removes the install-target annotation, provided the
-// inventory did not change since it was read: what is removed is the value
-// that was looked at. On success the inventory is what the API server stored.
-func (i *InventoryServer) removeSelection(inventory *elementalv1.MachineInventory) error {
-	if _, found := inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation]; !found {
+// removeAnnotations removes keys from the inventory, provided it did not
+// change since it was read: what is removed is the value that was looked at.
+// On success the inventory is what the API server stored.
+func (i *InventoryServer) removeAnnotations(inventory *elementalv1.MachineInventory, keys ...string) error {
+	patched := inventory.DeepCopy()
+	for _, key := range keys {
+		delete(patched.Annotations, key)
+	}
+	if len(patched.Annotations) == len(inventory.Annotations) {
 		return nil
 	}
-	patched := inventory.DeepCopy()
-	delete(patched.Annotations, elementalv1.InstallTargetDeviceAnnotation)
 	if err := i.Patch(i, patched, client.MergeFromWithOptions(inventory, client.MergeFromWithOptimisticLock{})); err != nil {
 		return err
 	}
@@ -686,33 +856,67 @@ func (i *InventoryServer) removeSelection(inventory *elementalv1.MachineInventor
 	return nil
 }
 
-// discardSelection removes the install-target annotation without releasing
-// anything. When the inventory changed meanwhile the annotation stays for the
-// next registration to look at again.
-func (i *InventoryServer) discardSelection(inventory *elementalv1.MachineInventory, selection, why string) {
-	if err := i.removeSelection(inventory); err != nil {
-		log.Warningf("Cannot discard %s of MachineInventory %s/%s: %v", elementalv1.InstallTargetDeviceAnnotation, inventory.Namespace, inventory.Name, err)
+// discardApproval removes the install-approved annotation without releasing
+// anything.
+func (i *InventoryServer) discardApproval(inventory *elementalv1.MachineInventory, approval, why string) {
+	i.discardAnnotation(inventory, elementalv1.InstallApprovedAnnotation, approval, why, EventReasonApprovalDiscarded)
+}
+
+// discardAnnotation removes the annotation key, whose value was rejected for
+// why, and records eventReason. It does not let a concurrent change keep the
+// annotation alive: on a conflict it reads the inventory again and removes
+// whatever value it holds, since what the next registration of this boot
+// would see must not be what this registration rejected.
+func (i *InventoryServer) discardAnnotation(inventory *elementalv1.MachineInventory, key, value, why, eventReason string) {
+	current := inventory
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		err := i.removeAnnotations(current, key)
+		if !apierrors.IsConflict(err) {
+			return err
+		}
+		fresh := &elementalv1.MachineInventory{}
+		if getErr := i.Get(i, client.ObjectKeyFromObject(inventory), fresh); getErr != nil {
+			return getErr
+		}
+		if fresh.UID != inventory.UID {
+			return fmt.Errorf("MachineInventory UID changed from %q to %q", inventory.UID, fresh.UID)
+		}
+		current = fresh
+		return err
+	})
+	if err != nil {
+		log.Warningf("Cannot discard %s of MachineInventory %s/%s: %v", key, inventory.Namespace, inventory.Name, err)
 		return
 	}
-	message := discardedSelection(selection, why)
-	i.recordEvent(inventory, corev1.EventTypeWarning, EventReasonSelectionDiscarded, message)
+	if current != inventory {
+		current.DeepCopyInto(inventory)
+	}
+	message := discardedAnnotation(key, value, why)
+	i.recordEvent(inventory, corev1.EventTypeWarning, eventReason, message)
 	log.Infof("MachineInventory %s/%s: %s", inventory.Namespace, inventory.Name, message)
 }
 
 // settleInstall runs after a registration without a live install session: an
 // installed system (or a client from before sessions). An install that was
-// released or failed is then over, the system it installed registered; a
-// selection left on the inventory goes with it. registered is set for a
-// registration update, i.e. a host with registration state: an installed
-// system. Only such a host also ends a wait for an install target, as when
-// the installation media stayed attached and the host went back to the live
-// ISO once before someone booted it from its disk.
+// released or failed is then over, the system it installed registered; the
+// selection, and an approval left on the inventory, go with it. registered is
+// set for a registration update, i.e. a host with registration state: an
+// installed system. Only such a host also ends a wait for an install target,
+// as when the installation media stayed attached and the host went back to
+// the live ISO once before someone booted it from its disk. Its registration
+// also removes the selection when the install already reported itself
+// Installed, the usual way an install ends: the selection is not consumed by
+// the release, so nothing else would.
 func (i *InventoryServer) settleInstall(inventory *elementalv1.MachineInventory, registered bool) {
-	if !installUnsettled(inventory.Status.Install, registered) {
+	unsettled := installUnsettled(inventory.Status.Install, registered)
+	if !unsettled && !registered {
 		return
 	}
-	if err := i.removeSelection(inventory); err != nil {
-		log.Warningf("Cannot remove %s from MachineInventory %s/%s: %v", elementalv1.InstallTargetDeviceAnnotation, inventory.Namespace, inventory.Name, err)
+	if err := i.removeAnnotations(inventory, installGateAnnotations...); err != nil {
+		log.Warningf("Cannot remove %s from MachineInventory %s/%s: %v", strings.Join(installGateAnnotations, " and "), inventory.Namespace, inventory.Name, err)
+	}
+	if !unsettled {
+		return
 	}
 	now := i.now()
 	err := i.patchInstallStatus(inventory, func(status *elementalv1.MachineInventoryStatus) bool {
@@ -784,12 +988,14 @@ func withoutInstallRelease(registration *elementalv1.MachineRegistration) func(*
 }
 
 // installReleasedTo adjusts the configuration to install to the released
-// target and nothing else.
-func installReleasedTo(target elementalv1.InstallTarget) func(*elementalv1.Config) {
+// target and nothing else, pulling the system image through registry, the
+// registry mirror input resolved before the release.
+func installReleasedTo(target elementalv1.InstallTarget, registry *elementalv1.InstallRegistry) func(*elementalv1.Config) {
 	return func(config *elementalv1.Config) {
 		config.Elemental.Install.Device = ""
 		config.Elemental.Install.DeviceSelector = nil
 		config.Elemental.InstallTarget = &target
+		config.Elemental.InstallRegistry = registry
 	}
 }
 

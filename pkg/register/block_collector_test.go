@@ -222,14 +222,17 @@ func TestForkProtocolMessageNumbers(t *testing.T) {
 		MsgLiveInstallSession:    16,
 		MsgInstallHold:           17,
 		MsgInstallReport:         18,
+		// A protocol level only: the operator holds a toolkit install from
+		// a system-uri for registers below it.
+		MsgToolkitInstallRegistry: 19,
 	}
 	for msg, number := range want {
 		if byte(msg) != number {
 			t.Errorf("%s = %d, want %d", msg, byte(msg), number)
 		}
 	}
-	if MsgLast != MsgInstallReport {
-		t.Errorf("MsgLast = %d, want %d", MsgLast, MsgInstallReport)
+	if MsgLast != MsgToolkitInstallRegistry {
+		t.Errorf("MsgLast = %d, want %d", MsgLast, MsgToolkitInstallRegistry)
 	}
 	// 14 and 15 carried the removed storage observer. Peers of older releases
 	// may still send them, so no message may ever be given those numbers again.
@@ -764,5 +767,19 @@ func TestBlockCollectorMeasuredQEMUBusEvidence(t *testing.T) {
 	}
 	if !strings.Contains(sda.IDProblem, `bus not proven local (transport="", driver="megaraid_sas")`) {
 		t.Fatalf("sda IDProblem must name the driver that failed the check: %q", sda.IDProblem)
+	}
+}
+
+func TestIsUnidentifiedDeviceID(t *testing.T) {
+	for id, want := range map[string]bool{
+		UnidentifiedDeviceID("/dev/vda"): true,
+		" UNIDENTIFIED:dev_vda":          true,
+		"wwn:5000c500a1b2c3d4":           false,
+		"serial:model:unidentified":      false,
+		"":                               false,
+	} {
+		if got := IsUnidentifiedDeviceID(id); got != want {
+			t.Errorf("IsUnidentifiedDeviceID(%q) = %v, want %v", id, got, want)
+		}
 	}
 }

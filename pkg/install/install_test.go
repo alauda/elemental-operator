@@ -56,7 +56,6 @@ var (
 				NoFormat:         true,
 				ConfigURLs:       []string{"foo", "bar"},
 				ISO:              "a test iso",
-				SystemURI:        "a system uri",
 				Debug:            true,
 				TTY:              "a test tty",
 				PowerOff:         true,
@@ -151,7 +150,7 @@ var _ = Describe("installer install elemental", Label("installer", "install"), f
 		DeferCleanup(fsCleanup)
 	})
 	It("should call elemental install", func() {
-		cliRunner.EXPECT().Install(configFixture.Elemental.Install).Return(nil)
+		cliRunner.EXPECT().Install(configFixture.Elemental.Install, elementalcli.InstallOptions{}).Return(nil)
 		networkConfigurator.EXPECT().GetNetworkConfigApplicator(networkConfigFixture).Return(networkConfigApplicatorFixture, nil)
 		Expect(install.InstallElemental(configFixture, stateFixture, networkConfigFixture)).ToNot(HaveOccurred())
 		compareFiles(fs, filepath.Join(elementalcli.TempCloudInitDir, elementalBeforeHook), "_testdata/before-hook-config-install.yaml")
@@ -161,7 +160,7 @@ var _ = Describe("installer install elemental", Label("installer", "install"), f
 		config.Elemental.Install.Device = "/dev/elemental-install-target"
 		want := config.Elemental.Install
 		want.Device = "/dev/sdb"
-		cliRunner.EXPECT().Install(want).Return(nil)
+		cliRunner.EXPECT().Install(want, elementalcli.InstallOptions{}).Return(nil)
 		networkConfigurator.EXPECT().GetNetworkConfigApplicator(networkConfigFixture).Return(networkConfigApplicatorFixture, nil)
 		Expect(install.InstallElemental(config, stateFixture, networkConfigFixture)).To(Succeed())
 	})
@@ -184,7 +183,7 @@ var _ = Describe("installer install elemental", Label("installer", "install"), f
 			config.Elemental.Install.NoFormat = false
 			want := config.Elemental.Install
 			want.Device = "/dev/sdb"
-			cliRunner.EXPECT().Install(want).DoAndReturn(func(elementalv1.Install) error {
+			cliRunner.EXPECT().Install(want, elementalcli.InstallOptions{}).DoAndReturn(func(elementalv1.Install, elementalcli.InstallOptions) error {
 				commands := destructive(host.calls)
 				Expect(commands).To(ContainElements("blockdev --rereadpt /dev/sda", "blockdev --rereadpt /dev/sdb"))
 				Expect(commands[len(commands)-1]).To(Equal("udevadm settle"))

@@ -31,6 +31,7 @@ import (
 	reflect "reflect"
 
 	v1beta1 "github.com/rancher/elemental-operator/api/v1beta1"
+	elementalcli "github.com/rancher/elemental-operator/pkg/elementalcli"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -58,17 +59,17 @@ func (m *MockRunner) EXPECT() *MockRunnerMockRecorder {
 }
 
 // Install mocks base method.
-func (m *MockRunner) Install(arg0 v1beta1.Install) error {
+func (m *MockRunner) Install(arg0 v1beta1.Install, arg1 elementalcli.InstallOptions) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Install", arg0)
+	ret := m.ctrl.Call(m, "Install", arg0, arg1)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // Install indicates an expected call of Install.
-func (mr *MockRunnerMockRecorder) Install(arg0 any) *gomock.Call {
+func (mr *MockRunnerMockRecorder) Install(arg0, arg1 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Install", reflect.TypeOf((*MockRunner)(nil).Install), arg0)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Install", reflect.TypeOf((*MockRunner)(nil).Install), arg0, arg1)
 }
 
 // Reset mocks base method.

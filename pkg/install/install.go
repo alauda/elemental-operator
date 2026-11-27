@@ -84,6 +84,7 @@ func NewInstaller(fs vfs.FS, networkConfigurator network.Configurator) Installer
 		runner:              elementalcli.NewRunner(),
 		networkConfigurator: networkConfigurator,
 		kubeos:              defaultKubeOSOptions(),
+		toolkit:             defaultToolkitOptions(),
 		disk:                defaultDiskOptions(),
 	}
 }
@@ -95,6 +96,8 @@ type installer struct {
 	runner              elementalcli.Runner
 	networkConfigurator network.Configurator
 	kubeos              kubeosOptions
+	// toolkit drives the pull of install.system-uri (toolkit_registry.go).
+	toolkit toolkitOptions
 	// disk drives the pre-install step both backends share (target.go).
 	disk diskOptions
 }
@@ -112,6 +115,14 @@ func (i *installer) InstallElemental(config elementalv1.Config, state register.S
 		return fmt.Errorf("failed picking installation device: %w", err)
 	}
 
+	// The toolkit partitions the disk before it pulls install.system-uri:
+	// make sure the image can be pulled while no disk was touched yet.
+	pull, removeCredentials, err := i.prepareSystemImagePull(&config.Elemental.Install, config.Elemental.InstallRegistry)
+	if err != nil {
+		return err
+	}
+	defer removeCredentials()
+
 	if err := i.writeHookConfigurator(beforeInstallStage, installOEMMount, config, state, networkConfig); err != nil {
 		return fmt.Errorf("writing %s configurator: %w", beforeInstallStage, err)
 	}
@@ -120,7 +131,7 @@ func (i *installer) InstallElemental(config elementalv1.Config, state register.S
 		return fmt.Errorf("preparing install disks: %w", err)
 	}
 
-	if err := i.runner.Install(config.Elemental.Install); err != nil {
+	if err := i.runner.Install(config.Elemental.Install, pull); err != nil {
 		return fmt.Errorf("failed to install elemental: %w", err)
 	}
 

@@ -53,6 +53,11 @@ type MachineInventorySpec struct {
 	// NetworkConfig is the final NetworkConfig.
 	// +optional
 	Network NetworkConfig `json:"network,omitempty"`
+	// Install overrides, for this host only, install settings of the
+	// MachineRegistration it registers with (Alauda fork). They take effect
+	// when the install is released, so they can be changed until then.
+	// +optional
+	Install *MachineInventoryInstall `json:"install,omitempty"`
 	// ObservedNetwork is a live-ISO-side snapshot of the host's actual network
 	// configuration uploaded by elemental-register during initial registration
 	// (Alauda fork). It is informational only and is intentionally kept
@@ -61,6 +66,19 @@ type MachineInventorySpec struct {
 	// before install-time network reconfiguration.
 	// +optional
 	ObservedNetwork *ObservedNetwork `json:"observedNetwork,omitempty"`
+}
+
+// MachineInventoryInstall holds the install settings a MachineInventory
+// overrides (Alauda fork). Each field means what the field of the same name
+// in the MachineRegistration's spec.config.elemental.install means; an empty
+// field keeps the registration's value.
+type MachineInventoryInstall struct {
+	// SystemURI is the system image the install pulls, as install.system-uri
+	// of the MachineRegistration: a registry reference, docker: prefix
+	// optional. The credentials are those of the cpaas.io/registry-reference
+	// label, which the MachineInventory may also override.
+	// +optional
+	SystemURI string `json:"system-uri,omitempty" yaml:"system-uri,omitempty"`
 }
 
 // ObservedNetwork captures a snapshot of the host's actual network state as

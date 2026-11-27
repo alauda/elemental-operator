@@ -38,7 +38,8 @@ type Install struct {
 	// device and device-selector. "inventory" makes a host booted from the
 	// live ISO report its disks on its MachineInventory (status.install) and
 	// wait until a person picks one with the
-	// baremetal.alauda.io/install-target-device annotation; device and
+	// baremetal.alauda.io/install-target-device annotation and approves the
+	// install with baremetal.alauda.io/install-approved: "true"; device and
 	// device-selector are not used then.
 	// +optional
 	// +kubebuilder:validation:Enum="";inventory

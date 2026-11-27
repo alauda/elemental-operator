@@ -23,10 +23,26 @@ import (
 const (
 	// InstallTargetDeviceAnnotation picks the install disk of a host that
 	// waits in the live ISO with install.device-selection: inventory. The
-	// value is the ID of one of status.install.candidates. It is one-shot:
-	// the registration server removes it when it releases the host, and
-	// discards one that was set before the live session started.
+	// value is the ID of one of status.install.candidates. It only prepares
+	// the install: InstallApprovedAnnotation releases it. The selection stays
+	// across live boots and is checked again against the disks of the boot
+	// the install is approved in; the registration server removes it once
+	// the installed system registers. An unidentified: ID names a disk by its
+	// kernel path in one live boot only: such a selection is discarded when
+	// the host boots the live ISO again.
 	InstallTargetDeviceAnnotation = "baremetal.alauda.io/install-target-device"
+	// InstallApprovedAnnotation, set to "true", releases the install of a
+	// host waiting in the live ISO with install.device-selection: inventory
+	// to the disk InstallTargetDeviceAnnotation selects, with the
+	// spec.network and spec.install the MachineInventory has at that moment.
+	// It is one-shot and holds for the current live boot only: the
+	// registration server removes it when it releases the install, and
+	// discards one that was set before this live boot registered or does not
+	// pass validation.
+	InstallApprovedAnnotation = "baremetal.alauda.io/install-approved"
+	// InstallApprovedValue is the only value of InstallApprovedAnnotation
+	// that approves the install.
+	InstallApprovedValue = "true"
 	// RegistrationIPLabel carries the source IP the host registered from,
 	// refreshed on every registration, so an inventory can be found by the
 	// IP shown on the host console. IPv6 addresses are written in full with
@@ -154,10 +170,25 @@ const (
 	InstallTargetReadyCondition = "InstallTargetReady"
 	// AwaitingSelectionReason: no install target was chosen yet.
 	AwaitingSelectionReason = "AwaitingSelection"
-	// SelectionDiscardedReason: an install-target annotation was set before
-	// the live session started, or did not survive validation, and was
-	// removed.
+	// AwaitingApprovalReason: an install target is selected and the host
+	// waits for the install-approved annotation.
+	AwaitingApprovalReason = "AwaitingApproval"
+	// SelectionDiscardedReason: an install-target annotation by an
+	// unidentified: ID was set before the live boot registered and was
+	// removed. Selections by stable IDs stay across live boots.
 	SelectionDiscardedReason = "SelectionDiscarded"
+	// ApprovalDiscardedReason: an install-approved annotation was set before
+	// the live boot registered, or is not "true", and was removed.
+	ApprovalDiscardedReason = "ApprovalDiscarded"
+	// LiveTooOldReason: the elemental-register of the live system cannot do
+	// the install the configuration asks for (a toolkit install from
+	// system-uri); the host must boot a newer live ISO.
+	LiveTooOldReason = "LiveTooOld"
+	// RegistryInputInvalidReason: the registry mirror input the install
+	// pulls its system image (install.system-uri) through is missing or
+	// does not validate. The install-approved annotation was discarded
+	// before the install was released; the selection stays.
+	RegistryInputInvalidReason = "RegistryInputInvalid"
 	// TargetNotObservedReason: the chosen disk is not among the disks the
 	// live session reported, or the host could not find it.
 	TargetNotObservedReason = "TargetNotObserved"

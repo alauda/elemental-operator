@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -298,6 +299,20 @@ func (e *installTestEnv) selectDisk(name, id string) {
 	})
 }
 
+func (e *installTestEnv) approve(name string) {
+	e.update(name, func(inventory *elementalv1.MachineInventory) {
+		inventory.Annotations[elementalv1.InstallApprovedAnnotation] = elementalv1.InstallApprovedValue
+	})
+}
+
+// selectAndApprove picks the disk and releases the install in one go.
+func (e *installTestEnv) selectAndApprove(name, id string) {
+	e.update(name, func(inventory *elementalv1.MachineInventory) {
+		inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation] = id
+		inventory.Annotations[elementalv1.InstallApprovedAnnotation] = elementalv1.InstallApprovedValue
+	})
+}
+
 func condition(inventory *elementalv1.MachineInventory, conditionType string) metav1.Condition {
 	found := meta.FindStatusCondition(inventory.Status.Conditions, conditionType)
 	if found == nil {
@@ -325,20 +340,22 @@ func (h liveHost) with(session *register.LiveInstallSession) liveHost {
 	return h
 }
 
-func TestLiveInstallNewBootDiscardsEarlierSelection(t *testing.T) {
+func TestLiveInstallNewBootDiscardsEarlierApproval(t *testing.T) {
 	g := NewWithT(t)
 	env := newInstallTestEnv(t, installEnvOptions{}, liveInventory("node-a"))
-	// Picked before the host booted the live ISO, e.g. left from an earlier
-	// install: it must not release this boot.
-	env.selectDisk("node-a", diskA)
+	// Approved before the host booted the live ISO, e.g. left from an
+	// earlier install: it must not release this boot. The selection stays.
+	env.selectAndApprove("node-a", diskA)
 
 	hold := env.hold(hostA.in("boot-1"))
-	g.Expect(hold.Reason).To(Equal(elementalv1.SelectionDiscardedReason))
+	g.Expect(hold.Reason).To(Equal(elementalv1.ApprovalDiscardedReason))
 	g.Expect(hold.RetryAfterSeconds).To(Equal(register.DefaultInstallHoldSeconds))
-	g.Expect(hold.Message).To(ContainSubstring("set before live boot boot-1 registered"))
+	g.Expect(hold.Message).To(HavePrefix(`discarded baremetal.alauda.io/install-approved="true": it was set before live boot boot-1 registered`))
+	g.Expect(hold.Message).To(ContainSubstring("install target " + diskA + " (/dev/sda"))
 
 	inventory := env.inventory("node-a")
-	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
+	g.Expect(inventory.Annotations).To(HaveKeyWithValue(elementalv1.InstallTargetDeviceAnnotation, diskA))
 	install := inventory.Status.Install
 	g.Expect(install).ToNot(BeNil())
 	g.Expect(install.Phase).To(Equal(elementalv1.InstallPhaseAwaitingTarget))
@@ -348,13 +365,19 @@ func TestLiveInstallNewBootDiscardsEarlierSelection(t *testing.T) {
 	g.Expect(install.TargetDeviceID).To(BeEmpty())
 	g.Expect(install.Candidates).To(Equal(liveSession("boot-1").Candidates))
 	g.Expect(install.StaleSystemDisks).To(Equal(liveSession("boot-1").StaleSystemDisks))
-	g.Expect(condition(inventory, elementalv1.InstallTargetReadyCondition)).To(haveCondition(metav1.ConditionFalse, elementalv1.SelectionDiscardedReason))
+	g.Expect(condition(inventory, elementalv1.InstallTargetReadyCondition)).To(haveCondition(metav1.ConditionFalse, elementalv1.ApprovalDiscardedReason))
 	stale := condition(inventory, elementalv1.StaleSystemDisksCondition)
 	g.Expect(stale).To(haveCondition(metav1.ConditionFalse, elementalv1.DetectedReason))
 	g.Expect(stale.Message).To(ContainSubstring(diskB))
 	// The controller's conditions stay.
 	g.Expect(condition(inventory, elementalv1.NetworkConfigReady)).To(haveCondition(metav1.ConditionTrue, elementalv1.ReconcilingNetworkConfig))
-	g.Expect(env.events()).To(ConsistOf(HavePrefix("Warning SelectionDiscarded")))
+	g.Expect(env.events()).To(ConsistOf(HavePrefix("Warning ApprovalDiscarded")))
+
+	// The host now waits for an approval of this boot.
+	g.Expect(env.hold(hostA.in("boot-1")).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+	env.approve("node-a")
+	config, _ := env.config(hostA.in("boot-1"))
+	g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
 }
 
 func TestLiveInstallHoldsUntilADiskIsPicked(t *testing.T) {
@@ -369,7 +392,7 @@ func TestLiveInstallHoldsUntilADiskIsPicked(t *testing.T) {
 	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingSelectionReason))
 	g.Expect(hold.RetryAfterSeconds).To(Equal(register.DefaultInstallHoldSeconds))
 	g.Expect(hold.Message).To(ContainSubstring("2 of 3 disks"))
-	g.Expect(hold.Message).To(ContainSubstring("kubectl -n fleet-default annotate machineinventory node-a baremetal.alauda.io/install-target-device=<id>"))
+	g.Expect(hold.Message).To(ContainSubstring("kubectl -n fleet-default annotate machineinventory node-a baremetal.alauda.io/install-target-device=<id>, then approve the install with baremetal.alauda.io/install-approved=true"))
 
 	inventory := env.inventory("node-a")
 	g.Expect(inventory.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseAwaitingTarget))
@@ -387,6 +410,13 @@ func TestLiveInstallReleasesThePickedDisk(t *testing.T) {
 	env.hold(hostA.in("boot-1"))
 	env.selectDisk("node-a", " "+diskA+" ")
 	env.clock.Advance(15 * time.Second)
+	// Picking the disk only prepares the install.
+	hold := env.hold(hostA.in("boot-1"))
+	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+	g.Expect(hold.Message).To(Equal("install target " + diskA + " (/dev/sda, 480103981056 bytes, SSDSC2KB480G8) is selected; review spec.network and spec.install, then approve the install with: kubectl -n fleet-default annotate machineinventory node-a baremetal.alauda.io/install-approved=true"))
+	g.Expect(condition(env.inventory("node-a"), elementalv1.InstallTargetReadyCondition)).To(haveCondition(metav1.ConditionFalse, elementalv1.AwaitingApprovalReason))
+	env.approve("node-a")
+	env.clock.Advance(15 * time.Second)
 
 	config, raw := env.config(hostA.in("boot-1"))
 	g.Expect(config.Elemental.Install.Device).To(BeEmpty())
@@ -401,7 +431,8 @@ func TestLiveInstallReleasesThePickedDisk(t *testing.T) {
 	g.Expect(config.Elemental.SystemAgent.Token).To(Equal("system-agent-token"))
 
 	inventory := env.inventory("node-a")
-	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
+	g.Expect(inventory.Annotations).To(HaveKeyWithValue(elementalv1.InstallTargetDeviceAnnotation, " "+diskA+" "))
 	install := inventory.Status.Install
 	g.Expect(install.Phase).To(Equal(elementalv1.InstallPhaseInstalling))
 	g.Expect(install.TargetDeviceID).To(Equal(diskA))
@@ -412,10 +443,10 @@ func TestLiveInstallReleasesThePickedDisk(t *testing.T) {
 	g.Expect(condition(inventory, elementalv1.StaleSystemDisksCondition)).To(haveCondition(metav1.ConditionFalse, elementalv1.DetectedReason))
 	g.Expect(env.events()).To(ConsistOf(SatisfyAll(HavePrefix("Normal InstallReleased"), ContainSubstring(diskA), ContainSubstring("wipes the stale system disks "+diskB))))
 
-	// The selection is gone: the next registration of the boot does not
+	// The approval is used up: the next registration of the boot does not
 	// release again.
-	hold := env.hold(hostA.in("boot-1"))
-	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	hold = env.hold(hostA.in("boot-1"))
+	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingApprovalReason))
 	g.Expect(env.inventory("node-a").Status.Install.Message).To(Equal("the install released to " + diskA + " in this live boot did not complete"))
 }
 
@@ -425,7 +456,7 @@ func TestLiveInstallMatchesAHandWrittenID(t *testing.T) {
 	g := NewWithT(t)
 	env := newInstallTestEnv(t, installEnvOptions{}, liveInventory("node-a"))
 	env.hold(hostA.in("boot-1"))
-	env.selectDisk("node-a", "WWN:0x5000C500A1B2C3D4")
+	env.selectAndApprove("node-a", "WWN:0x5000C500A1B2C3D4")
 
 	config, raw := env.config(hostA.in("boot-1"))
 	g.Expect(config.Elemental.InstallTarget).ToNot(BeNil(), raw)
@@ -443,7 +474,7 @@ func TestLiveInstallReleasesADiskWithoutAStableID(t *testing.T) {
 	session.Candidates = []elementalv1.InstallCandidate{{ID: "unidentified:dev_vda", Path: "/dev/vda", SizeBytes: 107374182400, Eligible: true}}
 	session.StaleSystemDisks = nil
 	env.hold(hostA.with(session))
-	env.selectDisk("node-a", "unidentified:dev_vda")
+	env.selectAndApprove("node-a", "unidentified:dev_vda")
 
 	config, raw := env.config(hostA.with(session))
 	target := config.Elemental.InstallTarget
@@ -473,7 +504,7 @@ func TestLiveInstallReleaseApprovesNoWipeBeyondTheList(t *testing.T) {
 			session := liveSession("boot-1")
 			session.StaleSystemDisks = tc.stale
 			env.hold(hostA.with(session))
-			env.selectDisk("node-a", tc.pick)
+			env.selectAndApprove("node-a", tc.pick)
 
 			config, raw := env.config(hostA.with(session))
 			g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(tc.pick))
@@ -490,7 +521,10 @@ func TestLiveInstallReleaseApprovesNoWipeBeyondTheList(t *testing.T) {
 	}
 }
 
-func TestLiveInstallDiscardsInvalidSelection(t *testing.T) {
+// An approval is checked against the disks of the live boot: when the
+// selected disk cannot be installed to, the approval is discarded and the
+// selection stays for a person to change.
+func TestLiveInstallDiscardsTheApprovalOfAnInvalidSelection(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		pick      string
@@ -539,14 +573,22 @@ func TestLiveInstallDiscardsInvalidSelection(t *testing.T) {
 					tc.inventory(inventory)
 				}
 			})
-
+			// Without the approval the host shows why the disk will not do.
 			hold := env.hold(hostA.with(session))
-			g.Expect(hold.Reason).To(Equal(tc.reason))
-			g.Expect(hold.Message).To(HavePrefix("discarded " + elementalv1.InstallTargetDeviceAnnotation))
+			g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+			g.Expect(hold.Message).To(ContainSubstring("is selected, but "))
 			g.Expect(hold.Message).To(ContainSubstring(tc.message))
+			env.approve("node-a")
+
+			hold = env.hold(hostA.with(session))
+			g.Expect(hold.Reason).To(Equal(tc.reason))
+			g.Expect(hold.Message).To(HavePrefix("discarded " + elementalv1.InstallApprovedAnnotation))
+			g.Expect(hold.Message).To(ContainSubstring(tc.message))
+			g.Expect(hold.Message).To(ContainSubstring(elementalv1.InstallTargetDeviceAnnotation + "=" + fmt.Sprintf("%q", tc.pick) + " stays"))
 
 			inventory := env.inventory("node-a")
-			g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+			g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
+			g.Expect(inventory.Annotations).To(HaveKeyWithValue(elementalv1.InstallTargetDeviceAnnotation, tc.pick))
 			g.Expect(inventory.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseAwaitingTarget))
 			ready := condition(inventory, elementalv1.InstallTargetReadyCondition)
 			g.Expect(ready).To(haveCondition(metav1.ConditionFalse, tc.reason))
@@ -554,43 +596,58 @@ func TestLiveInstallDiscardsInvalidSelection(t *testing.T) {
 			if tc.reason == elementalv1.BlockedReason {
 				g.Expect(condition(inventory, elementalv1.StaleSystemDisksCondition)).To(haveCondition(metav1.ConditionFalse, elementalv1.BlockedReason))
 			}
-			g.Expect(env.events()).To(ConsistOf(HavePrefix("Warning SelectionDiscarded")))
+			g.Expect(env.events()).To(ConsistOf(HavePrefix("Warning ApprovalDiscarded")))
 		})
 	}
 }
 
-// conflictOnce makes the next patch that touches the install-target
+// conflictOnce makes the next patch that touches the install-approved
 // annotation fail with a conflict, as if the inventory changed meanwhile.
 func conflictOnce(armed *atomic.Bool) interceptor.Funcs {
 	return interceptor.Funcs{Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 		data, err := patch.Data(obj)
-		if err == nil && strings.Contains(string(data), elementalv1.InstallTargetDeviceAnnotation) && armed.CompareAndSwap(true, false) {
+		if err == nil && strings.Contains(string(data), elementalv1.InstallApprovedAnnotation) && armed.CompareAndSwap(true, false) {
 			return apierrors.NewConflict(schema.GroupResource{Group: "elemental.cattle.io", Resource: "machineinventories"}, obj.GetName(), errors.New("the object has been modified"))
 		}
 		return c.Patch(ctx, obj, patch, opts...)
 	}}
 }
 
-func TestLiveInstallSelectionConsumeConflictHoldsBriefly(t *testing.T) {
+func TestLiveInstallApprovalConsumeConflictHoldsBriefly(t *testing.T) {
 	g := NewWithT(t)
 	armed := &atomic.Bool{}
 	env := newInstallTestEnv(t, installEnvOptions{funcs: conflictOnce(armed)}, liveInventory("node-a"))
 	env.hold(hostA.in("boot-1"))
-	env.selectDisk("node-a", diskA)
+	env.selectAndApprove("node-a", diskA)
 
 	armed.Store(true)
 	hold := env.hold(hostA.in("boot-1"))
-	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingApprovalReason))
 	g.Expect(hold.RetryAfterSeconds).To(Equal(5))
 	g.Expect(hold.Message).To(ContainSubstring("checked again"))
 	inventory := env.inventory("node-a")
-	g.Expect(inventory.Annotations).To(HaveKeyWithValue(elementalv1.InstallTargetDeviceAnnotation, diskA))
+	g.Expect(inventory.Annotations).To(HaveKeyWithValue(elementalv1.InstallApprovedAnnotation, "true"))
 	g.Expect(inventory.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseAwaitingTarget))
 
 	// The next registration looks at it again and releases.
 	config, _ := env.config(hostA.in("boot-1"))
 	g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
-	g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+	g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
+}
+
+// A discard that runs into a concurrent change still removes the approval:
+// the next registration of the boot must not take it as current.
+func TestLiveInstallDiscardSurvivesAConflict(t *testing.T) {
+	g := NewWithT(t)
+	armed := &atomic.Bool{}
+	env := newInstallTestEnv(t, installEnvOptions{funcs: conflictOnce(armed)}, liveInventory("node-a"))
+	env.selectAndApprove("node-a", diskA)
+
+	armed.Store(true)
+	g.Expect(env.hold(hostA.in("boot-1")).Reason).To(Equal(elementalv1.ApprovalDiscardedReason))
+	g.Expect(armed.Load()).To(BeFalse())
+	g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
+	g.Expect(env.hold(hostA.in("boot-1")).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
 }
 
 // failStatusPatches makes every status patch fail.
@@ -610,6 +667,7 @@ func TestLiveInstallStatusFailure(t *testing.T) {
 		inventory := liveInventory("node-a")
 		inventory.Status.Install = &elementalv1.InstallStatus{Phase: elementalv1.InstallPhaseAwaitingTarget, BootID: "boot-1"}
 		inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation] = diskA
+		inventory.Annotations[elementalv1.InstallApprovedAnnotation] = "true"
 		env := newInstallTestEnv(t, installEnvOptions{funcs: failStatusPatches}, inventory)
 		reply, data := env.registerLive(hostA.in("boot-1"))
 		message := errorReply(t, reply, data)
@@ -650,8 +708,8 @@ func TestLiveInstallAfterAFailedAttemptInTheSameBoot(t *testing.T) {
 	g.Expect(install.Phase).To(Equal(elementalv1.InstallPhaseAwaitingTarget))
 	g.Expect(install.Message).To(Equal("the last install attempt in this live boot failed: grub2-install: no space left on device"))
 
-	// Picked again in the same boot: released again.
-	env.selectDisk("node-a", diskA)
+	// Approved again in the same boot: released again.
+	env.selectAndApprove("node-a", diskA)
 	config, _ := env.config(hostA.in("boot-1"))
 	g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
 	g.Expect(env.inventory("node-a").Status.Install.Message).To(BeEmpty())
@@ -671,18 +729,19 @@ func TestLiveInstallAlternatingBootsAreAnIdentityConflict(t *testing.T) {
 	g.Expect(condition(env.inventory("node-a"), elementalv1.InstallTargetReadyCondition)).To(haveCondition(metav1.ConditionFalse, elementalv1.IdentityConflictReason))
 	g.Expect(env.events()).To(ConsistOf(HavePrefix("Warning IdentityConflict live boots boot-a and boot-b take turns")))
 
-	// A selection made meanwhile does not release either host, even when
+	// An approval given meanwhile does not release either host, even when
 	// the same boot registers twice in a row.
-	env.selectDisk("node-a", diskA)
+	env.selectAndApprove("node-a", diskA)
 	env.clock.Advance(8 * time.Second)
 	hold = env.hold(hostA.in("boot-a"))
 	g.Expect(hold.Reason).To(Equal(elementalv1.IdentityConflictReason))
-	g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+	g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
 
-	// Once the other host is gone for good, the remaining one can be picked.
+	// Once the other host is gone for good, the remaining one can be
+	// approved.
 	env.clock.Advance(liveBootAlternation)
-	g.Expect(env.hold(hostA.in("boot-a")).Reason).To(Equal(elementalv1.AwaitingSelectionReason))
-	env.selectDisk("node-a", diskA)
+	g.Expect(env.hold(hostA.in("boot-a")).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+	env.approve("node-a")
 	config, _ := env.config(hostA.in("boot-a"))
 	g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
 }
@@ -752,14 +811,17 @@ func TestInstalledSystemSettlesTheInstall(t *testing.T) {
 				Phase: phase, BootID: "boot-1", TargetDeviceID: diskA, Message: "earlier",
 				Candidates: session.Candidates, StaleSystemDisks: session.StaleSystemDisks,
 			}
-			// Set again while the host was installing.
+			// The selection of the install, and an approval set again while
+			// the host was installing.
 			inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation] = diskA
+			inventory.Annotations[elementalv1.InstallApprovedAnnotation] = "true"
 			env := newInstallTestEnv(t, installEnvOptions{}, inventory)
 
 			config, _ := env.config(hostA)
 			g.Expect(config.Elemental.Install.Device).To(Equal(installTargetRequiresSelection))
 			stored := env.inventory("node-a")
 			g.Expect(stored.Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+			g.Expect(stored.Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
 			g.Expect(stored.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseInstalled))
 			g.Expect(stored.Status.Install.Message).To(BeEmpty())
 			g.Expect(stored.Status.Install.BootID).To(Equal("boot-1"))
@@ -803,6 +865,31 @@ func TestInstalledSystemSettlesTheInstall(t *testing.T) {
 		g.Expect(meta.FindStatusCondition(stored.Status.Conditions, elementalv1.InstallTargetReadyCondition)).To(BeNil())
 		g.Expect(meta.FindStatusCondition(stored.Status.Conditions, elementalv1.StaleSystemDisksCondition)).To(BeNil())
 	})
+	// The usual end of an install: the host reported it Installed before it
+	// rebooted, then the installed system registers. The selection, which
+	// the release did not consume, goes; the status is already final.
+	t.Run("an installed system removes the selection after a reported install", func(t *testing.T) {
+		g := NewWithT(t)
+		inventory := liveInventory("node-a")
+		inventory.Status.Install = &elementalv1.InstallStatus{Phase: elementalv1.InstallPhaseInstalled, BootID: "boot-1", TargetDeviceID: diskA}
+		inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation] = diskA
+		env := newInstallTestEnv(t, installEnvOptions{}, inventory)
+
+		env.config(liveHost{auth: hostA.auth, update: true})
+		stored := env.inventory("node-a")
+		g.Expect(stored.Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+		g.Expect(stored.Status.Install).To(Equal(inventory.Status.Install))
+	})
+	t.Run("a registration without state leaves a reported install alone", func(t *testing.T) {
+		g := NewWithT(t)
+		inventory := liveInventory("node-a")
+		inventory.Status.Install = &elementalv1.InstallStatus{Phase: elementalv1.InstallPhaseInstalled, BootID: "boot-1", TargetDeviceID: diskA}
+		inventory.Annotations[elementalv1.InstallTargetDeviceAnnotation] = diskA
+		env := newInstallTestEnv(t, installEnvOptions{}, inventory)
+
+		env.config(hostA)
+		g.Expect(env.inventory("node-a").Annotations).To(HaveKeyWithValue(elementalv1.InstallTargetDeviceAnnotation, diskA))
+	})
 	t.Run("an install awaiting a target is left alone", func(t *testing.T) {
 		g := NewWithT(t)
 		inventory := liveInventory("node-a")
@@ -836,11 +923,18 @@ func TestLiveInstallSelectionComesFromTheInventoryOnly(t *testing.T) {
 	g := NewWithT(t)
 	env := newInstallTestEnv(t, installEnvOptions{registration: func(r *elementalv1.MachineRegistration) {
 		r.Spec.MachineInventoryAnnotations[elementalv1.InstallTargetDeviceAnnotation] = diskA
+		r.Spec.MachineInventoryAnnotations[elementalv1.InstallApprovedAnnotation] = "true"
 	}}, liveInventory("node-a"))
 	env.hold(hostA.in("boot-1"))
-	// A template cannot pick a disk for every host of the registration.
-	g.Expect(env.hold(hostA.in("boot-1")).Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	// A template cannot pick a disk or approve the install for every host
+	// of the registration, and neither can the host.
+	g.Expect(env.hold(liveHost{auth: hostA.auth, annotations: map[string]string{"install-approved": "true"}}.in("boot-1")).Reason).To(Equal(elementalv1.AwaitingSelectionReason))
 	g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
+	g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
+	// Picked on the inventory, still not approved by the template.
+	env.selectDisk("node-a", diskA)
+	g.Expect(env.hold(hostA.in("boot-1")).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+	g.Expect(env.inventory("node-a").Annotations).ToNot(HaveKey(elementalv1.InstallApprovedAnnotation))
 }
 
 func TestLiveInstallOnANewInventory(t *testing.T) {
@@ -1075,6 +1169,8 @@ func TestLiveInstallEndToEnd(t *testing.T) {
 
 	g.Expect(env.hold(hostA.in("boot-1")).Reason).To(Equal(elementalv1.AwaitingSelectionReason))
 	env.selectDisk("node-a", diskA)
+	g.Expect(env.hold(hostA.in("boot-1")).Reason).To(Equal(elementalv1.AwaitingApprovalReason))
+	env.approve("node-a")
 	config, _ := env.config(hostA.in("boot-1"))
 	g.Expect(*config.Elemental.InstallTarget.WipeDeviceIDs).To(Equal([]string{diskB}))
 
@@ -1085,14 +1181,14 @@ func TestLiveInstallEndToEnd(t *testing.T) {
 	g.Expect(reply).To(Equal(register.MsgReady))
 	g.Expect(condition(env.inventory("node-a"), elementalv1.StaleSystemDisksCondition)).To(haveCondition(metav1.ConditionFalse, elementalv1.WipeFailedReason))
 
-	// elemental-register starts over in the same boot: the selection was
-	// consumed, a person picks again.
+	// elemental-register starts over in the same boot: the approval was
+	// consumed, a person approves again.
 	hold := env.hold(hostA.in("boot-1"))
-	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingSelectionReason))
+	g.Expect(hold.Reason).To(Equal(elementalv1.AwaitingApprovalReason))
 	install := env.inventory("node-a").Status.Install
 	g.Expect(install.Phase).To(Equal(elementalv1.InstallPhaseAwaitingTarget))
 	g.Expect(install.Message).To(Equal("the last install attempt in this live boot failed: " + diskB + " still carries COS_STATE after the wipe"))
-	env.selectDisk("node-a", diskA)
+	env.approve("node-a")
 	config, _ = env.config(hostA.in("boot-1"))
 	g.Expect(config.Elemental.InstallTarget.DeviceID).To(Equal(diskA))
 
@@ -1101,6 +1197,7 @@ func TestLiveInstallEndToEnd(t *testing.T) {
 	inventory := env.inventory("node-a")
 	g.Expect(inventory.Status.Install.Phase).To(Equal(elementalv1.InstallPhaseInstalled))
 	g.Expect(inventory.Status.Install.TargetDeviceID).To(Equal(diskA))
+	g.Expect(inventory.Annotations).ToNot(HaveKey(elementalv1.InstallTargetDeviceAnnotation))
 	g.Expect(condition(inventory, elementalv1.InstallTargetReadyCondition)).To(haveCondition(metav1.ConditionTrue, elementalv1.ReleasedReason))
 	g.Expect(condition(inventory, elementalv1.StaleSystemDisksCondition)).To(haveCondition(metav1.ConditionTrue, elementalv1.WipedReason))
 	g.Expect(inventory.Labels).To(HaveKeyWithValue(elementalv1.RegistrationIPLabel, "10.0.0.31"))

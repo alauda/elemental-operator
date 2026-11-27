@@ -171,13 +171,13 @@ func (i *InventoryServer) writeMachineInventoryCloudConfig(conn *websocket.Conn,
 		SecretName:      elementalv1.PlanSecretName(inventory),
 		SecretNamespace: inventory.Namespace,
 	}
-	config.Elemental.Install = registration.Spec.Config.Elemental.Install
+	config.Elemental.Install = installOf(registration, inventory)
 	config.Elemental.Reset = registration.Spec.Config.Elemental.Reset
 	config.CloudConfig = registration.Spec.Config.CloudConfig
 	if adjust != nil {
 		adjust(config)
 	}
-	if err := i.addInstallRegistry(registration, config); err != nil {
+	if err := i.addInstallRegistry(registration, inventory, config); err != nil {
 		return err
 	}
 

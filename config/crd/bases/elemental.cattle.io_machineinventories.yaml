@@ -47,6 +47,20 @@ spec:
             type: object
           spec:
             properties:
+              install:
+                description: |-
+                  Install overrides, for this host only, install settings of the
+                  MachineRegistration it registers with (Alauda fork). They take effect
+                  when the install is released, so they can be changed until then.
+                properties:
+                  system-uri:
+                    description: |-
+                      SystemURI is the system image the install pulls, as install.system-uri
+                      of the MachineRegistration: a registry reference, docker: prefix
+                      optional. The credentials are those of the cpaas.io/registry-reference
+                      label, which the MachineInventory may also override.
+                    type: string
+                type: object
               ipAddressClaims:
                 additionalProperties:
                   description: ObjectReference contains enough information to let
